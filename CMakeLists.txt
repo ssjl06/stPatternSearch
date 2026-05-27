@@ -21,8 +21,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# CUDA: C++17 is the highest standard officially supported by nvcc 12.x.
-set(CMAKE_CUDA_STANDARD 17)
+# Match host C++ standard. nvcc 12 supports C++20 in device code.
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
