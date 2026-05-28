@@ -4,15 +4,91 @@
 
 #include <stComm/stComm.h>
 
+#include <cub/block/block_reduce.cuh>
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <iostream>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace fullchipusc {
 
 namespace {
+
+// CUDA kernels and helpers used by solve() — kept in this TU's anonymous
+// namespace so they don't pollute the public namespace.
+
+constexpr int kScoreBlockThreads = 256;
+
+// Set the bits at the given element IDs in a dense uint64 bitset.
+// One thread per ID; atomicOr keeps concurrent writers to the same word safe.
+__global__ void set_bits_kernel(std::uint64_t* bitset,
+                                const ElementId* ids,
+                                std::size_t n) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    const ElementId id = ids[i];
+    const std::uint64_t word_idx = id >> 6;
+    const std::uint64_t bit_mask = 1ULL << (id & 63);
+    atomicOr(reinterpret_cast<unsigned long long*>(&bitset[word_idx]),
+             static_cast<unsigned long long>(bit_mask));
+}
+
+// Design doc §6.2: one block per patch, threads cooperatively scan the patch's
+// element IDs against `newly_covered` and sum the intersection size; that delta
+// is subtracted from the patch's score. Patches with score <= 0 short-circuit.
+__global__ void score_update_kernel(const ElementId*     patch_data,
+                                    const std::uint64_t* patch_offsets,
+                                    const std::uint64_t* newly_covered,
+                                    Score*               scores,
+                                    std::uint64_t        M_local) {
+    const std::uint64_t p = blockIdx.x;
+    if (p >= M_local) return;
+
+    // Early-out for disabled patches. Score is shared across all threads but
+    // each reads the same value, so no synchronization needed before this.
+    if (scores[p] <= 0) return;
+
+    const std::uint64_t start = patch_offsets[p];
+    const std::uint64_t end   = patch_offsets[p + 1];
+
+    std::uint64_t local_delta = 0;
+    for (std::uint64_t i = start + threadIdx.x; i < end; i += blockDim.x) {
+        const ElementId id = patch_data[i];
+        const std::uint64_t bit =
+            (newly_covered[id >> 6] >> (id & 63)) & 1ULL;
+        local_delta += bit;
+    }
+
+    using BlockReduce = cub::BlockReduce<std::uint64_t, kScoreBlockThreads>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    const std::uint64_t block_delta = BlockReduce(temp).Sum(local_delta);
+
+    if (threadIdx.x == 0 && block_delta > 0) {
+        scores[p] -= static_cast<Score>(block_delta);
+    }
+}
+
+// Small helper: launch + sync-check. Aborts on any kernel error so a bug
+// surfaces at the responsible kernel rather than later as an opaque memcpy fail.
+inline void cuda_launch_check(const char* what) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA launch error in ") + what +
+                                 ": " + cudaGetErrorString(err));
+    }
+}
+
+inline void cuda_sync_check(const char* what) {
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA sync error in ") + what +
+                                 ": " + cudaGetErrorString(err));
+    }
+}
 
 // Distributed sample sort splitter selection. Every rank computes the same
 // (size-1) splitter values from gathered samples; afterwards each hash is
@@ -273,10 +349,11 @@ SolverResult USCSolver<CommT>::solve() {
     }
 
     DenseBitset covered(N_);
-    DenseBitset nc_mask(N_);
-    std::vector<ElementId>    newly_covered_ids;
-    std::vector<std::uint8_t> dirty(M_loc, 0);
-    std::vector<PatchId>      affected;
+    std::vector<ElementId> newly_covered_ids;
+
+    // Scratch buffer for sparse newly_covered IDs on device. Reused each iter;
+    // resize() reallocates only when the new size exceeds the current capacity.
+    DeviceBuffer<ElementId> d_newly_covered_ids;
 
     while (result.covered_count < N_) {
         Score   local_best_score = kDisabledScore;
@@ -314,24 +391,43 @@ SolverResult USCSolver<CommT>::solve() {
         result.covered_count += static_cast<std::uint64_t>(winner_score);
         result.selected.push_back(winner_global);
 
-        nc_mask.clear();
-        for (ElementId e : newly_covered_ids) nc_mask.set(e);
-
-        affected.clear();
-        for (ElementId e : newly_covered_ids) {
-            for (PatchId q : inv_.patches_of(e)) {
-                if (!dirty[q]) { dirty[q] = 1; affected.push_back(q); }
+        // ------------------------------------------------------------------
+        // Score update on device (design doc §6.2, strategy B — full sweep).
+        // ------------------------------------------------------------------
+        d_newly_covered_.zero();
+        if (winner_score > 0) {
+            if (d_newly_covered_ids.size() < static_cast<std::size_t>(winner_score)) {
+                d_newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
             }
+            d_newly_covered_ids.copy_from_host(newly_covered_ids.data(),
+                                               static_cast<std::size_t>(winner_score));
+            const int block = 128;
+            const int grid  = static_cast<int>(
+                (static_cast<std::size_t>(winner_score) + block - 1) / block);
+            set_bits_kernel<<<grid, block>>>(d_newly_covered_.data(),
+                                              d_newly_covered_ids.data(),
+                                              static_cast<std::size_t>(winner_score));
+            cuda_launch_check("set_bits_kernel");
         }
-        for (PatchId q : affected) {
-            dirty[q] = 0;
-            if (scores[q] <= 0) continue;
-            const auto delta = nc_mask.popcount_intersect_with_ids(patches_.patch(q));
-            scores[q] -= static_cast<Score>(delta);
+        if (M_loc > 0) {
+            score_update_kernel<<<static_cast<unsigned>(M_loc), kScoreBlockThreads>>>(
+                d_patch_data_.data(),
+                d_patch_offsets_.data(),
+                d_newly_covered_.data(),
+                d_scores_.data(),
+                M_loc);
+            cuda_launch_check("score_update_kernel");
+            // D2H sync of scores for next iteration's host-side argmax.
+            d_scores_.copy_to_host(scores.data(), M_loc);
         }
 
         if (comm_.getRank() == winner_rank) {
             scores[local_best_patch] = kDisabledScore;
+            // Mirror to device so next iteration's kernel skips this patch
+            // (the kernel's early-out checks scores[p] <= 0).
+            const Score neg = kDisabledScore;
+            cudaMemcpy(&d_scores_.data()[local_best_patch], &neg, sizeof(Score),
+                       cudaMemcpyHostToDevice);
         }
 
         ++result.iterations;
