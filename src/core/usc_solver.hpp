@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/csr.hpp"
+#include "core/device_buffer.hpp"
 #include "core/inverted_index.hpp"
 #include "core/types.hpp"
 
@@ -62,6 +63,17 @@ private:
     InvertedIndex inv_;
     std::uint64_t N_ = 0;
     std::vector<Hash> id_to_hash_;
+
+    // Device-side mirrors of the algorithm state. Populated at the end of
+    // setup() and consumed by GPU kernels in solve(). Empty until setup runs.
+    DeviceBuffer<ElementId>     d_patch_data_;
+    DeviceBuffer<std::uint64_t> d_patch_offsets_;
+    DeviceBuffer<ElementId>     d_inv_keys_;
+    DeviceBuffer<std::uint64_t> d_inv_offsets_;
+    DeviceBuffer<PatchId>       d_inv_data_;
+    DeviceBuffer<Score>         d_scores_;
+    DeviceBuffer<std::uint64_t> d_covered_;         // N/64 words, zero-init
+    DeviceBuffer<std::uint64_t> d_newly_covered_;   // N/64 words (scratch, M4+)
 };
 
 }  // namespace fullchipusc

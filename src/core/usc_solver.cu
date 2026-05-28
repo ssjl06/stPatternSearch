@@ -220,6 +220,44 @@ void USCSolver<CommT>::setup() {
 
     raw_patches_.clear();
     raw_patches_.shrink_to_fit();
+
+    // Mirror host state to device. solve() will gradually migrate hot paths to
+    // use these GPU buffers; for now they're populated but unused — exercises
+    // the allocation/copy path so any CUDA misconfiguration surfaces here, not
+    // mid-iteration.
+    const std::size_t patch_data_n   = patches_.data.size();
+    const std::size_t patch_offs_n   = patches_.offsets.size();
+    const std::size_t inv_keys_n     = inv_.keys.size();
+    const std::size_t inv_offs_n     = inv_.offsets.size();
+    const std::size_t inv_data_n     = inv_.data.size();
+    const std::size_t M_local        = patches_.M();
+    const std::size_t covered_words  = (N_ + 63) / 64;
+
+    d_patch_data_.resize(patch_data_n);
+    d_patch_offsets_.resize(patch_offs_n);
+    d_inv_keys_.resize(inv_keys_n);
+    d_inv_offsets_.resize(inv_offs_n);
+    d_inv_data_.resize(inv_data_n);
+    d_scores_.resize(M_local);
+    d_covered_.resize(covered_words);
+    d_newly_covered_.resize(covered_words);
+
+    if (patch_data_n) d_patch_data_.copy_from_host(patches_.data.data(),    patch_data_n);
+    if (patch_offs_n) d_patch_offsets_.copy_from_host(patches_.offsets.data(), patch_offs_n);
+    if (inv_keys_n)   d_inv_keys_.copy_from_host(inv_.keys.data(),         inv_keys_n);
+    if (inv_offs_n)   d_inv_offsets_.copy_from_host(inv_.offsets.data(),   inv_offs_n);
+    if (inv_data_n)   d_inv_data_.copy_from_host(inv_.data.data(),         inv_data_n);
+
+    // Initial scores = patch sizes (matches solve()'s host-side initialization).
+    std::vector<Score> initial_scores(M_local);
+    for (std::size_t p = 0; p < M_local; ++p) {
+        initial_scores[p] = static_cast<Score>(patches_.patch_size(p));
+    }
+    if (M_local) d_scores_.copy_from_host(initial_scores.data(), M_local);
+
+    // covered/newly_covered start empty.
+    d_covered_.zero();
+    d_newly_covered_.zero();
 }
 
 template<typename CommT>

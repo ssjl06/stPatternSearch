@@ -2,6 +2,7 @@ add_library(fullchipusc_core STATIC
     core/bitset.cpp
     core/csr.cpp
     core/inverted_index.cpp
+    core/device_buffer.cu
     core/usc_solver.cu
     core/brute_force.cpp
     data/synthetic.cpp
