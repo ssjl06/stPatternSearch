@@ -3,11 +3,15 @@
 
 #include <stComm/stComm.h>
 
+#include <cuda_runtime.h>
+#include <mpi.h>
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 
 namespace {
@@ -18,6 +22,39 @@ struct CliOptions {
     SyntheticParams params;
     bool print_solution = false;
 };
+
+// Per-process GPU pick. Rank-r picks GPU (r % visible_count). Caller must
+// invoke this *before* the NCCL communicator is initialized — NCCL records
+// the active device at ncclCommInitRank.
+void pick_device_for_rank(int rank) {
+    int num_gpus = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_gpus);
+    if (err != cudaSuccess || num_gpus <= 0) {
+        std::fprintf(stderr,
+            "rank %d: no CUDA device available (%s). fullchipUSC is GPU-only.\n",
+            rank, cudaGetErrorString(err));
+        std::exit(2);
+    }
+    const int device_id = rank % num_gpus;
+    cudaSetDevice(device_id);
+}
+
+// Bootstrap a NCCLComm shared by all ranks. Rank 0 mints the uniqueId and
+// MPI-broadcasts it to everyone, then each rank calls ncclCommInitRank on
+// its picked device. Returns a shared_ptr the solver takes co-ownership of.
+std::shared_ptr<stComm::NCCLComm> make_nccl_comm(const stComm::MPIComm& world) {
+    ncclUniqueId nccl_id;
+    if (world.getRank() == 0) {
+        nccl_id = stComm::NCCLComm::getUniqueId();
+    }
+    MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    int device_id = 0;
+    cudaGetDevice(&device_id);  // pick_device_for_rank already set this
+    auto nc = std::make_shared<stComm::NCCLComm>();
+    nc->initialize(world.getRank(), world.getSize(), device_id, nccl_id);
+    return nc;
+}
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
@@ -70,7 +107,9 @@ int main(int argc, char** argv) {
         if (!parse_args(argc, argv, opt)) { exit_code = 1; }
         else {
             stComm::MPIComm world;
-            USCSolver<stComm::MPIComm> solver(world);
+            pick_device_for_rank(world.getRank());
+            auto nccl_comm = make_nccl_comm(world);
+            USCSolver<stComm::MPIComm> solver(world, std::move(nccl_comm));
 
             auto t0 = std::chrono::steady_clock::now();
             auto slice = slice_patches_by_rank(

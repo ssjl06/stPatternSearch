@@ -8,7 +8,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -181,7 +184,14 @@ inline int target_rank_for_hash(Hash h, const std::vector<Hash>& splitters) {
 }  // namespace
 
 template<typename CommT>
-USCSolver<CommT>::USCSolver(CommT& comm) : comm_(comm) {}
+USCSolver<CommT>::USCSolver(CommT& comm,
+                            std::shared_ptr<stComm::NCCLComm> nccl_comm)
+    : comm_(comm), nccl_comm_(std::move(nccl_comm)) {
+    if (!nccl_comm_) {
+        throw std::invalid_argument(
+            "USCSolver requires an initialized NCCLComm — fullchipUSC is GPU-only.");
+    }
+}
 
 template<typename CommT>
 void USCSolver<CommT>::load(std::vector<std::vector<Hash>> raw_patches,
@@ -360,21 +370,18 @@ void USCSolver<CommT>::setup() {
 }
 
 // Multi-rank greedy loop. Hot data (PatchCsr, scores, covered, newly_covered)
-// lives on the device after setup(); host involvement is limited to the MPI
-// collectives, which require host pointers in M4 (stComm::MPIComm uses
-// MPI_Allreduce / MPI_Bcast / MPI_Alltoallv). Each iteration's host/device
-// boundary:
+// lives on the device after setup() and stays there throughout solve().
+// Each iteration touches host memory only for the small metadata that NCCL's
+// API requires as host scalars:
 //
 //   [device] CUB ArgMax → (Score, idx) D2H (16B)
-//        [host] MPI_Allreduce<MAXLOC> on (Score, rank)
+//        [host] MPI_Allreduce<MAXLOC>  — NCCL has no MAXLOC
 //        [host] MPI_Bcast winner_global PatchId (8B)
 //   [device] build_newly_covered_kernel writes sparse list  (winner only)
-//        D2H sparse list → [host] MPI_Bcast<ElementId>  (winner_score * 8B)
-//        H2D sparse list (non-winners)
+//        NCCL_Bcast<ElementId>(d_newly_covered_ids, winner_score, winner_rank)
+//          — device-direct, no D2H/H2D for the payload
 //   [device] set_bits × 2 (d_covered_, d_newly_covered_) + score_update_kernel
 //        H2D 1 Score = -1 (winner only)
-//
-// M5/NCCL would collapse the bcast staging into a device-direct broadcast.
 template<typename CommT>
 SolverResult USCSolver<CommT>::solve() {
     const std::uint64_t M_loc = patches_.M();
@@ -382,10 +389,9 @@ SolverResult USCSolver<CommT>::solve() {
     result.covered_count = 0;
     result.iterations    = 0;
 
-    // Sparse newly_covered staging — host buffer is the bcast vehicle, device
-    // buffer is the source/sink of the GPU kernels. The cumulative covered
-    // state lives entirely on device (d_covered_); no host bitset.
-    std::vector<ElementId>     newly_covered_ids;
+    // Sparse newly_covered list — entirely device-resident; NCCL broadcasts
+    // it in place. The cumulative covered state also lives on device
+    // (d_covered_); no host bitset, no host staging buffer.
     DeviceBuffer<ElementId>    d_newly_covered_ids;
     DeviceBuffer<unsigned int> d_newly_count(1);   // atomicAdd counter for build kernel
 
@@ -403,7 +409,36 @@ SolverResult USCSolver<CommT>::solve() {
         d_argmax_temp.resize(temp_bytes);
     }
 
+    // Optional per-iteration stage timing. Gated by FULLCHIPUSC_PROFILE=1 to
+    // keep the production hot path free of synchronization. When enabled, we
+    // force a cudaDeviceSynchronize at each stage boundary so chrono captures
+    // wall time on host *and* the GPU kernel that landed in this stage; the
+    // sync adds overhead, so the per-stage numbers are slightly inflated but
+    // their *relative* shape (which stage dominates) is what we care about.
+    const bool profile_enabled = []() {
+        const char* v = std::getenv("FULLCHIPUSC_PROFILE");
+        return v && v[0] && v[0] != '0';
+    }();
+    using Clock = std::chrono::steady_clock;
+    using ns    = std::chrono::nanoseconds;
+    std::int64_t t_argmax_ns        = 0;
+    std::int64_t t_maxloc_ns        = 0;
+    std::int64_t t_patchid_bcast_ns = 0;
+    std::int64_t t_build_kernel_ns  = 0;
+    std::int64_t t_nccl_bcast_ns    = 0;
+    std::int64_t t_set_bits_ns      = 0;
+    std::int64_t t_score_update_ns  = 0;
+    std::int64_t t_winner_disable_ns = 0;
+    auto tick = [&]() {
+        if (profile_enabled) cudaDeviceSynchronize();
+        return Clock::now();
+    };
+    auto add_elapsed = [&](std::int64_t& acc, Clock::time_point start) {
+        acc += std::chrono::duration_cast<ns>(tick() - start).count();
+    };
+
     while (result.covered_count < N_) {
+        auto t0 = tick();
         Score   local_best_score = kDisabledScore;
         PatchId local_best_patch = 0;
         if (M_loc > 0) {
@@ -419,23 +454,30 @@ SolverResult USCSolver<CommT>::solve() {
             local_best_score = host_result.value;
             local_best_patch = static_cast<PatchId>(host_result.key);
         }
+        if (profile_enabled) add_elapsed(t_argmax_ns, t0);
 
+        auto t1 = tick();
         auto maxloc = comm_.template allreduceMaxloc<std::int64_t>(local_best_score);
         const std::int64_t winner_score = maxloc.first;
         const int          winner_rank  = maxloc.second;
+        if (profile_enabled) add_elapsed(t_maxloc_ns, t1);
         if (winner_score <= 0) break;
 
+        auto t2 = tick();
         PatchId winner_global = 0;
         if (comm_.getRank() == winner_rank) {
             winner_global = patch_global_ids_[local_best_patch];
         }
         comm_.template bcast<PatchId>(&winner_global, 1, winner_rank)->wait();
+        if (profile_enabled) add_elapsed(t_patchid_bcast_ns, t2);
 
         // ------------------------------------------------------------------
         // Build the sparse newly_covered list on device (winner only), then
-        // bcast through the host buffer (M5 will replace with NCCL device bcast).
+        // broadcast it device-to-device via NCCL. d_newly_covered_ids never
+        // visits host memory — the winner kernel writes it, NCCL bcast
+        // distributes it, and set_bits_kernel consumes it.
         // ------------------------------------------------------------------
-        newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
+        auto t3 = tick();
         if (d_newly_covered_ids.size() < static_cast<std::size_t>(winner_score)) {
             d_newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
         }
@@ -454,18 +496,17 @@ SolverResult USCSolver<CommT>::solve() {
                     d_newly_count.data());
                 cuda_launch_check("build_newly_covered_kernel");
             }
-            // D2H sparse IDs into the host bcast buffer.
-            d_newly_covered_ids.copy_to_host(newly_covered_ids.data(),
-                                              static_cast<std::size_t>(winner_score));
         }
-        comm_.template bcast<ElementId>(newly_covered_ids.data(),
-                                        static_cast<std::size_t>(winner_score),
-                                        winner_rank)->wait();
-        // Non-winner ranks: stage the bcasted IDs back to device.
-        if (comm_.getRank() != winner_rank && winner_score > 0) {
-            d_newly_covered_ids.copy_from_host(newly_covered_ids.data(),
-                                                static_cast<std::size_t>(winner_score));
-        }
+        if (profile_enabled) add_elapsed(t_build_kernel_ns, t3);
+
+        // Device-direct broadcast. winner_score and winner_rank (16B) are the
+        // only host-visible metadata per iteration — that's a NCCL API
+        // constraint (root/count must be host scalars), not a payload cost.
+        auto t4 = tick();
+        nccl_comm_->template bcast<ElementId>(d_newly_covered_ids.data(),
+                                              static_cast<std::size_t>(winner_score),
+                                              winner_rank)->wait();
+        if (profile_enabled) add_elapsed(t_nccl_bcast_ns, t4);
 
         result.covered_count += static_cast<std::uint64_t>(winner_score);
         result.selected.push_back(winner_global);
@@ -475,6 +516,7 @@ SolverResult USCSolver<CommT>::solve() {
         // All ranks: update d_covered_ (cumulative) and build d_newly_covered_
         // (per-iter bitset) via atomicOr from the sparse list.
         // ------------------------------------------------------------------
+        auto t5 = tick();
         d_newly_covered_.zero();
         if (winner_score > 0) {
             const int block = 128;
@@ -489,6 +531,9 @@ SolverResult USCSolver<CommT>::solve() {
                                               static_cast<std::size_t>(winner_score));
             cuda_launch_check("set_bits_kernel (newly_covered)");
         }
+        if (profile_enabled) add_elapsed(t_set_bits_ns, t5);
+
+        auto t6 = tick();
         if (M_loc > 0) {
             score_update_kernel<<<static_cast<unsigned>(M_loc), kScoreBlockThreads>>>(
                 d_patch_data_.data(),
@@ -498,7 +543,9 @@ SolverResult USCSolver<CommT>::solve() {
                 M_loc);
             cuda_launch_check("score_update_kernel");
         }
+        if (profile_enabled) add_elapsed(t_score_update_ns, t6);
 
+        auto t7 = tick();
         if (comm_.getRank() == winner_rank) {
             // Disable winner on device so next iteration's kernel + ArgMax skip
             // it (kernel early-outs on score <= 0; ArgMax picks the next-best).
@@ -506,8 +553,36 @@ SolverResult USCSolver<CommT>::solve() {
             cudaMemcpy(&d_scores_.data()[local_best_patch], &neg, sizeof(Score),
                        cudaMemcpyHostToDevice);
         }
+        if (profile_enabled) add_elapsed(t_winner_disable_ns, t7);
 
         ++result.iterations;
+    }
+
+    if (profile_enabled && comm_.getRank() == 0) {
+        const double iters = static_cast<double>(result.iterations ? result.iterations : 1);
+        auto ms_avg = [&](std::int64_t total_ns) {
+            return total_ns * 1e-6 / iters;
+        };
+        auto ms_tot = [&](std::int64_t total_ns) { return total_ns * 1e-6; };
+        std::fprintf(stderr,
+            "[fullchipusc-profile] iters=%llu  (per-iter μs avg, total ms)\n"
+            "  argmax+D2H        %7.1f μs    %7.1f ms\n"
+            "  maxloc            %7.1f μs    %7.1f ms\n"
+            "  patchid_bcast     %7.1f μs    %7.1f ms\n"
+            "  build_kernel      %7.1f μs    %7.1f ms\n"
+            "  nccl_bcast        %7.1f μs    %7.1f ms\n"
+            "  set_bits          %7.1f μs    %7.1f ms\n"
+            "  score_update      %7.1f μs    %7.1f ms\n"
+            "  winner_disable    %7.1f μs    %7.1f ms\n",
+            (unsigned long long)result.iterations,
+            ms_avg(t_argmax_ns)        * 1000, ms_tot(t_argmax_ns),
+            ms_avg(t_maxloc_ns)        * 1000, ms_tot(t_maxloc_ns),
+            ms_avg(t_patchid_bcast_ns) * 1000, ms_tot(t_patchid_bcast_ns),
+            ms_avg(t_build_kernel_ns)  * 1000, ms_tot(t_build_kernel_ns),
+            ms_avg(t_nccl_bcast_ns)    * 1000, ms_tot(t_nccl_bcast_ns),
+            ms_avg(t_set_bits_ns)      * 1000, ms_tot(t_set_bits_ns),
+            ms_avg(t_score_update_ns)  * 1000, ms_tot(t_score_update_ns),
+            ms_avg(t_winner_disable_ns)* 1000, ms_tot(t_winner_disable_ns));
     }
 
     return result;

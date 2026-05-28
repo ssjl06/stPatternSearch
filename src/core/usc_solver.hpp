@@ -6,7 +6,13 @@
 #include "core/types.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
+
+// Forward-declared so solve() can hold an optional pointer to an NCCL
+// communicator without dragging <nccl.h> into this public header. The
+// concrete type is included in usc_solver.cu where it's actually used.
+namespace stComm { class NCCLComm; }
 
 namespace fullchipusc {
 
@@ -16,23 +22,30 @@ struct SolverResult {
     std::uint64_t        iterations;     // number of iterations executed
 };
 
-// Greedy minimum set-cover solver, parameterized on the communication backend.
+// Greedy minimum set-cover solver, parameterized on the host-side comm
+// backend used for setup() and for the 16B MAXLOC + 8B winner_global metadata
+// each iteration. The per-iteration newly_covered_ids payload always travels
+// device-direct over NCCL, so a NCCLComm is required.
 //
 // `CommT` is a duck-typed stComm-like comm object exposing:
 //   - int  getRank() / getSize()
 //   - allreduceMaxloc<T>(T) → std::pair<T,int>
 //   - bcast<T>(T*, size_t, root) → RequestPtr (with .wait())
 //   - allgatherv<T>(...)
+//   - alltoallv<T>(...)
+//   - exscan<T>(T, op)
 //
-// For M2 the only instantiation is USCSolver<stComm::MPIComm> (CPU + MPI host
-// memory). M5 will add USCSolver<stComm::NCCLComm> for GPU + NCCL device memory.
-//
-// Header carries declarations only; the implementation lives in usc_solver.cpp
-// behind an explicit template instantiation.
+// Only USCSolver<stComm::MPIComm> is instantiated (NCCL covers the device hot
+// path via the injected nccl_comm_; the host backend stays MPI because NCCL
+// lacks MAXLOC/EXSCAN and setup operates on host vectors).
 template<typename CommT>
 class USCSolver {
 public:
-    explicit USCSolver(CommT& comm);
+    // `comm` is host-side MPI for setup + tiny metadata in solve().
+    // `nccl_comm` is the GPU communicator for the per-iteration
+    // newly_covered_ids broadcast; must be initialized (rank/device/uniqueId)
+    // before construction. Both are required.
+    USCSolver(CommT& comm, std::shared_ptr<stComm::NCCLComm> nccl_comm);
 
     // Inject this rank's local patches plus their global patch IDs.
     void load(std::vector<std::vector<Hash>> raw_patches,
@@ -55,6 +68,7 @@ public:
 
 private:
     CommT& comm_;
+    std::shared_ptr<stComm::NCCLComm> nccl_comm_;      // required; hot-path device bcast
 
     std::vector<std::vector<Hash>> raw_patches_;       // freed after setup()
     std::vector<PatchId>           patch_global_ids_;  // local idx → global PatchId

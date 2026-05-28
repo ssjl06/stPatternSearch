@@ -2,6 +2,7 @@
 #include "core/usc_solver.hpp"
 #include "data/synthetic.hpp"
 #include "helpers/local_setup.hpp"
+#include "test_nccl_env.hpp"
 
 #include <stComm/stComm.h>
 
@@ -33,7 +34,7 @@ void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
 
     // Distributed path: every rank gets its slice, runs USCSolver.
     stComm::MPIComm comm;
-    USCSolver<stComm::MPIComm> solver(comm);
+    USCSolver<stComm::MPIComm> solver(comm, test_helpers::nccl_comm());
     auto raw_full = generate_synthetic(params);
     auto slice    = slice_patches_by_rank(raw_full, comm.getRank(), comm.getSize());
     solver.load(std::move(slice.patches), std::move(slice.global_ids));
