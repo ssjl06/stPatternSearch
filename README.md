@@ -33,7 +33,11 @@ Branches:
 ## Quick build
 
 ```bash
-# Prereqs: mpicxx, CUDA 12.x (for gpu branch), NCCL, stComm at ~/install/stComm
+# One-time: install build prereqs (cmake>=3.25, OpenMPI, NCCL, GTest, stComm).
+# CUDA Toolkit + driver must be pre-installed; everything else is handled.
+./scripts/setup-env.sh
+
+# Build
 CMAKE_PREFIX_PATH=~/install/stComm cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
