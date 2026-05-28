@@ -45,6 +45,7 @@ command -v mpicxx  >/dev/null 2>&1 || need_apt+=(openmpi-bin libopenmpi-dev)
 [ -f /usr/include/nccl.h ]         || need_apt+=(libnccl2 libnccl-dev)
 command -v git     >/dev/null 2>&1 || need_apt+=(git)
 command -v wget    >/dev/null 2>&1 || need_apt+=(wget ca-certificates)
+command -v curl    >/dev/null 2>&1 || need_apt+=(curl)
 # stComm's CMake calls find_package(GTest) — apt provides prebuilt libs on Ubuntu 22.04+.
 [ -f /usr/include/gtest/gtest.h ]  || need_apt+=(libgtest-dev libgmock-dev)
 
@@ -95,6 +96,22 @@ if [ "$need_cmake" -eq 1 ]; then
     hash -r
     log "cmake now: $(cmake --version | head -1)"
 fi
+
+# ----- 1c. gh (GitHub CLI) for PR / issue workflows -----
+if ! command -v gh >/dev/null 2>&1; then
+    log "installing GitHub CLI (gh) from official apt repo"
+    keyring=/usr/share/keyrings/githubcli-archive-keyring.gpg
+    list=/etc/apt/sources.list.d/github-cli.list
+    $SUDO mkdir -p -m 755 /etc/apt/keyrings
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | $SUDO dd of="$keyring" status=none
+    $SUDO chmod go+r "$keyring"
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] https://cli.github.com/packages stable main" \
+        | $SUDO tee "$list" >/dev/null
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y --no-install-recommends gh
+fi
+log "gh $(gh --version 2>/dev/null | head -1 | awk '{print $3}')"
 
 # ----- 2. CUDA / nvcc sanity check (must be pre-installed) -----
 NVCC="${NVCC:-/usr/local/cuda/bin/nvcc}"
