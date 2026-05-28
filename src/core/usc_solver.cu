@@ -39,6 +39,29 @@ __global__ void set_bits_kernel(std::uint64_t* bitset,
              static_cast<unsigned long long>(bit_mask));
 }
 
+// Winner-only: scan the chosen patch's element IDs against d_covered_ and emit
+// the IDs that are NOT yet covered into out_ids. atomicAdd on out_count
+// allocates output slots; ordering of out_ids is therefore non-deterministic,
+// but the resulting *set* matches the host build. Downstream consumers
+// (bcast + set_bits_kernel into d_covered_ / d_newly_covered_) are
+// order-insensitive (atomicOr / popcount on a bitset).
+__global__ void build_newly_covered_kernel(const ElementId*     patch_data,
+                                           std::uint64_t        start,
+                                           std::uint64_t        end,
+                                           const std::uint64_t* covered,
+                                           ElementId*           out_ids,
+                                           unsigned int*        out_count) {
+    const std::uint64_t i =
+        start + blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+    if (i >= end) return;
+    const ElementId id = patch_data[i];
+    const std::uint64_t bit = (covered[id >> 6] >> (id & 63)) & 1ULL;
+    if (bit == 0) {
+        const unsigned int slot = atomicAdd(out_count, 1u);
+        out_ids[slot] = id;
+    }
+}
+
 // Design doc §6.2: one block per patch, threads cooperatively scan the patch's
 // element IDs against `newly_covered` and sum the intersection size; that delta
 // is subtracted from the patch's score. Patches with score <= 0 short-circuit.
@@ -345,12 +368,12 @@ SolverResult USCSolver<CommT>::solve() {
     result.covered_count = 0;
     result.iterations    = 0;
 
-    DenseBitset covered(N_);
-    std::vector<ElementId> newly_covered_ids;
-
-    // Scratch buffer for sparse newly_covered IDs on device. Reused each iter;
-    // resize() reallocates only when the new size exceeds the current capacity.
-    DeviceBuffer<ElementId> d_newly_covered_ids;
+    // Sparse newly_covered staging — host buffer is the bcast vehicle, device
+    // buffer is the source/sink of the GPU kernels. The cumulative covered
+    // state lives entirely on device (d_covered_); no host bitset.
+    std::vector<ElementId>     newly_covered_ids;
+    DeviceBuffer<ElementId>    d_newly_covered_ids;
+    DeviceBuffer<unsigned int> d_newly_count(1);   // atomicAdd counter for build kernel
 
     // CUB DeviceReduce::ArgMax scratch + result. Query the byte requirements
     // once for the known M_loc, then reuse the buffers across all iterations.
@@ -394,38 +417,63 @@ SolverResult USCSolver<CommT>::solve() {
         }
         comm_.template bcast<PatchId>(&winner_global, 1, winner_rank)->wait();
 
+        // ------------------------------------------------------------------
+        // Build the sparse newly_covered list on device (winner only), then
+        // bcast through the host buffer (M5 will replace with NCCL device bcast).
+        // ------------------------------------------------------------------
         newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
+        if (d_newly_covered_ids.size() < static_cast<std::size_t>(winner_score)) {
+            d_newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
+        }
         if (comm_.getRank() == winner_rank) {
-            std::size_t i = 0;
-            for (ElementId e : patches_.patch(local_best_patch)) {
-                if (!covered.test(e)) newly_covered_ids[i++] = e;
+            const std::uint64_t start = patches_.offsets[local_best_patch];
+            const std::uint64_t end   = patches_.offsets[local_best_patch + 1];
+            const std::uint64_t patch_len = end - start;
+            d_newly_count.zero();
+            if (patch_len > 0) {
+                const int block = 128;
+                const int grid  = static_cast<int>((patch_len + block - 1) / block);
+                build_newly_covered_kernel<<<grid, block>>>(
+                    d_patch_data_.data(), start, end,
+                    d_covered_.data(),
+                    d_newly_covered_ids.data(),
+                    d_newly_count.data());
+                cuda_launch_check("build_newly_covered_kernel");
             }
+            // D2H sparse IDs into the host bcast buffer.
+            d_newly_covered_ids.copy_to_host(newly_covered_ids.data(),
+                                              static_cast<std::size_t>(winner_score));
         }
         comm_.template bcast<ElementId>(newly_covered_ids.data(),
                                         static_cast<std::size_t>(winner_score),
                                         winner_rank)->wait();
+        // Non-winner ranks: stage the bcasted IDs back to device.
+        if (comm_.getRank() != winner_rank && winner_score > 0) {
+            d_newly_covered_ids.copy_from_host(newly_covered_ids.data(),
+                                                static_cast<std::size_t>(winner_score));
+        }
 
-        for (ElementId e : newly_covered_ids) covered.set(e);
         result.covered_count += static_cast<std::uint64_t>(winner_score);
         result.selected.push_back(winner_global);
 
         // ------------------------------------------------------------------
         // Score update on device (design doc §6.2, strategy B — full sweep).
+        // All ranks: update d_covered_ (cumulative) and build d_newly_covered_
+        // (per-iter bitset) via atomicOr from the sparse list.
         // ------------------------------------------------------------------
         d_newly_covered_.zero();
         if (winner_score > 0) {
-            if (d_newly_covered_ids.size() < static_cast<std::size_t>(winner_score)) {
-                d_newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
-            }
-            d_newly_covered_ids.copy_from_host(newly_covered_ids.data(),
-                                               static_cast<std::size_t>(winner_score));
             const int block = 128;
             const int grid  = static_cast<int>(
                 (static_cast<std::size_t>(winner_score) + block - 1) / block);
+            set_bits_kernel<<<grid, block>>>(d_covered_.data(),
+                                              d_newly_covered_ids.data(),
+                                              static_cast<std::size_t>(winner_score));
+            cuda_launch_check("set_bits_kernel (covered)");
             set_bits_kernel<<<grid, block>>>(d_newly_covered_.data(),
                                               d_newly_covered_ids.data(),
                                               static_cast<std::size_t>(winner_score));
-            cuda_launch_check("set_bits_kernel");
+            cuda_launch_check("set_bits_kernel (newly_covered)");
         }
         if (M_loc > 0) {
             score_update_kernel<<<static_cast<unsigned>(M_loc), kScoreBlockThreads>>>(
