@@ -5,6 +5,8 @@
 #include <stComm/stComm.h>
 
 #include <cub/block/block_reduce.cuh>
+#include <cub/device/device_reduce.cuh>
+#include <cub/util_type.cuh>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -343,11 +345,6 @@ SolverResult USCSolver<CommT>::solve() {
     result.covered_count = 0;
     result.iterations    = 0;
 
-    std::vector<Score> scores(M_loc);
-    for (std::uint64_t p = 0; p < M_loc; ++p) {
-        scores[p] = static_cast<Score>(patches_.patch_size(p));
-    }
-
     DenseBitset covered(N_);
     std::vector<ElementId> newly_covered_ids;
 
@@ -355,14 +352,35 @@ SolverResult USCSolver<CommT>::solve() {
     // resize() reallocates only when the new size exceeds the current capacity.
     DeviceBuffer<ElementId> d_newly_covered_ids;
 
+    // CUB DeviceReduce::ArgMax scratch + result. Query the byte requirements
+    // once for the known M_loc, then reuse the buffers across all iterations.
+    using ArgmaxPair = cub::KeyValuePair<int, Score>;
+    DeviceBuffer<std::uint8_t> d_argmax_temp;
+    DeviceBuffer<ArgmaxPair>   d_argmax_result(M_loc > 0 ? 1 : 0);
+    if (M_loc > 0) {
+        std::size_t temp_bytes = 0;
+        cub::DeviceReduce::ArgMax(nullptr, temp_bytes,
+                                  d_scores_.data(),
+                                  d_argmax_result.data(),
+                                  static_cast<int>(M_loc));
+        d_argmax_temp.resize(temp_bytes);
+    }
+
     while (result.covered_count < N_) {
         Score   local_best_score = kDisabledScore;
         PatchId local_best_patch = 0;
-        for (std::uint64_t p = 0; p < M_loc; ++p) {
-            if (scores[p] > local_best_score) {
-                local_best_score = scores[p];
-                local_best_patch = static_cast<PatchId>(p);
-            }
+        if (M_loc > 0) {
+            std::size_t temp_bytes = d_argmax_temp.bytes();
+            cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
+                                      d_scores_.data(),
+                                      d_argmax_result.data(),
+                                      static_cast<int>(M_loc));
+            cuda_launch_check("cub::DeviceReduce::ArgMax");
+            ArgmaxPair host_result{};
+            cudaMemcpy(&host_result, d_argmax_result.data(),
+                       sizeof(host_result), cudaMemcpyDeviceToHost);
+            local_best_score = host_result.value;
+            local_best_patch = static_cast<PatchId>(host_result.key);
         }
 
         auto maxloc = comm_.template allreduceMaxloc<std::int64_t>(local_best_score);
@@ -417,14 +435,11 @@ SolverResult USCSolver<CommT>::solve() {
                 d_scores_.data(),
                 M_loc);
             cuda_launch_check("score_update_kernel");
-            // D2H sync of scores for next iteration's host-side argmax.
-            d_scores_.copy_to_host(scores.data(), M_loc);
         }
 
         if (comm_.getRank() == winner_rank) {
-            scores[local_best_patch] = kDisabledScore;
-            // Mirror to device so next iteration's kernel skips this patch
-            // (the kernel's early-out checks scores[p] <= 0).
+            // Disable winner on device so next iteration's kernel + ArgMax skip
+            // it (kernel early-outs on score <= 0; ArgMax picks the next-best).
             const Score neg = kDisabledScore;
             cudaMemcpy(&d_scores_.data()[local_best_patch], &neg, sizeof(Score),
                        cudaMemcpyHostToDevice);
