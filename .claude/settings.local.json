@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//workspace/**)",
+      "Bash(mv fullchipUSC_tmp/.git fullchipUSC_tmp/.gitignore fullchipUSC_tmp/CMakeLists.txt fullchipUSC_tmp/README.md fullchipUSC_tmp/greedy_set_cover.md fullchipUSC_tmp/src fullchipUSC_tmp/tests /workspace/fullchipUSC/)",
+      "Bash(rmdir fullchipUSC_tmp)"
+    ]
+  }
+}

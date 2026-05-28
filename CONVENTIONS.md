@@ -64,7 +64,7 @@ continue.
   distribution utility (will be reused by real loaders).
 
 ### 6. Determinism + bit-identical equivalence
-- The solver result must be **bit-identical** between size=1 and size=4,
+- The solver result must be **bit-identical** between size=1 and size>1,
   and against `solve_brute_force` on the same input. `test_solver_equivalence.cpp`
   enforces this — keep it green at every commit.
 - MAXLOC tie-breaking is smaller rank wins (MPI_MAXLOC semantics).
@@ -72,6 +72,29 @@ continue.
 - atomicAdd on the build_newly_covered_kernel makes order non-deterministic
   but the *set* is identical; downstream consumers (atomicOr) are order-
   insensitive, so the global result stays deterministic.
+- After M5, the verification matrix is `size=1` vs `size=N` where N = visible
+  GPUs (no MPS / oversubscription — NCCL needs 1:1 process:device mapping).
+
+### 7. GPU is required, no fallbacks
+- fullchipUSC is GPU-first by premise. Don't add CPU fallbacks, optional-GPU
+  toggles, or `--backend mpi` flags. If GPUs (or NCCL) aren't available, fail
+  loud at startup.
+- The CPU-only M3 baseline still lives on `main` branch for bisect-style
+  regression hunting — that's the only "fallback" we need.
+- Required GPU resources (e.g. `NCCLComm`) are ctor arguments, not optional
+  setters; constructing the solver without them is a bug.
+- Test fixtures `GTEST_SKIP` (or fail) when `num_gpus < world.size()`,
+  never silently fall back to a host-only path.
+
+### 8. Smart-pointer-only host ownership
+- Host-side optional or owned objects use `std::shared_ptr` / `std::unique_ptr`.
+  No raw owning pointers, no bare `new` / `delete`.
+- References (`T&`) are still fine for non-owning, non-nullable views that
+  share the caller's lifetime — that's how `USCSolver::comm_` works.
+- Device-side allocations (`cudaMalloc` ranges) are managed by `DeviceBuffer<T>`
+  RAII; this rule covers host-side state only.
+- Standard containers (`std::vector`, `std::unordered_map`, …) already
+  satisfy the rule.
 
 ## Workflow patterns
 
@@ -92,8 +115,12 @@ verification passes. The user can see live progress in the spinner.
 
 ### Build verification matrix
 - `mpirun -n 1 ctest` — single-rank correctness
-- `mpirun -n 4 --oversubscribe ctest` — multi-rank correctness
-- `mpirun -n 4 ... fullchipusc-solve --N ... --seed ...` — smoke at scale
+- `mpirun -n <num_gpus> ctest` — multi-rank correctness (NCCL needs 1
+  process per GPU, no oversubscription). Default ctest is `-n 2`; override
+  via `-DFULLCHIPUSC_TEST_NRANKS=<n>`.
+- `mpirun -n <num_gpus> ... fullchipusc-solve --N ...` — smoke at scale.
+- `FULLCHIPUSC_PROFILE=1 mpirun -n <num_gpus> -x FULLCHIPUSC_PROFILE ...`
+  — per-stage breakdown when investigating regressions or new bottlenecks.
 
 Smoke output baseline lives in [STATUS.md](STATUS.md). When changing
 hot-path code, verify all three before committing.

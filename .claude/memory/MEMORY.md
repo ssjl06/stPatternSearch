@@ -1,0 +1,2 @@
+- [Smart-pointer-only host ownership](feedback_smart_pointers.md) — no raw owning pointers in host code; use shared_ptr/unique_ptr.
+- [GPU required, no fallbacks](feedback_gpu_required.md) — fullchipUSC is GPU-first by premise; don't add optional-GPU branches or host-stage fallbacks.
