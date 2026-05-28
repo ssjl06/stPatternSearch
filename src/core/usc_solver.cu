@@ -1,7 +1,5 @@
 #include "core/usc_solver.hpp"
 
-#include "core/bitset.hpp"
-
 #include <stComm/stComm.h>
 
 #include <cub/block/block_reduce.cuh>
@@ -361,6 +359,22 @@ void USCSolver<CommT>::setup() {
     d_newly_covered_.zero();
 }
 
+// Multi-rank greedy loop. Hot data (PatchCsr, scores, covered, newly_covered)
+// lives on the device after setup(); host involvement is limited to the MPI
+// collectives, which require host pointers in M4 (stComm::MPIComm uses
+// MPI_Allreduce / MPI_Bcast / MPI_Alltoallv). Each iteration's host/device
+// boundary:
+//
+//   [device] CUB ArgMax → (Score, idx) D2H (16B)
+//        [host] MPI_Allreduce<MAXLOC> on (Score, rank)
+//        [host] MPI_Bcast winner_global PatchId (8B)
+//   [device] build_newly_covered_kernel writes sparse list  (winner only)
+//        D2H sparse list → [host] MPI_Bcast<ElementId>  (winner_score * 8B)
+//        H2D sparse list (non-winners)
+//   [device] set_bits × 2 (d_covered_, d_newly_covered_) + score_update_kernel
+//        H2D 1 Score = -1 (winner only)
+//
+// M5/NCCL would collapse the bcast staging into a device-direct broadcast.
 template<typename CommT>
 SolverResult USCSolver<CommT>::solve() {
     const std::uint64_t M_loc = patches_.M();
