@@ -18,13 +18,30 @@ The current dev host (single MX450) cannot exercise multi-GPU NCCL. M5+ needs:
 |---|---|---|
 | Linux | Ubuntu 24.04 / WSL2 OK | |
 | GCC / G++ | 12.4 | C++20 required |
-| CMake | 3.22+ | `enable_language(CUDA)` |
+| CMake | 3.25+ | `CMAKE_CUDA_STANDARD 20` requires 3.25; Ubuntu 22.04 apt cmake is 3.22 and too old. `scripts/setup-env.sh` installs the Kitware binary if needed. |
 | CUDA Toolkit | 12.8 | nvcc must be at `/usr/local/cuda/bin/nvcc` or override `CMAKE_CUDA_COMPILER` |
 | NCCL | 2.18+ (libnccl2 + libnccl-dev) | `apt install libnccl2 libnccl-dev` |
 | OpenMPI | 4.1 or 5.x | `mpicxx` available in PATH |
 | GoogleTest | 1.15.2 (auto via FetchContent) | |
 
-### stComm install
+### One-shot setup (recommended)
+
+`scripts/setup-env.sh` automates everything below — apt packages, cmake upgrade,
+stComm clone+build+install. CUDA Toolkit and the NVIDIA driver must already be
+present. Run it once after cloning:
+
+```bash
+git clone <fullchipUSC remote>
+cd fullchipUSC && git checkout gpu
+./scripts/setup-env.sh
+# then build per "Quick build" in README.md
+```
+
+The script is idempotent (skips already-installed pieces) and auto-detects
+`CUDA_ARCH` from `nvidia-smi`. Override paths via env: `STCOMM_PREFIX`,
+`STCOMM_SRC`, `CUDA_ARCH`, `CMAKE_VERSION`.
+
+### Manual stComm install (if doing it yourself)
 ```bash
 git clone https://github.com/ssjl06/stComm ~/tickets/stComm
 cd ~/tickets/stComm
@@ -35,14 +52,6 @@ export CUDA_ARCH=<your GPU arch, e.g. 80 for A100>
 ```
 
 Then for fullchipUSC: `CMAKE_PREFIX_PATH=~/install/stComm cmake ...`
-
-### Repo bootstrap
-```bash
-git clone <fullchipUSC remote>   # or copy directory if no remote yet
-cd fullchipUSC
-git checkout gpu                  # M4 tip
-# Build / test as in STATUS.md
-```
 
 ---
 
