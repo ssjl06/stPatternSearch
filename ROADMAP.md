@@ -11,6 +11,11 @@ completed work and the M5 profile baseline that drives the new ordering.
   with NVLink/InfiniBand are also fine.
 - Single-GPU hosts can still run `mpirun -n 1`, but won't exercise the
   NCCL device-direct path and won't reproduce the multi-GPU speedups.
+- **Broken GPU-pair PCIe P2P** (common in containers/VMs without NVLink, e.g.
+  the 2×L4 box) makes the per-iteration NCCL bcast deadlock at iteration 0.
+  Export `NCCL_P2P_DISABLE=1` to fall back to the SHM/socket transport. See
+  STATUS.md "Known issues" for the full diagnosis. Leave P2P enabled on real
+  NVLink hardware.
 
 ### Software
 | Package | Tested version | Notes |

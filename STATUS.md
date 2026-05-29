@@ -260,12 +260,46 @@ cmake --build build -j
 # Run tests — needs num_gpus >= mpirun -n. Default ctest uses -n 2.
 # Override with -DFULLCHIPUSC_TEST_NRANKS=<n> at configure time if you have n GPUs.
 export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+# On hosts where GPU-to-GPU PCIe P2P is broken (see "Known issues" below) the
+# NCCL bcast deadlocks — export NCCL_P2P_DISABLE=1 first. Harmless on NVLink
+# boxes other than a small bandwidth hit; required on the 2×L4 container.
+export NCCL_P2P_DISABLE=1
 (cd build && ctest --output-on-failure)
 
 # Smoke
-mpirun -n 2 ./build/src/fullchipusc-solve --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
+mpirun -n 2 -x NCCL_P2P_DISABLE ./build/src/fullchipusc-solve --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
 
 # Profile breakdown
-FULLCHIPUSC_PROFILE=1 mpirun -n 2 -x FULLCHIPUSC_PROFILE \
+FULLCHIPUSC_PROFILE=1 mpirun -n 2 -x FULLCHIPUSC_PROFILE -x NCCL_P2P_DISABLE \
     ./build/src/fullchipusc-solve --N 500000 --M 10000 --K 300 --overlap 0.3 --seed 1
 ```
+
+## Known issues
+
+### NCCL P2P deadlock on broken-P2P hosts (2×L4 container) — workaround: `NCCL_P2P_DISABLE=1`
+
+**Symptom.** `mpirun -n 2` hangs forever; `-n 1` is fine. With per-rank tracing
+the hang is at the **first NCCL broadcast of iteration 0** (`usc_solver.cu`,
+the `nccl_comm_->bcast<ElementId>(...)->wait()` device-direct payload bcast).
+Both ranks agree on `winner_score`/`winner_rank` via the MPI MAXLOC allreduce
+and clear the MPI patch-id bcast, then the **root rank returns from the NCCL
+bcast while the non-root rank blocks in `cudaStreamSynchronize` forever** — a
+mismatched-collective deadlock with identical args on both sides.
+
+**Root cause.** Not a code bug — the `solve()` collective order is correct.
+On this container NCCL selects `P2P/CUMEM` (PCIe peer-to-peer; the two L4s have
+no NVLink) but P2P data transfer never actually completes — a common ACS/IOMMU
+limitation in virtualized/container GPU setups. NCCL believes P2P works and
+picks it, so the broadcast stalls.
+
+**Confirmation.** With `NCCL_P2P_DISABLE=1` (forces NCCL onto the SHM/socket
+transport) the full suite passes reliably (27/27, ~42 s) and the standalone
+solver reproduces the documented baselines (`selected=324` for the smoke case,
+`selected=5378` for LARGE). With P2P enabled the result is *flaky*: the suite
+sometimes passes by lucky timing and sometimes deadlocks at iter 0.
+
+**When to set it.** Required on any host whose GPU-pair P2P is broken (this 2×L4
+box). On real NVLink hardware (the 2×A100 box used for the M5 perf tables) leave
+P2P enabled — disabling it there only costs a little bcast bandwidth. It is a
+runtime env var, deliberately *not* baked into the binary, so NVLink hosts keep
+the fast path.
