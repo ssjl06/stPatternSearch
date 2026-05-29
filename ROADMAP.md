@@ -47,39 +47,32 @@ export CUDA_ARCH=<your GPU arch, e.g. 80 for A100>
 
 ---
 
-## M5.5 — `score_update_kernel` rework (next, profile-driven)
+## M5.5 — `score_update` strategy A ✅ DONE (2026-05-29)
 
-### Why this jumped ahead of M6
+Replaced the strategy-B full sweep with `score_update_invidx_kernel` (design
+doc §6.3 strategy A): one block per newly covered element, inverted-index
+lookup, per-patch atomic −1. See STATUS.md decision #7 and the M5.5 profile
+table for the full write-up.
 
-M5 profile at the 20× workload (N=10M, M=100K, K=1000) shows
-`score_update_kernel` is **78% of solve time** at size=2 (15 of 19 s).
-Everything else combined is <22%. Until this is addressed, no other change
-moves the needle meaningfully.
+**Result (2×L4):** bit-identical `selected` at all four scales; 27 ctest pass
+at size=2. `score_update` total dropped 2.2× (LARGE) / 5.8× (4×) on the same
+hardware, and its 20× profile share fell from **78% → 18%** of solve. The new
+top stage is `argmax + 16 B D2H` (29%).
 
-### Candidate approaches (pick after a microbench)
-
-| Approach | Idea | Expected effect | Risk |
-|---|---|---|---|
-| **Strategy A: inverted-index, affected-only** | Per design doc §6.3. After each iter, gather only patches that share an element with `newly_covered`; skip the rest. Inverted index `d_inv_*` is already built but unused. | Big in later iters as `affected` shrinks; small early. -30–50% on `score_update`. | Irregular gather; needs careful kernel design. atomicSub on scores. |
-| **Strategy B + fusion** | Keep full sweep but fuse `set_bits` + `score_update` into one kernel (read `newly_covered_ids` once, then sweep). | -20–30% via fewer launches and one less global pass. | Smaller win; familiar pattern. |
-| **CUDA Graph capture of the iteration** | Capture the 7-kernel iter pattern as a graph, launch with `cudaGraphLaunch`. Re-record only when `winner_score` changes "shape." | -1–2 s (launch overhead). Complements either A or B. | Recapture cost when shape changes; needs guard. |
-| **Hybrid A/B** | Choose per-iter based on `popcount(newly_covered)` — design doc §6.3 explicitly suggests this. | Best in theory; both kernels must exist. | More code. |
-
-Recommended order: (1) **strategy A first** because it's the design-doc
-default and exploits already-built `d_inv_*`; (2) measure; (3) add graph
-capture if launch overhead still shows up.
-
-### Verification target
-
-- bit-identical against M5 baseline at all four scales (Small / LARGE / 4× /
-  20×) — `selected` sequence must match exactly.
-- 27 ctest pass at size=2.
-- 20× size=2 solve time should drop from ~19.3 s to ≤12 s if strategy A
-  delivers the expected affected-set scaling in late iters.
+Not pursued (recorded for later, in priority order if argmax becomes the
+constraint):
+- **Bucket / segmented argmax** to replace the full O(M_local) CUB scan every
+  iteration — now the largest single stage.
+- **CUDA Graph capture** of the per-iteration kernel chain to shave launch
+  overhead (complements any argmax change).
+- **Hybrid A/B** (design doc §6.3): pick per-iter by `popcount(newly_covered)`.
+  Skipped because strategy A's total work is provably ≤ B's in every iteration
+  (A touches a subset of incidences), so B never wins — the hybrid would be
+  dead weight at current scales.
 
 ---
 
-## M6 — Element-partitioned covered bitset (§7.3)
+## M6 — Element-partitioned covered bitset (§7.3)  ← next
 
 ### Goal
 When N is large enough that `d_covered_` (N/64 words per rank) becomes a
@@ -149,15 +142,19 @@ Capture format spec from the OPC team before designing the reader.
   `build_newly_covered_kernel` still reads `patches_.offsets[lbp]` on host —
   could pull from `d_patch_offsets_` via a tiny D2H to drop the host
   dependency.
-- **`d_inv_*` allocated but unused at M5** — used by M5.5 strategy A if we
-  go that route; otherwise remove the device mirror.
+- ~~**`d_inv_*` allocated but unused at M5**~~ — RESOLVED in M5.5: the device
+  inverted index is the backbone of `score_update_invidx_kernel`.
+- ~~**`d_newly_covered_` per-iter bitset**~~ — REMOVED in M5.5: strategy A reads
+  the sparse list + inverted index directly, so the dense per-iter bitset (and
+  its second `set_bits` launch) is gone. `d_covered_` (cumulative) stays.
 - **Determinism audit**: `build_newly_covered_kernel`'s `atomicAdd` makes
   `d_newly_covered_ids` ordering non-deterministic. The *set* is identical
-  and downstream consumers are order-insensitive, but if anything ever
-  relies on order this needs a stable sort or grid-strided write.
+  and downstream consumers are order-insensitive (strategy A's per-patch
+  decrements commute), but if anything ever relies on order this needs a
+  stable sort or grid-strided write.
 - **Stream awareness**: All kernels use the default stream. Per-step streams
   + explicit `cudaStreamSynchronize` would document intent and unlock
   comm/compute overlap.
 - **Profile gating**: `FULLCHIPUSC_PROFILE=1` instrumentation lives in
-  `solve()`; off path has no sync. Keep until M5.5 is done so we can
-  re-measure stage shares.
+  `solve()`; off path has no sync. Kept through M5.5 (used to confirm the
+  78% → 18% shift); next useful for a possible argmax rework.

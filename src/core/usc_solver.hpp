@@ -87,7 +87,6 @@ private:
     DeviceBuffer<PatchId>       d_inv_data_;
     DeviceBuffer<Score>         d_scores_;
     DeviceBuffer<std::uint64_t> d_covered_;         // N/64 words, zero-init
-    DeviceBuffer<std::uint64_t> d_newly_covered_;   // N/64 words (scratch, M4+)
 };
 
 }  // namespace fullchipusc

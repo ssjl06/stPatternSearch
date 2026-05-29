@@ -2,7 +2,6 @@
 
 #include <stComm/stComm.h>
 
-#include <cub/block/block_reduce.cuh>
 #include <cub/device/device_reduce.cuh>
 #include <cub/util_type.cuh>
 #include <cuda_runtime.h>
@@ -44,8 +43,8 @@ __global__ void set_bits_kernel(std::uint64_t* bitset,
 // the IDs that are NOT yet covered into out_ids. atomicAdd on out_count
 // allocates output slots; ordering of out_ids is therefore non-deterministic,
 // but the resulting *set* matches the host build. Downstream consumers
-// (bcast + set_bits_kernel into d_covered_ / d_newly_covered_) are
-// order-insensitive (atomicOr / popcount on a bitset).
+// (bcast + set_bits_kernel into d_covered_, strategy-A score update) are
+// order-insensitive (atomicOr on a bitset / commutative atomic decrements).
 __global__ void build_newly_covered_kernel(const ElementId*     patch_data,
                                            std::uint64_t        start,
                                            std::uint64_t        end,
@@ -63,38 +62,61 @@ __global__ void build_newly_covered_kernel(const ElementId*     patch_data,
     }
 }
 
-// Design doc §6.2: one block per patch, threads cooperatively scan the patch's
-// element IDs against `newly_covered` and sum the intersection size; that delta
-// is subtracted from the patch's score. Patches with score <= 0 short-circuit.
-__global__ void score_update_kernel(const ElementId*     patch_data,
-                                    const std::uint64_t* patch_offsets,
-                                    const std::uint64_t* newly_covered,
-                                    Score*               scores,
-                                    std::uint64_t        M_local) {
-    const std::uint64_t p = blockIdx.x;
-    if (p >= M_local) return;
+// Design doc §6.3 strategy A — inverted-index, affected-only score update.
+//
+// One block per *newly covered* element (grid = winner_score). The block looks
+// up that element in this rank's inverted index (binary search over the sorted
+// `inv_keys`) and decrements by one the score of every patch that contains it.
+//
+// Correctness vs the strategy-B full sweep: a patch's score equals its count of
+// still-uncovered elements, so subtracting 1 for each newly covered element it
+// contains is exactly popcount(patch ∩ newly_covered). Because each element
+// transitions to "covered" exactly once over the whole solve, every
+// (element, patch) incidence is visited at most once across all iterations —
+// total work is O(local inverted-index size), not O(iters × M·K) like the full
+// sweep. A patch whose score has reached 0 has all its elements covered, so none
+// of them can reappear in a future newly_covered list and its score is never
+// touched again — matching strategy B's `score <= 0` early-out bit-for-bit.
+// Elements not present on this rank fall out of the binary search and are
+// skipped (the index stores only locally-occurring elements).
+__global__ void score_update_invidx_kernel(const ElementId*     newly_ids,
+                                           std::uint64_t        n,
+                                           const ElementId*     inv_keys,
+                                           std::uint64_t        inv_keys_n,
+                                           const std::uint64_t* inv_offsets,
+                                           const PatchId*       inv_data,
+                                           Score*               scores) {
+    const std::uint64_t e = blockIdx.x;
+    if (e >= n) return;
 
-    // Early-out for disabled patches. Score is shared across all threads but
-    // each reads the same value, so no synchronization needed before this.
-    if (scores[p] <= 0) return;
-
-    const std::uint64_t start = patch_offsets[p];
-    const std::uint64_t end   = patch_offsets[p + 1];
-
-    std::uint64_t local_delta = 0;
-    for (std::uint64_t i = start + threadIdx.x; i < end; i += blockDim.x) {
-        const ElementId id = patch_data[i];
-        const std::uint64_t bit =
-            (newly_covered[id >> 6] >> (id & 63)) & 1ULL;
-        local_delta += bit;
+    // Resolve the element's patch-list range once (thread 0), share to the block.
+    __shared__ std::uint64_t s_start;
+    __shared__ std::uint64_t s_end;
+    if (threadIdx.x == 0) {
+        const ElementId id = newly_ids[e];
+        std::uint64_t lo = 0, hi = inv_keys_n;
+        while (lo < hi) {                       // lower_bound over sorted keys
+            const std::uint64_t mid = lo + ((hi - lo) >> 1);
+            if (inv_keys[mid] < id) lo = mid + 1;
+            else                    hi = mid;
+        }
+        if (lo < inv_keys_n && inv_keys[lo] == id) {
+            s_start = inv_offsets[lo];
+            s_end   = inv_offsets[lo + 1];
+        } else {
+            s_start = 0;        // element not on this rank → empty range
+            s_end   = 0;
+        }
     }
+    __syncthreads();
 
-    using BlockReduce = cub::BlockReduce<std::uint64_t, kScoreBlockThreads>;
-    __shared__ typename BlockReduce::TempStorage temp;
-    const std::uint64_t block_delta = BlockReduce(temp).Sum(local_delta);
-
-    if (threadIdx.x == 0 && block_delta > 0) {
-        scores[p] -= static_cast<Score>(block_delta);
+    // Score is int64; CUDA has no 64-bit atomicSub, so add the two's-complement
+    // of 1 via the unsigned 64-bit atomicAdd. Subtractions commute, so the final
+    // per-patch score is order-independent (deterministic).
+    for (std::uint64_t i = s_start + threadIdx.x; i < s_end; i += blockDim.x) {
+        const PatchId q = inv_data[i];
+        atomicAdd(reinterpret_cast<unsigned long long*>(&scores[q]),
+                  static_cast<unsigned long long>(-1LL));
     }
 }
 
@@ -349,7 +371,6 @@ void USCSolver<CommT>::setup() {
     d_inv_data_.resize(inv_data_n);
     d_scores_.resize(M_local);
     d_covered_.resize(covered_words);
-    d_newly_covered_.resize(covered_words);
 
     if (patch_data_n) d_patch_data_.copy_from_host(patches_.data.data(),    patch_data_n);
     if (patch_offs_n) d_patch_offsets_.copy_from_host(patches_.offsets.data(), patch_offs_n);
@@ -364,9 +385,8 @@ void USCSolver<CommT>::setup() {
     }
     if (M_local) d_scores_.copy_from_host(initial_scores.data(), M_local);
 
-    // covered/newly_covered start empty.
+    // covered starts empty.
     d_covered_.zero();
-    d_newly_covered_.zero();
 }
 
 // Multi-rank greedy loop. Hot data (PatchCsr, scores, covered, newly_covered)
@@ -380,7 +400,7 @@ void USCSolver<CommT>::setup() {
 //   [device] build_newly_covered_kernel writes sparse list  (winner only)
 //        NCCL_Bcast<ElementId>(d_newly_covered_ids, winner_score, winner_rank)
 //          — device-direct, no D2H/H2D for the payload
-//   [device] set_bits × 2 (d_covered_, d_newly_covered_) + score_update_kernel
+//   [device] set_bits (d_covered_) + score_update_invidx_kernel (strategy A)
 //        H2D 1 Score = -1 (winner only)
 template<typename CommT>
 SolverResult USCSolver<CommT>::solve() {
@@ -512,12 +532,13 @@ SolverResult USCSolver<CommT>::solve() {
         result.selected.push_back(winner_global);
 
         // ------------------------------------------------------------------
-        // Score update on device (design doc §6.2, strategy B — full sweep).
-        // All ranks: update d_covered_ (cumulative) and build d_newly_covered_
-        // (per-iter bitset) via atomicOr from the sparse list.
+        // All ranks fold the sparse newly_covered list into the cumulative
+        // d_covered_ bitset (consumed by next iteration's build kernel and the
+        // termination check). Strategy A reads the sparse list + inverted index
+        // directly, so the per-iteration newly_covered *bitset* is no longer
+        // needed — one set_bits launch instead of two.
         // ------------------------------------------------------------------
         auto t5 = tick();
-        d_newly_covered_.zero();
         if (winner_score > 0) {
             const int block = 128;
             const int grid  = static_cast<int>(
@@ -526,22 +547,26 @@ SolverResult USCSolver<CommT>::solve() {
                                               d_newly_covered_ids.data(),
                                               static_cast<std::size_t>(winner_score));
             cuda_launch_check("set_bits_kernel (covered)");
-            set_bits_kernel<<<grid, block>>>(d_newly_covered_.data(),
-                                              d_newly_covered_ids.data(),
-                                              static_cast<std::size_t>(winner_score));
-            cuda_launch_check("set_bits_kernel (newly_covered)");
         }
         if (profile_enabled) add_elapsed(t_set_bits_ns, t5);
 
+        // Score update — design doc §6.3 strategy A (inverted-index, affected
+        // only). One block per newly covered element; each decrements the score
+        // of every local patch containing it. Bit-identical to the strategy-B
+        // full sweep (see kernel comment), but visits each incidence once over
+        // the whole solve instead of re-sweeping all patches every iteration.
         auto t6 = tick();
-        if (M_loc > 0) {
-            score_update_kernel<<<static_cast<unsigned>(M_loc), kScoreBlockThreads>>>(
-                d_patch_data_.data(),
-                d_patch_offsets_.data(),
-                d_newly_covered_.data(),
-                d_scores_.data(),
-                M_loc);
-            cuda_launch_check("score_update_kernel");
+        if (winner_score > 0) {
+            score_update_invidx_kernel<<<static_cast<unsigned>(winner_score),
+                                         kScoreBlockThreads>>>(
+                d_newly_covered_ids.data(),
+                static_cast<std::uint64_t>(winner_score),
+                d_inv_keys_.data(),
+                inv_.num_keys(),
+                d_inv_offsets_.data(),
+                d_inv_data_.data(),
+                d_scores_.data());
+            cuda_launch_check("score_update_invidx_kernel");
         }
         if (profile_enabled) add_elapsed(t_score_update_ns, t6);
 

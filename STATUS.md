@@ -1,4 +1,4 @@
-# fullchipUSC — Status (as of M5 completion, 2026-05-28)
+# fullchipUSC — Status (as of M5.5 completion, 2026-05-29)
 
 ## Project
 
@@ -15,8 +15,8 @@ covers every unique hash. Design rationale lives in [`greedy_set_cover.md`](gree
 | M3 | Distributed sample sort setup (§5.1) + sparse bcast (§7.2) | ✅ Done | `main` |
 | M4 | GPU port (CUDA kernels, CUB ArgMax, DeviceBuffer) | ✅ Done | `gpu` |
 | M5 | NCCL device-direct broadcast for newly_covered_ids | ✅ Done | `gpu` |
-| M5.5 | score_update kernel rework (strategy A or fusion) — driven by profile | ⏳ Next | `gpu` |
-| M6 | Element-partitioned covered bitset (§7.3) | ⏳ Planned | |
+| M5.5 | score_update strategy A (inverted-index, affected-only) | ✅ Done | `gpu` |
+| M6 | Element-partitioned covered bitset (§7.3) | ⏳ Next | |
 | M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ Planned | |
 
 ## Branch model
@@ -99,7 +99,7 @@ tests/
 | MPI Bcast&lt;PatchId&gt; winner_global (8 B) | host | tiny |
 | build_newly_covered_kernel (winner only) | device | — |
 | **NCCL Bcast&lt;ElementId&gt; on d_newly_covered_ids** | **device-direct** | **no host staging** |
-| set_bits ×2 + score_update_kernel | device | — |
+| set_bits (d_covered_ only) + score_update_invidx_kernel (strategy A) | device | — |
 | H2D 8 B (Score = -1) winner disable | host stub | tiny |
 
 The payload (`d_newly_covered_ids`, sized winner_score × 8 B) **never visits host
@@ -136,11 +136,21 @@ API (root/count must be host scalars).
    hash distributions. `compute_splitters()` implements the 6 standard
    sample sort steps.
 
-7. **Score update strategy B (full sweep) — for now** — design doc §6.3
-   alternatives: A (inverted-index, affected-only) and B (full sweep). B is
-   currently used because of its regular kernel pattern. M5 profile shows
-   `score_update_kernel` dominates (78% of solve at the 20× workload), so
-   M5.5 will revisit and likely adopt A or a fused variant.
+7. **Score update strategy A (inverted-index, affected-only)** — design doc
+   §6.3. M5 used strategy B (full sweep) and its profile showed
+   `score_update_kernel` dominating (78% of solve at the 20× workload). M5.5
+   replaced it: `score_update_invidx_kernel` launches one block per *newly
+   covered element*, looks the element up in this rank's inverted index
+   (`d_inv_*`, built since M3 but unused until now) and decrements the score of
+   every patch containing it. Because each element is covered exactly once over
+   the whole solve, every (element, patch) incidence is touched at most once —
+   total work is O(local inverted-index size) instead of O(iters × M·K). The
+   result is **bit-identical** to strategy B: a patch's score is its uncovered-
+   element count, so per-element −1 equals popcount(patch ∩ newly_covered), and
+   a score-0 patch's elements can never reappear in a future newly_covered list
+   (matching B's `score <= 0` early-out). int64 scores use a 64-bit `atomicAdd`
+   of −1 (no 64-bit `atomicSub` exists); decrements commute, so scores stay
+   deterministic. The strategy-B kernel lives on the `main` branch for bisect.
 
 8. **Optional profile instrumentation in solve()** — gated by env var
    `FULLCHIPUSC_PROFILE=1`; off path has no sync overhead. Used to pinpoint
@@ -187,9 +197,11 @@ work-distributable across ranks.
 
 ### Profile baseline — 20× workload, `FULLCHIPUSC_PROFILE=1`
 
-| Stage | size=2 μs/iter | size=2 ms total | share |
+The original M5 profile (2×A100) had `score_update` at **78% of solve**:
+
+| Stage (M5, 2×A100) | size=2 μs/iter | size=2 ms total | share |
 |---|---|---|---|
-| **score_update** | 421 | **15063** | **78%** ← dominant |
+| **score_update (strategy B)** | 421 | **15063** | **78%** ← dominant |
 | argmax + 16 B D2H | 28 | 996 | 5% |
 | nccl_bcast | 27 | 969 | 5% |
 | set_bits ×2 | 17 | 624 | 3% |
@@ -197,8 +209,39 @@ work-distributable across ranks.
 | build_kernel | 8 | 299 | 2% |
 | winner_disable, patchid_bcast | — | 343 | 2% |
 
-`score_update` is now the unambiguous next target (M5.5). NCCL latency is
-constant ~27 μs/iter and only matters at small workloads.
+### M5.5 result — strategy A, 20× workload (2×L4-24GB, this box)
+
+> Note: the M5.5 measurements below are on **2×NVIDIA L4** (the hardware
+> available for this milestone), not the 2×A100 used for the M5 table above, so
+> absolute solve times are not directly comparable across the two tables. The
+> *stage shares* and the within-L4 before/after comparison (next table) are the
+> apples-to-apples signal.
+
+| Stage (M5.5, 2×L4) | size=2 μs/iter | size=2 ms total | share |
+|---|---|---|---|
+| argmax + 16 B D2H | 19.9 | 713 | **29%** ← new top stage |
+| nccl_bcast | 14.9 | 535 | 22% |
+| **score_update (strategy A)** | 12.5 | **447** | **18%** (was 78%) |
+| set_bits (×1 now) | 5.7 | 204 | 8% |
+| build_kernel | 4.4 | 158 | 7% |
+| winner_disable | 3.1 | 113 | 5% |
+| maxloc | 2.6 | 92 | 4% |
+
+solve total at 20× = **2425 ms**; `selected=35824` — bit-identical to M5.
+
+### Strategy B → A, same hardware (2×L4), `score_update` total ms
+
+| Workload | B (was) | A (now) | speedup | solve total B→A |
+|---|---|---|---|---|
+| LARGE | 106 | 48 | 2.2× | 428 → 349 ms |
+| 4× | 853 | 146 | 5.8× | 1765 → 980 ms |
+
+The win grows with M (patch count) because B re-sweeps all M patches every
+iteration while A touches each incidence once total. At the 20× scale (M=100K)
+B's `score_update` would dominate as on A100; A drops it to 18% of solve.
+`argmax + 16 B D2H` (full O(M_local) CUB scan every iter) is now the top stage
+— a candidate for a future bucket/segmented argmax, but well behind where
+`score_update` was.
 
 ## Build & run (current environment)
 
