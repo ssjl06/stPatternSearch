@@ -16,8 +16,19 @@ covers every unique hash. Design rationale lives in [`greedy_set_cover.md`](gree
 | M4 | GPU port (CUDA kernels, CUB ArgMax, DeviceBuffer) | ✅ Done | `gpu` |
 | M5 | NCCL device-direct broadcast for newly_covered_ids | ✅ Done | `gpu` |
 | M5.5 | score_update strategy A (inverted-index, affected-only) | ✅ Done | `gpu` |
-| M6 | Element-partitioned covered bitset (§7.3) | ⏳ Next | |
+| — | Segmented argmax (tried, no gain — loop is latency-bound) | ⛔ Reverted | |
+| M6 | Element-partitioned covered bitset (§7.3) | ⏸ Deferred (speculative; needs real N/M×K) | |
 | M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ Planned | |
+
+> **Next-work note (2026-05-29):** the per-iteration hot loop is **latency/
+> launch-bound, not compute-bound** (argmax ≈ 20 µs flat across a 5× M range).
+> A **device-resident single-rank loop** (no per-iter D2H/H2D, batched
+> termination) was prototyped and measured **2.7× / 2.06× faster** at size=1,
+> bit-identical — then reverted to keep solve() simple (re-implement from the
+> ROADMAP note if single-GPU throughput matters). The **multi-rank all-NCCL**
+> version was attempted and reverted (correctness bug at scale, too complex).
+> Both lessons + the segmented-argmax post-mortem are in ROADMAP.md
+> "Full-GPU iteration track".
 
 ## Branch model
 
