@@ -171,4 +171,8 @@ cat <<EOF
     cmake --build build -j
 
     cd build && ctest --output-on-failure
+
+If a multi-GPU run hangs at the first NCCL broadcast (common on container/VM
+hosts without NVLink, e.g. 2xL4 — broken PCIe P2P), export NCCL_P2P_DISABLE=1
+before launching. See STATUS.md "Known issues" for details.
 EOF
