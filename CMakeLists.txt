@@ -56,13 +56,12 @@ add_subdirectory(src)
 
 if(FULLCHIPUSC_BUILD_TESTS)
     enable_testing()
-    include(FetchContent)
-    FetchContent_Declare(
-        googletest
-        GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG        v1.15.2
-    )
-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(googletest)
+    # Use a system-installed GoogleTest. Point CMake at a custom install with
+    # any of the standard hints, e.g.:
+    #   -DGTEST_ROOT=/path/to/gtest        (FindGTest module hint)
+    #   -DGTest_ROOT=/path/to/gtest        (<Package>_ROOT, CMP0074)
+    #   -DCMAKE_PREFIX_PATH=/path/to/gtest (generic prefix)
+    find_package(GTest REQUIRED)
+    message(STATUS "fullchipUSC: GTest found (${GTest_DIR})")
     add_subdirectory(tests)
 endif()

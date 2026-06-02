@@ -46,7 +46,9 @@ command -v mpicxx  >/dev/null 2>&1 || need_apt+=(openmpi-bin libopenmpi-dev)
 command -v git     >/dev/null 2>&1 || need_apt+=(git)
 command -v wget    >/dev/null 2>&1 || need_apt+=(wget ca-certificates)
 command -v curl    >/dev/null 2>&1 || need_apt+=(curl)
-# stComm's CMake calls find_package(GTest) — apt provides prebuilt libs on Ubuntu 22.04+.
+# Both stComm and fullchipUSC call find_package(GTest) to link the test suite
+# against a system-installed GoogleTest — apt provides prebuilt libs on Ubuntu
+# 22.04+. Point CMake at a custom install via -DGTEST_ROOT / -DCMAKE_PREFIX_PATH.
 [ -f /usr/include/gtest/gtest.h ]  || need_apt+=(libgtest-dev libgmock-dev)
 
 SUDO=""
