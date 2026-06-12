@@ -32,9 +32,10 @@ void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
     SyntheticParams params;
     params.N = N; params.M = M; params.K_mean = K; params.overlap = overlap; params.seed = seed;
 
-    // Distributed path: every rank gets its slice, runs USCSolver.
-    stComm::MPIComm comm;
-    USCSolver<stComm::MPIComm> solver(comm, test_helpers::nccl_comm());
+    // Distributed path: every rank gets its slice, runs USCSolver on the shared
+    // device-enabled Comm (Host space for setup, Device space for the hot path).
+    stComm::Comm& comm = test_helpers::comm();
+    USCSolver solver(comm);
     auto raw_full = generate_synthetic(params);
     auto slice    = slice_patches_by_rank(raw_full, comm.getRank(), comm.getSize());
     solver.load(std::move(slice.patches), std::move(slice.global_ids));
