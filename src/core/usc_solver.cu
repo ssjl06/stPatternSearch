@@ -146,9 +146,8 @@ inline void cuda_sync_check(const char* what) {
 //
 // Returns a sorted vector of size (size-1) splitter Hash values. For size == 1
 // returns empty (no partitioning needed).
-template<typename CommT>
 std::vector<Hash> compute_splitters(const std::vector<Hash>& local_uniq_sorted,
-                                    CommT& comm) {
+                                    stComm::Comm& comm) {
     constexpr int kSamplesPerRank = 128;
     const int size = comm.getSize();
     if (size <= 1) return {};
@@ -180,7 +179,7 @@ std::vector<Hash> compute_splitters(const std::vector<Hash>& local_uniq_sorted,
     const std::size_t total_samples = static_cast<std::size_t>(size) * kSamplesPerRank;
     std::vector<Hash> all_samples(total_samples);
     std::vector<int>  recvcounts(static_cast<std::size_t>(size), kSamplesPerRank);
-    comm.template allgatherv<Hash>(local_sample.data(), kSamplesPerRank,
+    comm.allgatherv<stComm::Space::Host, Hash>(local_sample.data(), kSamplesPerRank,
                                    all_samples.data(), recvcounts.data())->wait();
 
     // Step 3: sort all samples (every rank computes identical splitters).
@@ -205,25 +204,22 @@ inline int target_rank_for_hash(Hash h, const std::vector<Hash>& splitters) {
 
 }  // namespace
 
-template<typename CommT>
-USCSolver<CommT>::USCSolver(CommT& comm,
-                            std::shared_ptr<stComm::NCCLComm> nccl_comm)
-    : comm_(comm), nccl_comm_(std::move(nccl_comm)) {
-    if (!nccl_comm_) {
+USCSolver::USCSolver(stComm::Comm& comm)
+    : comm_(comm) {
+    if (!comm_.hasDevice()) {
         throw std::invalid_argument(
-            "USCSolver requires an initialized NCCLComm — fullchipUSC is GPU-only.");
+            "USCSolver requires a device-enabled Comm (Comm::onDevice) — "
+            "fullchipUSC is GPU-only.");
     }
 }
 
-template<typename CommT>
-void USCSolver<CommT>::load(std::vector<std::vector<Hash>> raw_patches,
+void USCSolver::load(std::vector<std::vector<Hash>> raw_patches,
                             std::vector<PatchId>           patch_global_ids) {
     raw_patches_      = std::move(raw_patches);
     patch_global_ids_ = std::move(patch_global_ids);
 }
 
-template<typename CommT>
-void USCSolver<CommT>::setup() {
+void USCSolver::setup() {
     const int size = comm_.getSize();
     const int rank = comm_.getRank();
 
@@ -277,7 +273,7 @@ void USCSolver<CommT>::setup() {
     std::vector<int> all_sendcounts(static_cast<std::size_t>(size) * size);
     {
         std::vector<int> uniform(static_cast<std::size_t>(size), size);
-        comm_.template allgatherv<int>(sendcounts.data(), size,
+        comm_.allgatherv<stComm::Space::Host, int>(sendcounts.data(), size,
                                        all_sendcounts.data(), uniform.data())->wait();
     }
     std::vector<int> recvcounts(static_cast<std::size_t>(size), 0);
@@ -286,7 +282,7 @@ void USCSolver<CommT>::setup() {
     // Step 4: alltoallv — every hash flies to its owner rank.
     const int total_recv = std::accumulate(recvcounts.begin(), recvcounts.end(), 0);
     std::vector<Hash> recvbuf(static_cast<std::size_t>(total_recv));
-    comm_.template alltoallv<Hash>(sendbuf.data(), sendcounts.data(),
+    comm_.alltoallv<stComm::Space::Host, Hash>(sendbuf.data(), sendcounts.data(),
                                    recvbuf.data(), recvcounts.data())->wait();
 
     // Step 5: form this rank's bucket universe — sorted unique view of recvbuf.
@@ -296,13 +292,15 @@ void USCSolver<CommT>::setup() {
     bucket.erase(std::unique(bucket.begin(), bucket.end()), bucket.end());
 
     // Step 6: Exscan over bucket sizes → this rank's first global ID.
+    // exscan is async on the unified Comm; wait() immediately for the scalar.
     const std::uint64_t local_shard_size = bucket.size();
-    const std::uint64_t global_id_start  =
-        comm_.template exscan<std::uint64_t>(local_shard_size, MPI_SUM);
+    std::uint64_t global_id_start = 0;
+    comm_.exscan<stComm::Space::Host>(local_shard_size, &global_id_start,
+                                      stComm::ReduceOp::Sum)->wait();
 
     // Step 7: only the last rank knows N at this point; broadcast it.
     std::uint64_t N_total = (rank == size - 1) ? (global_id_start + local_shard_size) : 0;
-    comm_.template bcast<std::uint64_t>(&N_total, 1, size - 1)->wait();
+    comm_.bcast<stComm::Space::Host, std::uint64_t>(&N_total, 1, size - 1)->wait();
     N_ = N_total;
 
     // Step 8: for every slot in recvbuf (in arrival order, possibly with dupes),
@@ -317,7 +315,7 @@ void USCSolver<CommT>::setup() {
     // Step 9: reverse alltoallv — IDs travel back to original senders. The
     // sendcounts and recvcounts arrays swap roles relative to Step 4.
     std::vector<std::uint64_t> id_back(sendbuf.size());
-    comm_.template alltoallv<std::uint64_t>(id_response.data(), recvcounts.data(),
+    comm_.alltoallv<stComm::Space::Host, std::uint64_t>(id_response.data(), recvcounts.data(),
                                             id_back.data(),     sendcounts.data())->wait();
 
     // Step 10: sendbuf[i] ↔ id_back[i] are paired by construction. Build this
@@ -402,8 +400,7 @@ void USCSolver<CommT>::setup() {
 //          — device-direct, no D2H/H2D for the payload
 //   [device] set_bits (d_covered_) + score_update_invidx_kernel (strategy A)
 //        H2D 1 Score = -1 (winner only)
-template<typename CommT>
-SolverResult USCSolver<CommT>::solve() {
+SolverResult USCSolver::solve() {
     const std::uint64_t M_loc = patches_.M();
     SolverResult result;
     result.covered_count = 0;
@@ -477,7 +474,9 @@ SolverResult USCSolver<CommT>::solve() {
         if (profile_enabled) add_elapsed(t_argmax_ns, t0);
 
         auto t1 = tick();
-        auto maxloc = comm_.template allreduceMaxloc<std::int64_t>(local_best_score);
+        // allreduceMaxloc is async on the unified Comm; wait() for the pair.
+        std::pair<std::int64_t, int> maxloc;
+        comm_.allreduceMaxloc<stComm::Space::Host>(local_best_score, &maxloc)->wait();
         const std::int64_t winner_score = maxloc.first;
         const int          winner_rank  = maxloc.second;
         if (profile_enabled) add_elapsed(t_maxloc_ns, t1);
@@ -488,7 +487,7 @@ SolverResult USCSolver<CommT>::solve() {
         if (comm_.getRank() == winner_rank) {
             winner_global = patch_global_ids_[local_best_patch];
         }
-        comm_.template bcast<PatchId>(&winner_global, 1, winner_rank)->wait();
+        comm_.bcast<stComm::Space::Host, PatchId>(&winner_global, 1, winner_rank)->wait();
         if (profile_enabled) add_elapsed(t_patchid_bcast_ns, t2);
 
         // ------------------------------------------------------------------
@@ -523,7 +522,7 @@ SolverResult USCSolver<CommT>::solve() {
         // only host-visible metadata per iteration — that's a NCCL API
         // constraint (root/count must be host scalars), not a payload cost.
         auto t4 = tick();
-        nccl_comm_->template bcast<ElementId>(d_newly_covered_ids.data(),
+        comm_.bcast<stComm::Space::Device, ElementId>(d_newly_covered_ids.data(),
                                               static_cast<std::size_t>(winner_score),
                                               winner_rank)->wait();
         if (profile_enabled) add_elapsed(t_nccl_bcast_ns, t4);
@@ -613,8 +612,7 @@ SolverResult USCSolver<CommT>::solve() {
     return result;
 }
 
-template<typename CommT>
-void USCSolver<CommT>::print_solution(const SolverResult& r) const {
+void USCSolver::print_solution(const SolverResult& r) const {
     if (comm_.getRank() != 0) return;
     std::cout << "fullchipUSC solve\n"
               << "  universe N=" << N_
@@ -624,12 +622,11 @@ void USCSolver<CommT>::print_solution(const SolverResult& r) const {
               << " iterations=" << r.iterations << "\n";
 }
 
-template<typename CommT> std::uint64_t        USCSolver<CommT>::N() const            { return N_; }
-template<typename CommT> std::uint64_t        USCSolver<CommT>::M_local() const      { return patches_.M(); }
-template<typename CommT> const PatchCsr&      USCSolver<CommT>::patches() const      { return patches_; }
-template<typename CommT> const InvertedIndex& USCSolver<CommT>::inverted_index() const { return inv_; }
+std::uint64_t        USCSolver::N() const            { return N_; }
+std::uint64_t        USCSolver::M_local() const      { return patches_.M(); }
+const PatchCsr&      USCSolver::patches() const      { return patches_; }
+const InvertedIndex& USCSolver::inverted_index() const { return inv_; }
 
 // Explicit instantiation for the M2 backend.
-template class USCSolver<stComm::MPIComm>;
 
 }  // namespace fullchipusc

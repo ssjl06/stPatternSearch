@@ -4,14 +4,12 @@
 #include <stComm/stComm.h>
 
 #include <cuda_runtime.h>
-#include <mpi.h>
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
-#include <memory>
 #include <string>
 
 namespace {
@@ -23,10 +21,10 @@ struct CliOptions {
     bool print_solution = false;
 };
 
-// Per-process GPU pick. Rank-r picks GPU (r % visible_count). Caller must
-// invoke this *before* the NCCL communicator is initialized — NCCL records
-// the active device at ncclCommInitRank.
-void pick_device_for_rank(int rank) {
+// Per-process GPU pick: rank-r uses GPU (r % visible_count). Sets the active
+// device for this rank's own CUDA allocations and returns the device id to hand
+// to Comm::onDevice (which bootstraps NCCL on it). Exits if no GPU is visible.
+int pick_device_for_rank(int rank) {
     int num_gpus = 0;
     cudaError_t err = cudaGetDeviceCount(&num_gpus);
     if (err != cudaSuccess || num_gpus <= 0) {
@@ -37,23 +35,7 @@ void pick_device_for_rank(int rank) {
     }
     const int device_id = rank % num_gpus;
     cudaSetDevice(device_id);
-}
-
-// Bootstrap a NCCLComm shared by all ranks. Rank 0 mints the uniqueId and
-// MPI-broadcasts it to everyone, then each rank calls ncclCommInitRank on
-// its picked device. Returns a shared_ptr the solver takes co-ownership of.
-std::shared_ptr<stComm::NCCLComm> make_nccl_comm(const stComm::MPIComm& world) {
-    ncclUniqueId nccl_id;
-    if (world.getRank() == 0) {
-        nccl_id = stComm::NCCLComm::getUniqueId();
-    }
-    MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
-
-    int device_id = 0;
-    cudaGetDevice(&device_id);  // pick_device_for_rank already set this
-    auto nc = std::make_shared<stComm::NCCLComm>();
-    nc->initialize(world.getRank(), world.getSize(), device_id, nccl_id);
-    return nc;
+    return device_id;
 }
 
 void print_usage(const char* prog) {
@@ -100,20 +82,21 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    stComm::MPIComm::initialize(&argc, &argv);
+    stComm::Comm::initialize(&argc, &argv);
     int exit_code = 0;
     {
         CliOptions opt;
         if (!parse_args(argc, argv, opt)) { exit_code = 1; }
         else {
-            stComm::MPIComm world;
-            pick_device_for_rank(world.getRank());
-            auto nccl_comm = make_nccl_comm(world);
-            USCSolver<stComm::MPIComm> solver(world, std::move(nccl_comm));
+            const int rank = stComm::Comm{}.getRank();      // host probe for device pick
+            const int device_id = pick_device_for_rank(rank);
+            // onDevice bootstraps NCCL internally (uniqueId handshake + init).
+            stComm::Comm comm = stComm::Comm::onDevice(device_id);
+            USCSolver solver(comm);
 
             auto t0 = std::chrono::steady_clock::now();
             auto slice = slice_patches_by_rank(
-                generate_synthetic(opt.params), world.getRank(), world.getSize());
+                generate_synthetic(opt.params), comm.getRank(), comm.getSize());
             solver.load(std::move(slice.patches), std::move(slice.global_ids));
             auto t1 = std::chrono::steady_clock::now();
             solver.setup();
@@ -122,7 +105,7 @@ int main(int argc, char** argv) {
             auto t3 = std::chrono::steady_clock::now();
 
             solver.print_solution(result);
-            if (world.getRank() == 0) {
+            if (comm.getRank() == 0) {
                 std::cout << "  M_local(rank0)=" << solver.M_local() << "\n";
                 std::cout << "  timing (ms): load="
                           << std::chrono::duration<double, std::milli>(t1 - t0).count()
@@ -141,6 +124,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-    stComm::MPIComm::finalize();
+    stComm::Comm::finalize();
     return exit_code;
 }

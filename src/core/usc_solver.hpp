@@ -9,10 +9,10 @@
 #include <memory>
 #include <vector>
 
-// Forward-declared so solve() can hold an optional pointer to an NCCL
-// communicator without dragging <nccl.h> into this public header. The
-// concrete type is included in usc_solver.cu where it's actually used.
-namespace stComm { class NCCLComm; }
+// Forward-declared so this public header can reference the unified comm by
+// reference without dragging <mpi.h>/<nccl.h> in. The concrete type is included
+// in usc_solver.cu where its members are actually called.
+namespace stComm { class Comm; }
 
 namespace fullchipusc {
 
@@ -22,30 +22,17 @@ struct SolverResult {
     std::uint64_t        iterations;     // number of iterations executed
 };
 
-// Greedy minimum set-cover solver, parameterized on the host-side comm
-// backend used for setup() and for the 16B MAXLOC + 8B winner_global metadata
-// each iteration. The per-iteration newly_covered_ids payload always travels
-// device-direct over NCCL, so a NCCLComm is required.
-//
-// `CommT` is a duck-typed stComm-like comm object exposing:
-//   - int  getRank() / getSize()
-//   - allreduceMaxloc<T>(T) → std::pair<T,int>
-//   - bcast<T>(T*, size_t, root) → RequestPtr (with .wait())
-//   - allgatherv<T>(...)
-//   - alltoallv<T>(...)
-//   - exscan<T>(T, op)
-//
-// Only USCSolver<stComm::MPIComm> is instantiated (NCCL covers the device hot
-// path via the injected nccl_comm_; the host backend stays MPI because NCCL
-// lacks MAXLOC/EXSCAN and setup operates on host vectors).
-template<typename CommT>
+// Greedy minimum set-cover solver over a single unified stComm::Comm. The host
+// (MPI) side drives setup() and the tiny per-iteration metadata (16B MAXLOC +
+// 8B winner_global); the per-iteration newly_covered_ids payload travels
+// device-direct over NCCL via the same Comm's Device space. The Comm must be
+// device-enabled (built with Comm::onDevice) — fullchipUSC is GPU-only.
 class USCSolver {
 public:
-    // `comm` is host-side MPI for setup + tiny metadata in solve().
-    // `nccl_comm` is the GPU communicator for the per-iteration
-    // newly_covered_ids broadcast; must be initialized (rank/device/uniqueId)
-    // before construction. Both are required.
-    USCSolver(CommT& comm, std::shared_ptr<stComm::NCCLComm> nccl_comm);
+    // `comm` must be a device-enabled Comm (Comm::onDevice): its Host space
+    // backs setup() + solve() metadata, its Device space backs the hot-path
+    // newly_covered_ids broadcast.
+    explicit USCSolver(stComm::Comm& comm);
 
     // Inject this rank's local patches plus their global patch IDs.
     void load(std::vector<std::vector<Hash>> raw_patches,
@@ -67,8 +54,7 @@ public:
     const InvertedIndex& inverted_index() const;
 
 private:
-    CommT& comm_;
-    std::shared_ptr<stComm::NCCLComm> nccl_comm_;      // required; hot-path device bcast
+    stComm::Comm& comm_;   // device-enabled; Host space + Device space hot path
 
     std::vector<std::vector<Hash>> raw_patches_;       // freed after setup()
     std::vector<PatchId>           patch_global_ids_;  // local idx → global PatchId
