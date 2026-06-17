@@ -3,36 +3,31 @@
 #include "core/csr.hpp"
 #include "core/device_buffer.hpp"
 #include "core/inverted_index.hpp"
-#include "core/types.hpp"
+#include <stPS/usc_patch_selector.hpp>   // PatchSelection + the public UscPatchSelector this backs
+#include <stPS/types.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <vector>
 
-// Forward-declared so this public header can reference the unified comm by
-// reference without dragging <mpi.h>/<nccl.h> in. The concrete type is included
-// in usc_solver.cu where its members are actually called.
+// Forward-declared so this internal header drags in no <mpi.h>/<nccl.h>. The
+// concrete type is included in usc_patch_selector_impl.cu where its members are called.
 namespace stComm { class Comm; }
 
-namespace fullchipusc {
+namespace stPS {
 
-struct SolverResult {
-    std::vector<PatchId> selected;       // chosen patch IDs in order (global, identical on every rank)
-    std::uint64_t        covered_count;  // total elements covered
-    std::uint64_t        iterations;     // number of iterations executed
-};
-
-// Greedy minimum set-cover solver over a single unified stComm::Comm. The host
+// Internal implementation of the public UscPatchSelector: greedy minimum
+// set-cover over a single unified stComm::Comm. The host
 // (MPI) side drives setup() and the tiny per-iteration metadata (16B MAXLOC +
 // 8B winner_global); the per-iteration newly_covered_ids payload travels
 // device-direct over NCCL via the same Comm's Device space. The Comm must be
 // device-enabled (built with Comm::onDevice) — fullchipUSC is GPU-only.
-class USCSolver {
+class UscPatchSelectorImpl {
 public:
     // `comm` must be a device-enabled Comm (Comm::onDevice): its Host space
-    // backs setup() + solve() metadata, its Device space backs the hot-path
+    // backs setup() + select() metadata, its Device space backs the hot-path
     // newly_covered_ids broadcast.
-    explicit USCSolver(stComm::Comm& comm);
+    explicit UscPatchSelectorImpl(stComm::Comm& comm);
 
     // Inject this rank's local patches plus their global patch IDs.
     void load(std::vector<std::vector<Hash>> raw_patches,
@@ -41,11 +36,11 @@ public:
     // Distributed setup: build local PatchCsr + InvertedIndex + global universe.
     void setup();
 
-    // Multi-rank greedy main loop. All ranks return identical SolverResult.
-    SolverResult solve();
+    // Multi-rank greedy main loop. All ranks return identical PatchSelection.
+    PatchSelection select();
 
     // Print result to stdout; only the root rank actually writes anything.
-    void print_solution(const SolverResult& r) const;
+    void print_selection(const PatchSelection& r) const;
 
     // Inspection (algorithm state only; no MPI state leaked).
     std::uint64_t        N() const;
@@ -75,4 +70,4 @@ private:
     DeviceBuffer<std::uint64_t> d_covered_;         // N/64 words, zero-init
 };
 
-}  // namespace fullchipusc
+}  // namespace stPS

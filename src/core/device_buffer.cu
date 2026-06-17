@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <string>
 
-namespace fullchipusc {
+namespace stPS {
 
 namespace {
 void check(cudaError_t err, const char* what) {
@@ -74,4 +74,4 @@ void DeviceBufferImpl::zero() {
     check(cudaMemset(ptr_, 0, bytes_), "DeviceBufferImpl::zero");
 }
 
-}  // namespace fullchipusc
+}  // namespace stPS

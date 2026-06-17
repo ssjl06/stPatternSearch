@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <gtest/gtest.h>
 
-using namespace fullchipusc;
+using namespace stPS;
 
 namespace {
 std::vector<PatchId> as_vec(std::span<const PatchId> sp) {

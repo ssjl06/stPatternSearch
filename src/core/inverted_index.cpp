@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cassert>
 
-namespace fullchipusc {
+namespace stPS {
 
 std::span<const PatchId> InvertedIndex::patches_of(ElementId e) const noexcept {
     const auto it = std::lower_bound(keys.begin(), keys.end(), e);
@@ -95,4 +95,4 @@ InvertedIndex build_inverted_index(const PatchCsr& patches, std::uint64_t N) {
     return inv;
 }
 
-}  // namespace fullchipusc
+}  // namespace stPS

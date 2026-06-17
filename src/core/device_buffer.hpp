@@ -5,7 +5,7 @@
 #include <string>
 #include <utility>
 
-namespace fullchipusc {
+namespace stPS {
 
 // Exception thrown when a CUDA runtime call fails inside DeviceBuffer.
 struct CudaError : std::runtime_error {
@@ -80,4 +80,4 @@ private:
     DeviceBufferImpl impl_;
 };
 
-}  // namespace fullchipusc
+}  // namespace stPS

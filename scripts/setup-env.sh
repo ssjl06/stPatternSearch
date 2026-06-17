@@ -18,7 +18,7 @@ set -euo pipefail
 
 # ----- configuration (override via env) -----
 STCOMM_REPO_URL="${STCOMM_REPO_URL:-https://github.com/ssjl06/stComm.git}"
-STCOMM_BRANCH="${STCOMM_BRANCH:-add-bcast-maxloc-exscan}"
+STCOMM_BRANCH="${STCOMM_BRANCH:-main}"
 STCOMM_SRC="${STCOMM_SRC:-$HOME/tickets/stComm}"
 STCOMM_PREFIX="${STCOMM_PREFIX:-$HOME/install/stComm}"
 FORCE_STCOMM=0

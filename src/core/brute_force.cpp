@@ -2,11 +2,11 @@
 
 #include "core/bitset.hpp"
 
-namespace fullchipusc {
+namespace stPS {
 
-SolverResult solve_brute_force(const PatchCsr& patches, std::uint64_t N) {
+PatchSelection brute_force_select(const PatchCsr& patches, std::uint64_t N) {
     const std::uint64_t M = patches.M();
-    SolverResult result;
+    PatchSelection result;
     result.covered_count = 0;
     result.iterations    = 0;
 
@@ -49,4 +49,4 @@ SolverResult solve_brute_force(const PatchCsr& patches, std::uint64_t N) {
     return result;
 }
 
-}  // namespace fullchipusc
+}  // namespace stPS

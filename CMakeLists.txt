@@ -52,6 +52,8 @@ message(STATUS "fullchipUSC: MPI backend (${MPI_CXX_COMPILER})")
 message(STATUS "fullchipUSC: stComm found")
 message(STATUS "fullchipUSC: CUDA toolkit ${CUDAToolkit_VERSION}, arch=${CMAKE_CUDA_ARCHITECTURES}")
 
+include(GNUInstallDirs)
+
 add_subdirectory(src)
 
 if(FULLCHIPUSC_BUILD_TESTS)
@@ -65,3 +67,49 @@ if(FULLCHIPUSC_BUILD_TESTS)
     message(STATUS "fullchipUSC: GTest found (${GTest_DIR})")
     add_subdirectory(tests)
 endif()
+
+# ============================================================================
+# Install / packaging — consumers do: find_package(stPS) +
+# target_link_libraries(their_target PRIVATE stPS::stPS)
+# ============================================================================
+
+# Public headers
+install(DIRECTORY include/stPS
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+include(CMakePackageConfigHelpers)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/stPSConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/stPSConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/stPS
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/stPSConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/stPSConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/stPSConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/stPS
+)
+
+install(EXPORT stPSTargets
+    FILE stPSTargets.cmake
+    NAMESPACE stPS::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/stPS
+)
+
+message(STATUS "")
+message(STATUS "========================================")
+message(STATUS "stPS installation configuration:")
+message(STATUS "  Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "  Headers: ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}/stPS")
+message(STATUS "  Library: ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+message(STATUS "  CMake config: ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/cmake/stPS")
+message(STATUS "========================================")
+message(STATUS "")

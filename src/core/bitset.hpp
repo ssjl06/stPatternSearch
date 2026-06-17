@@ -1,13 +1,13 @@
 #pragma once
 
-#include "core/types.hpp"
+#include <stPS/types.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
 
-namespace fullchipusc {
+namespace stPS {
 
 class DenseBitset {
 public:
@@ -51,4 +51,4 @@ private:
     std::vector<std::uint64_t> words_;
 };
 
-}  // namespace fullchipusc
+}  // namespace stPS

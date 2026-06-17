@@ -1,12 +1,12 @@
 #pragma once
 
-#include "core/types.hpp"
+#include <stPS/types.hpp>
 
 #include <cstdint>
 #include <span>
 #include <vector>
 
-namespace fullchipusc {
+namespace stPS {
 
 // Compressed Sparse Row layout: for each patch p,
 //   patch p's element IDs = data[offsets[p] .. offsets[p+1])
@@ -32,4 +32,4 @@ struct PatchCsr {
 // sorted ascending and contain unique IDs (setup ensures this).
 PatchCsr build_patch_csr(const std::vector<std::vector<ElementId>>& sorted_id_lists);
 
-}  // namespace fullchipusc
+}  // namespace stPS
