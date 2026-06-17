@@ -6,6 +6,9 @@ Splits a semiconductor layout's full chip into patches, where each patch's segme
 based on local pattern context. This solver finds the **minimum number of patches whose union covers
 every unique hash** — a classical Minimum Set Cover problem solved with the greedy approximation.
 
+Ships as the **`stPS`** (stPatternSearch) library: one header, one `Solver` class —
+see [Use as a library](#use-as-a-library).
+
 Design rationale lives in [`greedy_set_cover.md`](./greedy_set_cover.md).
 
 ## Status
@@ -30,24 +33,69 @@ Branches:
 - **[ROADMAP.md](ROADMAP.md)** — M5+ planned work, new-environment setup, open decisions
 - **[CONVENTIONS.md](CONVENTIONS.md)** — collaboration patterns and design preferences
 
-## Quick build
+## Build & install
 
 ```bash
 # One-time: install build prereqs (cmake>=3.25, OpenMPI, NCCL, GTest, stComm).
 # CUDA Toolkit + driver must be pre-installed; everything else is handled.
 ./scripts/setup-env.sh
 
-# Build
-CMAKE_PREFIX_PATH=~/install/stComm cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+# Build (stComm is a dependency; point at its prefix if not in ~/install/stComm)
+STCOMM_PREFIX=~/install/stComm ./build.sh        # or: ./build.sh --clean / --debug
 
-# Tests (size=4 multi-rank)
+# Install the stPS library + headers + CMake package
+./install.sh ~/install/stPS                      # default prefix: /usr/local
+
+# Tests (one MPI rank per visible GPU)
 cd build && ctest --output-on-failure
 
-# Smoke
+# Smoke (the CLI driver, which uses the public stPS::Solver under the hood)
 mpirun -n 4 --oversubscribe ./build/src/fullchipusc-solve \
     --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
-# Expected: selected=353 covered=6019/6019 iterations=353
+# Expected: selected=353 covered=6019 iterations=353
 ```
+
+`build.sh` configures + builds against stComm and prints the artifact paths;
+the raw `cmake -S . -B build -DCMAKE_PREFIX_PATH=~/install/stComm` flow works too.
+
+## Use as a library
+
+stPS installs a CMake package, so consumers just `find_package` and link:
+
+```cmake
+find_package(stPS REQUIRED)        # also pulls in stComm, MPI, CUDA
+target_link_libraries(your_target PRIVATE stPS::stPS)
+```
+
+The whole API is one umbrella header and one class. A device-enabled
+`stComm::Comm` (from `stComm::Comm::onDevice`) drives the distributed solve:
+
+```cpp
+#include <stPS/stPS.h>
+#include <stComm/stComm.h>
+
+stComm::Comm::initialize(&argc, &argv);
+{
+    stComm::Comm comm = stComm::Comm::onDevice(/*device_id=*/rank % num_gpus);
+
+    stPS::Solver solver(comm);
+
+    // This rank's patches (each a list of element hashes) + their global IDs.
+    // Use slice_patches_by_rank to partition a full list across ranks:
+    auto slice = stPS::slice_patches_by_rank(std::move(all_patches), rank, size);
+
+    // One collective call = load + distributed setup + greedy solve.
+    // Every rank must call together and gets the same result.
+    stPS::SolverResult r =
+        solver.run(std::move(slice.patches), std::move(slice.global_ids));
+
+    // r.selected (chosen patch IDs), r.covered_count, r.iterations
+}
+stComm::Comm::finalize();
+```
+
+All algorithm internals (CSR, inverted index, device buffers, CUDA kernels) are
+hidden behind a pImpl — the public headers (`include/stPS/`) pull in no
+MPI/NCCL/CUDA.
 
 Detailed build / environment instructions: [STATUS.md](STATUS.md) and [ROADMAP.md](ROADMAP.md).
