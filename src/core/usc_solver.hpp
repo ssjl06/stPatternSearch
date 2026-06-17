@@ -14,7 +14,7 @@
 // in usc_solver.cu where its members are actually called.
 namespace stComm { class Comm; }
 
-namespace fullchipusc {
+namespace stPS {
 
 struct SolverResult {
     std::vector<PatchId> selected;       // chosen patch IDs in order (global, identical on every rank)
@@ -75,4 +75,4 @@ private:
     DeviceBuffer<std::uint64_t> d_covered_;         // N/64 words, zero-init
 };
 
-}  // namespace fullchipusc
+}  // namespace stPS

@@ -2,7 +2,7 @@
 
 #include "core/bitset.hpp"
 
-namespace fullchipusc {
+namespace stPS {
 
 SolverResult solve_brute_force(const PatchCsr& patches, std::uint64_t N) {
     const std::uint64_t M = patches.M();
@@ -49,4 +49,4 @@ SolverResult solve_brute_force(const PatchCsr& patches, std::uint64_t N) {
     return result;
 }
 
-}  // namespace fullchipusc
+}  // namespace stPS

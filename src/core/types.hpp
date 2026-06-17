@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace fullchipusc {
+namespace stPS {
 
 using ElementId = std::uint64_t;
 using PatchId   = std::uint64_t;
@@ -11,4 +11,4 @@ using Hash      = std::uint64_t;
 
 inline constexpr Score kDisabledScore = -1;
 
-}  // namespace fullchipusc
+}  // namespace stPS

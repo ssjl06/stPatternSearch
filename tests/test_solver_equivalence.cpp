@@ -10,7 +10,7 @@
 
 #include <cstdio>
 
-using namespace fullchipusc;
+using namespace stPS;
 
 namespace {
 

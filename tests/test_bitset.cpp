@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-using namespace fullchipusc;
+using namespace stPS;
 
 TEST(DenseBitset, EmptyBitset) {
     DenseBitset b(0);

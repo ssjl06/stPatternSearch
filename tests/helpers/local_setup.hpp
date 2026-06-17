@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace fullchipusc::test_helpers {
+namespace stPS::test_helpers {
 
 // Single-process reference setup. NOT used by the production algorithm
 // (USCSolver), only by tests that want a full-universe PatchCsr to feed into
@@ -24,4 +24,4 @@ struct LocalSetupResult {
 
 LocalSetupResult run_local_setup(const std::vector<std::vector<Hash>>& raw_patches);
 
-}  // namespace fullchipusc::test_helpers
+}  // namespace stPS::test_helpers

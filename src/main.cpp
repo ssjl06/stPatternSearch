@@ -14,7 +14,7 @@
 
 namespace {
 
-using namespace fullchipusc;
+using namespace stPS;
 
 struct CliOptions {
     SyntheticParams params;

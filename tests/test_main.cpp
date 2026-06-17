@@ -17,7 +17,7 @@ stComm::Comm* g_comm = nullptr;
 
 }  // namespace
 
-stComm::Comm& fullchipusc::test_helpers::comm() {
+stComm::Comm& stPS::test_helpers::comm() {
     return *g_comm;
 }
 

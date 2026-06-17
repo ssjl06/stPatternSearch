@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace fullchipusc {
+namespace stPS {
 
 // Reference greedy set-cover implementation.
 //
@@ -16,4 +16,4 @@ namespace fullchipusc {
 // correct. Used as ground truth in equivalence tests against solve_greedy.
 SolverResult solve_brute_force(const PatchCsr& patches, std::uint64_t N);
 
-}  // namespace fullchipusc
+}  // namespace stPS

@@ -4,7 +4,7 @@
 #include <cassert>
 #include <cstring>
 
-namespace fullchipusc {
+namespace stPS {
 
 namespace {
 constexpr std::uint64_t words_for(std::uint64_t num_bits) noexcept {
@@ -75,4 +75,4 @@ void DenseBitset::collect_set_ids(std::vector<ElementId>& out) const {
     }
 }
 
-}  // namespace fullchipusc
+}  // namespace stPS

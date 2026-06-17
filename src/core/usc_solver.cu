@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace fullchipusc {
+namespace stPS {
 
 namespace {
 
@@ -629,4 +629,4 @@ const InvertedIndex& USCSolver::inverted_index() const { return inv_; }
 
 // Explicit instantiation for the M2 backend.
 
-}  // namespace fullchipusc
+}  // namespace stPS

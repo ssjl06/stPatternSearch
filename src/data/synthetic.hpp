@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace fullchipusc {
+namespace stPS {
 
 struct SyntheticParams {
     std::uint64_t N            = 1000;   // target universe size (distinct hash count)
@@ -40,4 +40,4 @@ struct PatchSlice {
 PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
                                   int rank, int size);
 
-}  // namespace fullchipusc
+}  // namespace stPS

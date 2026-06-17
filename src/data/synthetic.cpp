@@ -6,7 +6,7 @@
 #include <random>
 #include <unordered_set>
 
-namespace fullchipusc {
+namespace stPS {
 
 namespace {
 
@@ -88,4 +88,4 @@ PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
     return slice;
 }
 
-}  // namespace fullchipusc
+}  // namespace stPS

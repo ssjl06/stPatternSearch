@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-using namespace fullchipusc;
+using namespace stPS;
 
 TEST(PatchCsr, BuildAndQuery) {
     // Design doc §3.2 example.
