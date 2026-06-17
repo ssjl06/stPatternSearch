@@ -6,7 +6,7 @@
  *        minimum set-cover over stComm.
  *
  * Include this to use the library:
- *   - Solver / SolverResult  (the single solve entry point)
+ *   - UscPatchSelector / PatchSelection  (the single patch-select entry point)
  *   - slice_patches_by_rank  (partition patches across ranks)
  *   - the public scalar types (Hash, PatchId, ...)
  *
@@ -16,4 +16,4 @@
 
 #include <stPS/types.hpp>
 #include <stPS/partition.hpp>
-#include <stPS/solver.hpp>
+#include <stPS/usc_patch_selector.hpp>

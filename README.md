@@ -6,8 +6,8 @@ Splits a semiconductor layout's full chip into patches, where each patch's segme
 based on local pattern context. This solver finds the **minimum number of patches whose union covers
 every unique hash** — a classical Minimum Set Cover problem solved with the greedy approximation.
 
-Ships as the **`stPS`** (stPatternSearch) library: one header, one `Solver` class —
-see [Use as a library](#use-as-a-library).
+Ships as the **`stPS`** (stPatternSearch) library: one header, one
+`UscPatchSelector` class — see [Use as a library](#use-as-a-library).
 
 Design rationale lives in [`greedy_set_cover.md`](./greedy_set_cover.md).
 
@@ -49,8 +49,8 @@ STCOMM_PREFIX=~/install/stComm ./build.sh        # or: ./build.sh --clean / --de
 # Tests (one MPI rank per visible GPU)
 cd build && ctest --output-on-failure
 
-# Smoke (the CLI driver, which uses the public stPS::Solver under the hood)
-mpirun -n 4 --oversubscribe ./build/src/fullchipusc-solve \
+# Smoke (the CLI driver, which uses the public stPS::UscPatchSelector under the hood)
+mpirun -n 4 --oversubscribe ./build/src/fullchipusc-patch-select \
     --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
 # Expected: selected=353 covered=6019 iterations=353
 ```
@@ -78,16 +78,16 @@ stComm::Comm::initialize(&argc, &argv);
 {
     stComm::Comm comm = stComm::Comm::onDevice(/*device_id=*/rank % num_gpus);
 
-    stPS::Solver solver(comm);
+    stPS::UscPatchSelector selector(comm);
 
     // This rank's patches (each a list of element hashes) + their global IDs.
     // Use slice_patches_by_rank to partition a full list across ranks:
     auto slice = stPS::slice_patches_by_rank(std::move(all_patches), rank, size);
 
-    // One collective call = load + distributed setup + greedy solve.
+    // One collective call = load + distributed setup + greedy select.
     // Every rank must call together and gets the same result.
-    stPS::SolverResult r =
-        solver.run(std::move(slice.patches), std::move(slice.global_ids));
+    stPS::PatchSelection r =
+        selector.patch_select(std::move(slice.patches), std::move(slice.global_ids));
 
     // r.selected (chosen patch IDs), r.covered_count, r.iterations
 }

@@ -1,4 +1,4 @@
-#include "core/usc_solver.hpp"
+#include "core/usc_patch_selector_impl.hpp"
 
 #include <stComm/stComm.h>
 
@@ -204,22 +204,22 @@ inline int target_rank_for_hash(Hash h, const std::vector<Hash>& splitters) {
 
 }  // namespace
 
-USCSolver::USCSolver(stComm::Comm& comm)
+UscPatchSelectorImpl::UscPatchSelectorImpl(stComm::Comm& comm)
     : comm_(comm) {
     if (!comm_.hasDevice()) {
         throw std::invalid_argument(
-            "USCSolver requires a device-enabled Comm (Comm::onDevice) — "
+            "UscPatchSelectorImpl requires a device-enabled Comm (Comm::onDevice) — "
             "fullchipUSC is GPU-only.");
     }
 }
 
-void USCSolver::load(std::vector<std::vector<Hash>> raw_patches,
+void UscPatchSelectorImpl::load(std::vector<std::vector<Hash>> raw_patches,
                             std::vector<PatchId>           patch_global_ids) {
     raw_patches_      = std::move(raw_patches);
     patch_global_ids_ = std::move(patch_global_ids);
 }
 
-void USCSolver::setup() {
+void UscPatchSelectorImpl::setup() {
     const int size = comm_.getSize();
     const int rank = comm_.getRank();
 
@@ -400,9 +400,9 @@ void USCSolver::setup() {
 //          — device-direct, no D2H/H2D for the payload
 //   [device] set_bits (d_covered_) + score_update_invidx_kernel (strategy A)
 //        H2D 1 Score = -1 (winner only)
-SolverResult USCSolver::solve() {
+PatchSelection UscPatchSelectorImpl::select() {
     const std::uint64_t M_loc = patches_.M();
-    SolverResult result;
+    PatchSelection result;
     result.covered_count = 0;
     result.iterations    = 0;
 
@@ -612,9 +612,9 @@ SolverResult USCSolver::solve() {
     return result;
 }
 
-void USCSolver::print_solution(const SolverResult& r) const {
+void UscPatchSelectorImpl::print_selection(const PatchSelection& r) const {
     if (comm_.getRank() != 0) return;
-    std::cout << "fullchipUSC solve\n"
+    std::cout << "fullchipUSC patch-select\n"
               << "  universe N=" << N_
               << " ranks=" << comm_.getSize() << "\n"
               << "  result: selected=" << r.selected.size()
@@ -622,30 +622,31 @@ void USCSolver::print_solution(const SolverResult& r) const {
               << " iterations=" << r.iterations << "\n";
 }
 
-std::uint64_t        USCSolver::N() const            { return N_; }
-std::uint64_t        USCSolver::M_local() const      { return patches_.M(); }
-const PatchCsr&      USCSolver::patches() const      { return patches_; }
-const InvertedIndex& USCSolver::inverted_index() const { return inv_; }
+std::uint64_t        UscPatchSelectorImpl::N() const            { return N_; }
+std::uint64_t        UscPatchSelectorImpl::M_local() const      { return patches_.M(); }
+const PatchCsr&      UscPatchSelectorImpl::patches() const      { return patches_; }
+const InvertedIndex& UscPatchSelectorImpl::inverted_index() const { return inv_; }
 
 // ============================================================================
-// Public facade: stPS::Solver — pImpl over USCSolver (hides all internals).
+// Public facade: stPS::UscPatchSelector — pImpl over UscPatchSelectorImpl
+// (hides all internals).
 // ============================================================================
 
-struct Solver::Impl {
-    USCSolver usc;
+struct UscPatchSelector::Impl {
+    UscPatchSelectorImpl usc;
     explicit Impl(stComm::Comm& comm) : usc(comm) {}
 };
 
-Solver::Solver(stComm::Comm& comm) : impl_(std::make_unique<Impl>(comm)) {}
-Solver::~Solver() = default;
-Solver::Solver(Solver&&) noexcept = default;
-Solver& Solver::operator=(Solver&&) noexcept = default;
+UscPatchSelector::UscPatchSelector(stComm::Comm& comm) : impl_(std::make_unique<Impl>(comm)) {}
+UscPatchSelector::~UscPatchSelector() = default;
+UscPatchSelector::UscPatchSelector(UscPatchSelector&&) noexcept = default;
+UscPatchSelector& UscPatchSelector::operator=(UscPatchSelector&&) noexcept = default;
 
-SolverResult Solver::run(std::vector<std::vector<Hash>> patches,
-                         std::vector<PatchId>           global_ids) {
+PatchSelection UscPatchSelector::patch_select(std::vector<std::vector<Hash>> patches,
+                                              std::vector<PatchId>           global_ids) {
     impl_->usc.load(std::move(patches), std::move(global_ids));
     impl_->usc.setup();
-    return impl_->usc.solve();
+    return impl_->usc.select();
 }
 
 }  // namespace stPS

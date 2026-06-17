@@ -1,4 +1,4 @@
-#include <stPS/stPS.h>          // public library API (Solver, partition, types)
+#include <stPS/stPS.h>          // public library API (UscPatchSelector, partition, types)
 #include "data/synthetic.hpp"   // internal demo data generator (this exe only)
 
 #include <stComm/stComm.h>
@@ -93,26 +93,26 @@ int main(int argc, char** argv) {
             // onDevice bootstraps NCCL internally (uniqueId handshake + init).
             stComm::Comm comm = stComm::Comm::onDevice(device_id);
 
-            // The whole library API: build a Solver on the comm, hand it this
-            // rank's patches + their global IDs, get the cover back.
-            stPS::Solver solver(comm);
+            // The whole library API: build a UscPatchSelector on the comm, hand
+            // it this rank's patches + their global IDs, get the cover back.
+            stPS::UscPatchSelector selector(comm);
             auto slice = stPS::slice_patches_by_rank(
                 generate_synthetic(opt.params), comm.getRank(), comm.getSize());
             const std::size_t m_local = slice.patches.size();  // capture before move
 
             auto t0 = std::chrono::steady_clock::now();
             const auto result =
-                solver.run(std::move(slice.patches), std::move(slice.global_ids));
+                selector.patch_select(std::move(slice.patches), std::move(slice.global_ids));
             auto t1 = std::chrono::steady_clock::now();
 
             if (comm.getRank() == 0) {
-                std::cout << "fullchipUSC solve\n"
+                std::cout << "fullchipUSC patch-select\n"
                           << "  ranks=" << comm.getSize() << "\n"
                           << "  result: selected=" << result.selected.size()
                           << " covered=" << result.covered_count
                           << " iterations=" << result.iterations << "\n"
                           << "  M_local(rank0)=" << m_local << "\n"
-                          << "  timing (ms): solve="
+                          << "  timing (ms): patch-select="
                           << std::chrono::duration<double, std::milli>(t1 - t0).count()
                           << "\n";
                 if (opt.print_solution) {

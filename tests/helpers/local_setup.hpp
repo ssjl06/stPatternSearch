@@ -10,8 +10,8 @@
 namespace stPS::test_helpers {
 
 // Single-process reference setup. NOT used by the production algorithm
-// (USCSolver), only by tests that want a full-universe PatchCsr to feed into
-// `solve_brute_force` for equivalence comparison.
+// (UscPatchSelector), only by tests that want a full-universe PatchCsr to feed
+// into `brute_force_select` for equivalence comparison.
 //
 // Performs: hash flatten → sort+unique → ID assignment → per-patch ID list
 // → build PatchCsr → build InvertedIndex. No MPI calls.

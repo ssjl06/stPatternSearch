@@ -3,14 +3,14 @@ add_library(stPS STATIC
     core/csr.cpp
     core/inverted_index.cpp
     core/device_buffer.cu
-    core/usc_solver.cu
+    core/usc_patch_selector_impl.cu
     core/brute_force.cpp
     data/synthetic.cpp
     data/partition.cpp
 )
 add_library(stPS::stPS ALIAS stPS)
 
-# usc_solver.cu / device_buffer.cu are compiled by nvcc — link the CUDA runtime
+# usc_patch_selector_impl.cu / device_buffer.cu are compiled by nvcc — link the CUDA runtime
 # so DeviceBuffer's cudaMalloc/cudaFree resolve. PIC + separable compilation let
 # the static lib drop into mixed host/device consumers without surprises.
 set_target_properties(stPS PROPERTIES
@@ -47,7 +47,7 @@ install(TARGETS stPS
 )
 
 # Demo / CLI driver. main.cpp lives in src/, so its quote-include of the
-# internal "data/synthetic.hpp" resolves relative to it; it drives the solve
-# through the public stPS::Solver from <stPS/...> (carried by the link below).
-add_executable(fullchipusc-solve main.cpp)
-target_link_libraries(fullchipusc-solve PRIVATE stPS)
+# internal "data/synthetic.hpp" resolves relative to it; it drives the selection
+# through the public stPS::UscPatchSelector from <stPS/...> (carried by the link below).
+add_executable(fullchipusc-patch-select main.cpp)
+target_link_libraries(fullchipusc-patch-select PRIVATE stPS)
