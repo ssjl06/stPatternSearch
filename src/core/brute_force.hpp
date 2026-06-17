@@ -1,8 +1,8 @@
 #pragma once
 
 #include "core/csr.hpp"
-#include "core/usc_solver.hpp"  // SolverResult
-#include "core/types.hpp"
+#include <stPS/solver.hpp>  // SolverResult
+#include <stPS/types.hpp>
 
 #include <cstdint>
 

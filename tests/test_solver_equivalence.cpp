@@ -1,5 +1,5 @@
-#include "core/brute_force.hpp"
-#include "core/usc_solver.hpp"
+#include <stPS/stPS.h>          // public API under test: Solver, slice, types
+#include "core/brute_force.hpp"  // white-box reference (solve_brute_force)
 #include "data/synthetic.hpp"
 #include "helpers/local_setup.hpp"
 #include "test_nccl_env.hpp"
@@ -32,15 +32,13 @@ void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
     SyntheticParams params;
     params.N = N; params.M = M; params.K_mean = K; params.overlap = overlap; params.seed = seed;
 
-    // Distributed path: every rank gets its slice, runs USCSolver on the shared
-    // device-enabled Comm (Host space for setup, Device space for the hot path).
+    // Distributed path: every rank gets its slice and runs the public Solver on
+    // the shared device-enabled Comm — one run() does load + setup + solve.
     stComm::Comm& comm = test_helpers::comm();
-    USCSolver solver(comm);
+    Solver solver(comm);
     auto raw_full = generate_synthetic(params);
     auto slice    = slice_patches_by_rank(raw_full, comm.getRank(), comm.getSize());
-    solver.load(std::move(slice.patches), std::move(slice.global_ids));
-    solver.setup();
-    const auto multi = solver.solve();
+    const auto multi = solver.run(std::move(slice.patches), std::move(slice.global_ids));
 
     // Reference path: every rank runs single-process setup + brute_force on the
     // full deterministic data. Identical work on every rank, used only as ground

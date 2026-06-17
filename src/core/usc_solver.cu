@@ -627,6 +627,25 @@ std::uint64_t        USCSolver::M_local() const      { return patches_.M(); }
 const PatchCsr&      USCSolver::patches() const      { return patches_; }
 const InvertedIndex& USCSolver::inverted_index() const { return inv_; }
 
-// Explicit instantiation for the M2 backend.
+// ============================================================================
+// Public facade: stPS::Solver — pImpl over USCSolver (hides all internals).
+// ============================================================================
+
+struct Solver::Impl {
+    USCSolver usc;
+    explicit Impl(stComm::Comm& comm) : usc(comm) {}
+};
+
+Solver::Solver(stComm::Comm& comm) : impl_(std::make_unique<Impl>(comm)) {}
+Solver::~Solver() = default;
+Solver::Solver(Solver&&) noexcept = default;
+Solver& Solver::operator=(Solver&&) noexcept = default;
+
+SolverResult Solver::run(std::vector<std::vector<Hash>> patches,
+                         std::vector<PatchId>           global_ids) {
+    impl_->usc.load(std::move(patches), std::move(global_ids));
+    impl_->usc.setup();
+    return impl_->usc.solve();
+}
 
 }  // namespace stPS

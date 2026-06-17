@@ -2,7 +2,7 @@
 
 #include "core/csr.hpp"
 #include "core/inverted_index.hpp"
-#include "core/types.hpp"
+#include <stPS/types.hpp>
 
 #include <cstdint>
 #include <vector>

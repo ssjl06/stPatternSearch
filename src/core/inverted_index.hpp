@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/csr.hpp"
-#include "core/types.hpp"
+#include <stPS/types.hpp>
 
 #include <cstdint>
 #include <span>

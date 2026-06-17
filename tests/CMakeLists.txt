@@ -12,10 +12,11 @@ add_executable(fullchipusc_tests
 find_package(CUDAToolkit REQUIRED)
 target_link_libraries(fullchipusc_tests PRIVATE CUDA::cudart)
 target_include_directories(fullchipusc_tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}     # tests/  (test_nccl_env.hpp, helpers/)
+    ${CMAKE_SOURCE_DIR}/src         # white-box access to internal core/ + data/
 )
 target_link_libraries(fullchipusc_tests PRIVATE
-    fullchipusc_core
+    stPS
     GTest::gtest
 )
 

@@ -3,26 +3,21 @@
 #include "core/csr.hpp"
 #include "core/device_buffer.hpp"
 #include "core/inverted_index.hpp"
-#include "core/types.hpp"
+#include <stPS/solver.hpp>   // SolverResult + the public Solver this backs
+#include <stPS/types.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <vector>
 
-// Forward-declared so this public header can reference the unified comm by
-// reference without dragging <mpi.h>/<nccl.h> in. The concrete type is included
-// in usc_solver.cu where its members are actually called.
+// Forward-declared so this internal header drags in no <mpi.h>/<nccl.h>. The
+// concrete type is included in usc_solver.cu where its members are called.
 namespace stComm { class Comm; }
 
 namespace stPS {
 
-struct SolverResult {
-    std::vector<PatchId> selected;       // chosen patch IDs in order (global, identical on every rank)
-    std::uint64_t        covered_count;  // total elements covered
-    std::uint64_t        iterations;     // number of iterations executed
-};
-
-// Greedy minimum set-cover solver over a single unified stComm::Comm. The host
+// Internal implementation of the public Solver: greedy minimum set-cover over a
+// single unified stComm::Comm. The host
 // (MPI) side drives setup() and the tiny per-iteration metadata (16B MAXLOC +
 // 8B winner_global); the per-iteration newly_covered_ids payload travels
 // device-direct over NCCL via the same Comm's Device space. The Comm must be

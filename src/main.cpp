@@ -1,5 +1,5 @@
-#include "core/usc_solver.hpp"
-#include "data/synthetic.hpp"
+#include <stPS/stPS.h>          // public library API (Solver, partition, types)
+#include "data/synthetic.hpp"   // internal demo data generator (this exe only)
 
 #include <stComm/stComm.h>
 
@@ -92,27 +92,28 @@ int main(int argc, char** argv) {
             const int device_id = pick_device_for_rank(rank);
             // onDevice bootstraps NCCL internally (uniqueId handshake + init).
             stComm::Comm comm = stComm::Comm::onDevice(device_id);
-            USCSolver solver(comm);
+
+            // The whole library API: build a Solver on the comm, hand it this
+            // rank's patches + their global IDs, get the cover back.
+            stPS::Solver solver(comm);
+            auto slice = stPS::slice_patches_by_rank(
+                generate_synthetic(opt.params), comm.getRank(), comm.getSize());
+            const std::size_t m_local = slice.patches.size();  // capture before move
 
             auto t0 = std::chrono::steady_clock::now();
-            auto slice = slice_patches_by_rank(
-                generate_synthetic(opt.params), comm.getRank(), comm.getSize());
-            solver.load(std::move(slice.patches), std::move(slice.global_ids));
+            const auto result =
+                solver.run(std::move(slice.patches), std::move(slice.global_ids));
             auto t1 = std::chrono::steady_clock::now();
-            solver.setup();
-            auto t2 = std::chrono::steady_clock::now();
-            const auto result = solver.solve();
-            auto t3 = std::chrono::steady_clock::now();
 
-            solver.print_solution(result);
             if (comm.getRank() == 0) {
-                std::cout << "  M_local(rank0)=" << solver.M_local() << "\n";
-                std::cout << "  timing (ms): load="
+                std::cout << "fullchipUSC solve\n"
+                          << "  ranks=" << comm.getSize() << "\n"
+                          << "  result: selected=" << result.selected.size()
+                          << " covered=" << result.covered_count
+                          << " iterations=" << result.iterations << "\n"
+                          << "  M_local(rank0)=" << m_local << "\n"
+                          << "  timing (ms): solve="
                           << std::chrono::duration<double, std::milli>(t1 - t0).count()
-                          << " setup="
-                          << std::chrono::duration<double, std::milli>(t2 - t1).count()
-                          << " solve="
-                          << std::chrono::duration<double, std::milli>(t3 - t2).count()
                           << "\n";
                 if (opt.print_solution) {
                     std::cout << "  selected (" << result.selected.size() << "):";

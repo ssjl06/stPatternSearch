@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/types.hpp"
+#include <stPS/types.hpp>
 
 #include <cstdint>
 #include <vector>
@@ -27,17 +27,5 @@ struct SyntheticParams {
 // Returns one vector per patch, each holding raw uint64 hash values (not yet
 // converted to IDs). Patch sizes vary mildly around K_mean.
 std::vector<std::vector<Hash>> generate_synthetic(const SyntheticParams& p);
-
-// Data distribution utility — independent of where patches came from (synthetic
-// or future real loaders). Partitions an M-patch list contiguously across `size`
-// ranks and returns rank `rank`'s slice with its corresponding global patch IDs.
-//
-//   rank r owns global IDs [r*M/size, (r+1)*M/size).
-struct PatchSlice {
-    std::vector<std::vector<Hash>> patches;
-    std::vector<PatchId>           global_ids;
-};
-PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
-                                  int rank, int size);
 
 }  // namespace stPS
