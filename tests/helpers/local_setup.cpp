@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 
-namespace fullchipusc::test_helpers {
+namespace stPS::test_helpers {
 
 LocalSetupResult run_local_setup(const std::vector<std::vector<Hash>>& raw_patches) {
     LocalSetupResult out;
@@ -37,4 +37,4 @@ LocalSetupResult run_local_setup(const std::vector<std::vector<Hash>>& raw_patch
     return out;
 }
 
-}  // namespace fullchipusc::test_helpers
+}  // namespace stPS::test_helpers

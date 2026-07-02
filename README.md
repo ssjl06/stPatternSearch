@@ -6,39 +6,96 @@ Splits a semiconductor layout's full chip into patches, where each patch's segme
 based on local pattern context. This solver finds the **minimum number of patches whose union covers
 every unique hash** — a classical Minimum Set Cover problem solved with the greedy approximation.
 
+Ships as the **`stPS`** (stPatternSearch) library: one header, one
+`UscPatchSelector` class — see [Use as a library](#use-as-a-library).
+
 Design rationale lives in [`greedy_set_cover.md`](./greedy_set_cover.md).
 
-## Status — Milestone 1 (single-rank end-to-end)
+## Status
 
-- Single-process greedy solver (`size=1` MPI shim)
-- CSR-backed patches + inverted index
-- Synthetic data generator for testing
-- Brute-force reference for correctness validation
+| Milestone | Title | State |
+|---|---|---|
+| M1 | Single-rank end-to-end | ✅ |
+| M2 | Multi-rank MPI via stComm | ✅ |
+| M3 | Distributed sample sort setup (§5.1) + sparse bcast (§7.2) | ✅ |
+| M4 | GPU port (CUDA kernels, CUB ArgMax) | ✅ on `gpu` branch |
+| M5 | NCCL device-direct broadcast | ⏳ Planned |
+| M6 | Element-partitioned covered bitset (§7.3) | ⏳ Planned |
+| M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ Planned |
 
-Multi-rank MPI / GPU / NCCL ports are scheduled for milestones 2–5.
+Branches:
+- `main` — CPU-only baseline (through M3). Stable regression reference.
+- `gpu` — GPU work (M4+). M5+ continues here.
 
-## Build
+## Documentation
 
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
+- **[STATUS.md](STATUS.md)** — what's been built, architecture summary, verification baseline
+- **[ROADMAP.md](ROADMAP.md)** — M5+ planned work, new-environment setup, open decisions
+- **[CONVENTIONS.md](CONVENTIONS.md)** — collaboration patterns and design preferences
 
-Requires CMake ≥ 3.22, a C++20 compiler, and MPI (OpenMPI or MPICH). Linux only.
-
-## Test
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
-## Run
+## Build & install
 
 ```bash
-mpirun -n 1 ./build/src/fullchipusc-solve \
+# One-time: install build prereqs (cmake>=3.25, OpenMPI, NCCL, GTest, stComm).
+# CUDA Toolkit + driver must be pre-installed; everything else is handled.
+./scripts/setup-env.sh
+
+# Build (stComm is a dependency; point at its prefix if not in ~/install/stComm)
+STCOMM_PREFIX=~/install/stComm ./build.sh        # or: ./build.sh --clean / --debug
+
+# Install the stPS library + headers + CMake package
+./install.sh ~/install/stPS                      # default prefix: /usr/local
+
+# Tests (one MPI rank per visible GPU)
+cd build && ctest --output-on-failure
+
+# Smoke (the CLI driver, which uses the public stPS::UscPatchSelector under the hood)
+mpirun -n 4 --oversubscribe ./build/src/fullchipusc-patch-select \
     --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
-
-# correctness comparison against brute-force reference (small instances)
-mpirun -n 1 ./build/src/fullchipusc-solve \
-    --N 500 --M 100 --K 20 --overlap 0.3 --seed 7 --brute-force
+# Expected: selected=353 covered=6019 iterations=353
 ```
+
+`build.sh` configures + builds against stComm and prints the artifact paths;
+the raw `cmake -S . -B build -DCMAKE_PREFIX_PATH=~/install/stComm` flow works too.
+
+## Use as a library
+
+stPS installs a CMake package, so consumers just `find_package` and link:
+
+```cmake
+find_package(stPS REQUIRED)        # also pulls in stComm, MPI, CUDA
+target_link_libraries(your_target PRIVATE stPS::stPS)
+```
+
+The whole API is one umbrella header and one class. A device-enabled
+`stComm::Comm` (from `stComm::Comm::onDevice`) drives the distributed solve:
+
+```cpp
+#include <stPS/stPS.h>
+#include <stComm/stComm.h>
+
+stComm::Comm::initialize(&argc, &argv);
+{
+    stComm::Comm comm = stComm::Comm::onDevice(/*device_id=*/rank % num_gpus);
+
+    stPS::UscPatchSelector selector(comm);
+
+    // This rank's patches (each a list of element hashes) + their global IDs.
+    // Use slice_patches_by_rank to partition a full list across ranks:
+    auto slice = stPS::slice_patches_by_rank(std::move(all_patches), rank, size);
+
+    // One collective call = load + distributed setup + greedy select.
+    // Every rank must call together and gets the same result.
+    stPS::PatchSelection r =
+        selector.patch_select(std::move(slice.patches), std::move(slice.global_ids));
+
+    // r.selected (chosen patch IDs), r.covered_count, r.iterations
+}
+stComm::Comm::finalize();
+```
+
+All algorithm internals (CSR, inverted index, device buffers, CUDA kernels) are
+hidden behind a pImpl — the public headers (`include/stPS/`) pull in no
+MPI/NCCL/CUDA.
+
+Detailed build / environment instructions: [STATUS.md](STATUS.md) and [ROADMAP.md](ROADMAP.md).

@@ -1,13 +1,13 @@
 #pragma once
 
 #include "core/csr.hpp"
-#include "core/types.hpp"
+#include <stPS/types.hpp>
 
 #include <cstdint>
 #include <span>
 #include <vector>
 
-namespace fullchipusc {
+namespace stPS {
 
 // Sparse CSR transpose of PatchCsr (design doc §4.4).
 //   keys[k]     : the k-th element ID that actually appears in this rank's patches
@@ -34,4 +34,4 @@ struct InvertedIndex {
 // stores only elements that actually appear in `patches`).
 InvertedIndex build_inverted_index(const PatchCsr& patches, std::uint64_t N);
 
-}  // namespace fullchipusc
+}  // namespace stPS

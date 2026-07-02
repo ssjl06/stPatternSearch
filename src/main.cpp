@@ -1,7 +1,9 @@
-#include "core/usc_solver.hpp"
-#include "data/synthetic.hpp"
+#include <stPS/stPS.h>          // public library API (UscPatchSelector, partition, types)
+#include "data/synthetic.hpp"   // internal demo data generator (this exe only)
 
 #include <stComm/stComm.h>
+
+#include <cuda_runtime.h>
 
 #include <chrono>
 #include <cstdint>
@@ -12,12 +14,29 @@
 
 namespace {
 
-using namespace fullchipusc;
+using namespace stPS;
 
 struct CliOptions {
     SyntheticParams params;
     bool print_solution = false;
 };
+
+// Per-process GPU pick: rank-r uses GPU (r % visible_count). Sets the active
+// device for this rank's own CUDA allocations and returns the device id to hand
+// to Comm::onDevice (which bootstraps NCCL on it). Exits if no GPU is visible.
+int pick_device_for_rank(int rank) {
+    int num_gpus = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_gpus);
+    if (err != cudaSuccess || num_gpus <= 0) {
+        std::fprintf(stderr,
+            "rank %d: no CUDA device available (%s). fullchipUSC is GPU-only.\n",
+            rank, cudaGetErrorString(err));
+        std::exit(2);
+    }
+    const int device_id = rank % num_gpus;
+    cudaSetDevice(device_id);
+    return device_id;
+}
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
@@ -63,34 +82,38 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    stComm::MPIComm::initialize(&argc, &argv);
+    stComm::Comm::initialize(&argc, &argv);
     int exit_code = 0;
     {
         CliOptions opt;
         if (!parse_args(argc, argv, opt)) { exit_code = 1; }
         else {
-            stComm::MPIComm world;
-            USCSolver<stComm::MPIComm> solver(world);
+            const int rank = stComm::Comm{}.getRank();      // host probe for device pick
+            const int device_id = pick_device_for_rank(rank);
+            // onDevice bootstraps NCCL internally (uniqueId handshake + init).
+            stComm::Comm comm = stComm::Comm::onDevice(device_id);
+
+            // The whole library API: build a UscPatchSelector on the comm, hand
+            // it this rank's patches + their global IDs, get the cover back.
+            stPS::UscPatchSelector selector(comm);
+            auto slice = stPS::slice_patches_by_rank(
+                generate_synthetic(opt.params), comm.getRank(), comm.getSize());
+            const std::size_t m_local = slice.patches.size();  // capture before move
 
             auto t0 = std::chrono::steady_clock::now();
-            auto slice = slice_patches_by_rank(
-                generate_synthetic(opt.params), world.getRank(), world.getSize());
-            solver.load(std::move(slice.patches), std::move(slice.global_ids));
+            const auto result =
+                selector.patch_select(std::move(slice.patches), std::move(slice.global_ids));
             auto t1 = std::chrono::steady_clock::now();
-            solver.setup();
-            auto t2 = std::chrono::steady_clock::now();
-            const auto result = solver.solve();
-            auto t3 = std::chrono::steady_clock::now();
 
-            solver.print_solution(result);
-            if (world.getRank() == 0) {
-                std::cout << "  M_local(rank0)=" << solver.M_local() << "\n";
-                std::cout << "  timing (ms): load="
+            if (comm.getRank() == 0) {
+                std::cout << "fullchipUSC patch-select\n"
+                          << "  ranks=" << comm.getSize() << "\n"
+                          << "  result: selected=" << result.selected.size()
+                          << " covered=" << result.covered_count
+                          << " iterations=" << result.iterations << "\n"
+                          << "  M_local(rank0)=" << m_local << "\n"
+                          << "  timing (ms): patch-select="
                           << std::chrono::duration<double, std::milli>(t1 - t0).count()
-                          << " setup="
-                          << std::chrono::duration<double, std::milli>(t2 - t1).count()
-                          << " solve="
-                          << std::chrono::duration<double, std::milli>(t3 - t2).count()
                           << "\n";
                 if (opt.print_solution) {
                     std::cout << "  selected (" << result.selected.size() << "):";
@@ -102,6 +125,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-    stComm::MPIComm::finalize();
+    stComm::Comm::finalize();
     return exit_code;
 }

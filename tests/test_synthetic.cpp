@@ -3,7 +3,7 @@
 
 #include <gtest/gtest.h>
 
-using namespace fullchipusc;
+using namespace stPS;
 
 TEST(Synthetic, DeterministicForSameSeed) {
     SyntheticParams p;

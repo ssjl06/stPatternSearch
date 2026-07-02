@@ -1,7 +1,8 @@
-#include "core/brute_force.hpp"
-#include "core/usc_solver.hpp"
+#include <stPS/stPS.h>          // public API under test: UscPatchSelector, slice, types
+#include "core/brute_force.hpp"  // white-box reference (brute_force_select)
 #include "data/synthetic.hpp"
 #include "helpers/local_setup.hpp"
+#include "test_nccl_env.hpp"
 
 #include <stComm/stComm.h>
 
@@ -9,19 +10,19 @@
 
 #include <cstdio>
 
-using namespace fullchipusc;
+using namespace stPS;
 
 namespace {
 
-void expect_match(const SolverResult& solver, const SolverResult& bf,
+void expect_match(const PatchSelection& selection, const PatchSelection& bf,
                   const std::string& tag) {
-    EXPECT_EQ(solver.selected.size(), bf.selected.size())
+    EXPECT_EQ(selection.selected.size(), bf.selected.size())
         << "[" << tag << "] selected size mismatch";
-    EXPECT_EQ(solver.covered_count, bf.covered_count)
+    EXPECT_EQ(selection.covered_count, bf.covered_count)
         << "[" << tag << "] covered_count mismatch";
-    const std::size_t n = std::min(solver.selected.size(), bf.selected.size());
+    const std::size_t n = std::min(selection.selected.size(), bf.selected.size());
     for (std::size_t i = 0; i < n; ++i) {
-        EXPECT_EQ(solver.selected[i], bf.selected[i])
+        EXPECT_EQ(selection.selected[i], bf.selected[i])
             << "[" << tag << "] mismatch at step " << i;
     }
 }
@@ -31,20 +32,20 @@ void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
     SyntheticParams params;
     params.N = N; params.M = M; params.K_mean = K; params.overlap = overlap; params.seed = seed;
 
-    // Distributed path: every rank gets its slice, runs USCSolver.
-    stComm::MPIComm comm;
-    USCSolver<stComm::MPIComm> solver(comm);
+    // Distributed path: every rank gets its slice and runs the public
+    // UscPatchSelector on the shared device-enabled Comm — one patch_select()
+    // does load + setup + select.
+    stComm::Comm& comm = test_helpers::comm();
+    UscPatchSelector selector(comm);
     auto raw_full = generate_synthetic(params);
     auto slice    = slice_patches_by_rank(raw_full, comm.getRank(), comm.getSize());
-    solver.load(std::move(slice.patches), std::move(slice.global_ids));
-    solver.setup();
-    const auto multi = solver.solve();
+    const auto multi = selector.patch_select(std::move(slice.patches), std::move(slice.global_ids));
 
     // Reference path: every rank runs single-process setup + brute_force on the
     // full deterministic data. Identical work on every rank, used only as ground
     // truth for the comparison below.
     auto local = test_helpers::run_local_setup(raw_full);
-    auto bf    = solve_brute_force(local.patches, local.N);
+    auto bf    = brute_force_select(local.patches, local.N);
 
     char tag[128];
     std::snprintf(tag, sizeof(tag),

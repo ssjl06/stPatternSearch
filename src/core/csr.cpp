@@ -1,6 +1,6 @@
 #include "core/csr.hpp"
 
-namespace fullchipusc {
+namespace stPS {
 
 PatchCsr build_patch_csr(const std::vector<std::vector<ElementId>>& sorted_id_lists) {
     PatchCsr csr;
@@ -25,4 +25,4 @@ PatchCsr build_patch_csr(const std::vector<std::vector<ElementId>>& sorted_id_li
     return csr;
 }
 
-}  // namespace fullchipusc
+}  // namespace stPS

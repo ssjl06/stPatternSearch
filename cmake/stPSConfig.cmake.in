@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+# stPS (stPatternSearch) CMake package configuration.
+
+include(CMakeFindDependencyMacro)
+
+# Public link dependencies of the stPS target.
+find_dependency(MPI REQUIRED COMPONENTS CXX)
+find_dependency(CUDAToolkit REQUIRED)
+find_dependency(stComm REQUIRED)
+
+include("${CMAKE_CURRENT_LIST_DIR}/stPSTargets.cmake")
+
+check_required_components(stPS)
