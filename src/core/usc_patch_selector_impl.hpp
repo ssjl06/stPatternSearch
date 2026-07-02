@@ -21,7 +21,7 @@ namespace stPS {
 // (MPI) side drives setup() and the tiny per-iteration metadata (16B MAXLOC +
 // 8B winner_global); the per-iteration newly_covered_ids payload travels
 // device-direct over NCCL via the same Comm's Device space. The Comm must be
-// device-enabled (built with Comm::onDevice) — fullchipUSC is GPU-only.
+// device-enabled (built with Comm::onDevice) — USC is GPU-only.
 class UscPatchSelectorImpl {
 public:
     // `comm` must be a device-enabled Comm (Comm::onDevice): its Host space

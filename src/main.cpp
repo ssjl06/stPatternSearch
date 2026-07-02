@@ -31,7 +31,7 @@ int pick_device_for_rank(int rank) {
     cudaError_t err = cudaGetDeviceCount(&num_gpus);
     if (err != cudaSuccess || num_gpus <= 0) {
         std::fprintf(stderr,
-            "rank %d: no CUDA device available (%s). fullchipUSC is GPU-only.\n",
+            "rank %d: no CUDA device available (%s). USC is GPU-only.\n",
             rank, cudaGetErrorString(err));
         std::exit(2);
     }
@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
             auto t1 = std::chrono::steady_clock::now();
 
             if (comm.getRank() == 0) {
-                std::cout << "fullchipUSC patch-select\n"
+                std::cout << "USC patch-select\n"
                           << "  ranks=" << comm.getSize() << "\n"
                           << "  result: selected=" << result.selected.size()
                           << " covered=" << result.covered_count

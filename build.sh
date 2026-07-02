@@ -1,5 +1,5 @@
 #!/bin/bash
-# fullchipUSC (stPS) build script
+# stPatternSearch (stPS) build script
 
 set -e
 
@@ -42,6 +42,6 @@ echo "=========================================="
 echo "Build completed successfully!"
 echo "=========================================="
 echo "Library: build/src/libstPS.a"
-echo "Driver:  build/src/fullchipusc-patch-select"
-echo "Tests:   build/tests/fullchipusc_tests"
+echo "Driver:  build/src/usc-patch-select"
+echo "Tests:   build/tests/stps_tests"
 echo "=========================================="

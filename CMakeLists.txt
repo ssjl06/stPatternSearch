@@ -11,9 +11,9 @@ if(NOT DEFINED CMAKE_CUDA_COMPILER AND EXISTS "/usr/local/cuda/bin/nvcc")
     set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
 endif()
 
-project(fullchipUSC
+project(stPatternSearch
     VERSION 0.1.0
-    DESCRIPTION "Distributed greedy minimum set cover for OPC segment dedup (fullchip USC)"
+    DESCRIPTION "Distributed pattern-search library (USC: greedy minimum set cover for OPC segment dedup)"
     LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -29,15 +29,19 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(FULLCHIPUSC_BUILD_TESTS "Build unit tests (GoogleTest via FetchContent)" ON)
-option(FULLCHIPUSC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+option(STPS_BUILD_TESTS "Build unit tests (GoogleTest via FetchContent)" ON)
+option(STPS_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+# Per-stage profiling in the USC solve loop (CUDA-event + host timers). Off by
+# default so the production hot path carries no synchronization; enable with
+# -DUSC_PROFILE=ON to get a per-iteration stage breakdown on stderr.
+option(USC_PROFILE "Enable USC per-stage profiling instrumentation" OFF)
 
 if(MSVC)
     add_compile_options(/W4 /permissive-)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter)
 endif()
-if(FULLCHIPUSC_WARNINGS_AS_ERRORS)
+if(STPS_WARNINGS_AS_ERRORS)
     if(MSVC)
         add_compile_options(/WX)
     else()
@@ -48,15 +52,15 @@ endif()
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(stComm REQUIRED)
 find_package(CUDAToolkit REQUIRED)
-message(STATUS "fullchipUSC: MPI backend (${MPI_CXX_COMPILER})")
-message(STATUS "fullchipUSC: stComm found")
-message(STATUS "fullchipUSC: CUDA toolkit ${CUDAToolkit_VERSION}, arch=${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "stPS: MPI backend (${MPI_CXX_COMPILER})")
+message(STATUS "stPS: stComm found")
+message(STATUS "stPS: CUDA toolkit ${CUDAToolkit_VERSION}, arch=${CMAKE_CUDA_ARCHITECTURES}")
 
 include(GNUInstallDirs)
 
 add_subdirectory(src)
 
-if(FULLCHIPUSC_BUILD_TESTS)
+if(STPS_BUILD_TESTS)
     enable_testing()
     # Use a system-installed GoogleTest. Point CMake at a custom install with
     # any of the standard hints, e.g.:
@@ -64,7 +68,7 @@ if(FULLCHIPUSC_BUILD_TESTS)
     #   -DGTest_ROOT=/path/to/gtest        (<Package>_ROOT, CMP0074)
     #   -DCMAKE_PREFIX_PATH=/path/to/gtest (generic prefix)
     find_package(GTest REQUIRED)
-    message(STATUS "fullchipUSC: GTest found (${GTest_DIR})")
+    message(STATUS "stPS: GTest found (${GTest_DIR})")
     add_subdirectory(tests)
 endif()
 

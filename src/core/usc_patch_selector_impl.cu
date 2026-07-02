@@ -1,5 +1,8 @@
 #include "core/usc_patch_selector_impl.hpp"
 
+#include "core/gpu_profiler.hpp"
+#include "core/host_profiler.hpp"
+
 #include <stComm/stComm.h>
 
 #include <cub/device/device_reduce.cuh>
@@ -7,10 +10,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdio>
-#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -209,7 +210,7 @@ UscPatchSelectorImpl::UscPatchSelectorImpl(stComm::Comm& comm)
     if (!comm_.hasDevice()) {
         throw std::invalid_argument(
             "UscPatchSelectorImpl requires a device-enabled Comm (Comm::onDevice) — "
-            "fullchipUSC is GPU-only.");
+            "USC is GPU-only.");
     }
 }
 
@@ -426,36 +427,29 @@ PatchSelection UscPatchSelectorImpl::select() {
         d_argmax_temp.resize(temp_bytes);
     }
 
-    // Optional per-iteration stage timing. Gated by FULLCHIPUSC_PROFILE=1 to
-    // keep the production hot path free of synchronization. When enabled, we
-    // force a cudaDeviceSynchronize at each stage boundary so chrono captures
-    // wall time on host *and* the GPU kernel that landed in this stage; the
-    // sync adds overhead, so the per-stage numbers are slightly inflated but
-    // their *relative* shape (which stage dominates) is what we care about.
-    const bool profile_enabled = []() {
-        const char* v = std::getenv("FULLCHIPUSC_PROFILE");
-        return v && v[0] && v[0] != '0';
-    }();
-    using Clock = std::chrono::steady_clock;
-    using ns    = std::chrono::nanoseconds;
-    std::int64_t t_argmax_ns        = 0;
-    std::int64_t t_maxloc_ns        = 0;
-    std::int64_t t_patchid_bcast_ns = 0;
-    std::int64_t t_build_kernel_ns  = 0;
-    std::int64_t t_nccl_bcast_ns    = 0;
-    std::int64_t t_set_bits_ns      = 0;
-    std::int64_t t_score_update_ns  = 0;
-    std::int64_t t_winner_disable_ns = 0;
-    auto tick = [&]() {
-        if (profile_enabled) cudaDeviceSynchronize();
-        return Clock::now();
-    };
-    auto add_elapsed = [&](std::int64_t& acc, Clock::time_point start) {
-        acc += std::chrono::duration_cast<ns>(tick() - start).count();
-    };
+    // Per-iteration stage timing, split by where the cost lands. Pure
+    // default-stream GPU compute is measured with CUDA events (GpuProfiler);
+    // host-blocking collectives — the MPI host-space ops and the NCCL bcast,
+    // whose device work runs on a stComm-internal stream that default-stream
+    // events can't see — are measured with host wall-clock around wait()
+    // (HostProfiler). Compile-time gated by -DUSC_PROFILE: when off, every
+    // begin/end is a no-op, so the production hot path keeps no synchronization
+    // and no environment lookup.
+#ifdef USC_PROFILE
+    constexpr bool kProfile = true;
+#else
+    constexpr bool kProfile = false;
+#endif
+    enum GpuStage  { kArgmax = 0, kBuildKernel, kSetBits, kScoreUpdate, kWinnerDisable };
+    enum HostStage { kMaxloc = 0, kPatchIdBcast, kNcclBcast };
+    detail::GpuProfiler gpu_prof(
+        {"argmax+D2H", "build_kernel", "set_bits", "score_update", "winner_disable"},
+        kProfile);
+    detail::HostProfiler host_prof(
+        {"maxloc", "patchid_bcast", "nccl_bcast"}, kProfile);
 
     while (result.covered_count < N_) {
-        auto t0 = tick();
+        gpu_prof.begin(kArgmax);
         Score   local_best_score = kDisabledScore;
         PatchId local_best_patch = 0;
         if (M_loc > 0) {
@@ -471,24 +465,24 @@ PatchSelection UscPatchSelectorImpl::select() {
             local_best_score = host_result.value;
             local_best_patch = static_cast<PatchId>(host_result.key);
         }
-        if (profile_enabled) add_elapsed(t_argmax_ns, t0);
+        gpu_prof.end(kArgmax);
 
-        auto t1 = tick();
+        host_prof.begin(kMaxloc);
         // allreduceMaxloc is async on the unified Comm; wait() for the pair.
         std::pair<std::int64_t, int> maxloc;
         comm_.allreduceMaxloc<stComm::Space::Host>(local_best_score, &maxloc)->wait();
         const std::int64_t winner_score = maxloc.first;
         const int          winner_rank  = maxloc.second;
-        if (profile_enabled) add_elapsed(t_maxloc_ns, t1);
+        host_prof.end(kMaxloc);
         if (winner_score <= 0) break;
 
-        auto t2 = tick();
+        host_prof.begin(kPatchIdBcast);
         PatchId winner_global = 0;
         if (comm_.getRank() == winner_rank) {
             winner_global = patch_global_ids_[local_best_patch];
         }
         comm_.bcast<stComm::Space::Host, PatchId>(&winner_global, 1, winner_rank)->wait();
-        if (profile_enabled) add_elapsed(t_patchid_bcast_ns, t2);
+        host_prof.end(kPatchIdBcast);
 
         // ------------------------------------------------------------------
         // Build the sparse newly_covered list on device (winner only), then
@@ -496,7 +490,7 @@ PatchSelection UscPatchSelectorImpl::select() {
         // visits host memory — the winner kernel writes it, NCCL bcast
         // distributes it, and set_bits_kernel consumes it.
         // ------------------------------------------------------------------
-        auto t3 = tick();
+        gpu_prof.begin(kBuildKernel);
         if (d_newly_covered_ids.size() < static_cast<std::size_t>(winner_score)) {
             d_newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
         }
@@ -516,16 +510,16 @@ PatchSelection UscPatchSelectorImpl::select() {
                 cuda_launch_check("build_newly_covered_kernel");
             }
         }
-        if (profile_enabled) add_elapsed(t_build_kernel_ns, t3);
+        gpu_prof.end(kBuildKernel);
 
         // Device-direct broadcast. winner_score and winner_rank (16B) are the
         // only host-visible metadata per iteration — that's a NCCL API
         // constraint (root/count must be host scalars), not a payload cost.
-        auto t4 = tick();
+        host_prof.begin(kNcclBcast);
         comm_.bcast<stComm::Space::Device, ElementId>(d_newly_covered_ids.data(),
                                               static_cast<std::size_t>(winner_score),
                                               winner_rank)->wait();
-        if (profile_enabled) add_elapsed(t_nccl_bcast_ns, t4);
+        host_prof.end(kNcclBcast);
 
         result.covered_count += static_cast<std::uint64_t>(winner_score);
         result.selected.push_back(winner_global);
@@ -537,7 +531,7 @@ PatchSelection UscPatchSelectorImpl::select() {
         // directly, so the per-iteration newly_covered *bitset* is no longer
         // needed — one set_bits launch instead of two.
         // ------------------------------------------------------------------
-        auto t5 = tick();
+        gpu_prof.begin(kSetBits);
         if (winner_score > 0) {
             const int block = 128;
             const int grid  = static_cast<int>(
@@ -547,14 +541,14 @@ PatchSelection UscPatchSelectorImpl::select() {
                                               static_cast<std::size_t>(winner_score));
             cuda_launch_check("set_bits_kernel (covered)");
         }
-        if (profile_enabled) add_elapsed(t_set_bits_ns, t5);
+        gpu_prof.end(kSetBits);
 
         // Score update — design doc §6.3 strategy A (inverted-index, affected
         // only). One block per newly covered element; each decrements the score
         // of every local patch containing it. Bit-identical to the strategy-B
         // full sweep (see kernel comment), but visits each incidence once over
         // the whole solve instead of re-sweeping all patches every iteration.
-        auto t6 = tick();
+        gpu_prof.begin(kScoreUpdate);
         if (winner_score > 0) {
             score_update_invidx_kernel<<<static_cast<unsigned>(winner_score),
                                          kScoreBlockThreads>>>(
@@ -567,9 +561,9 @@ PatchSelection UscPatchSelectorImpl::select() {
                 d_scores_.data());
             cuda_launch_check("score_update_invidx_kernel");
         }
-        if (profile_enabled) add_elapsed(t_score_update_ns, t6);
+        gpu_prof.end(kScoreUpdate);
 
-        auto t7 = tick();
+        gpu_prof.begin(kWinnerDisable);
         if (comm_.getRank() == winner_rank) {
             // Disable winner on device so next iteration's kernel + ArgMax skip
             // it (kernel early-outs on score <= 0; ArgMax picks the next-best).
@@ -577,36 +571,14 @@ PatchSelection UscPatchSelectorImpl::select() {
             cudaMemcpy(&d_scores_.data()[local_best_patch], &neg, sizeof(Score),
                        cudaMemcpyHostToDevice);
         }
-        if (profile_enabled) add_elapsed(t_winner_disable_ns, t7);
+        gpu_prof.end(kWinnerDisable);
 
         ++result.iterations;
     }
 
-    if (profile_enabled && comm_.getRank() == 0) {
-        const double iters = static_cast<double>(result.iterations ? result.iterations : 1);
-        auto ms_avg = [&](std::int64_t total_ns) {
-            return total_ns * 1e-6 / iters;
-        };
-        auto ms_tot = [&](std::int64_t total_ns) { return total_ns * 1e-6; };
-        std::fprintf(stderr,
-            "[fullchipusc-profile] iters=%llu  (per-iter μs avg, total ms)\n"
-            "  argmax+D2H        %7.1f μs    %7.1f ms\n"
-            "  maxloc            %7.1f μs    %7.1f ms\n"
-            "  patchid_bcast     %7.1f μs    %7.1f ms\n"
-            "  build_kernel      %7.1f μs    %7.1f ms\n"
-            "  nccl_bcast        %7.1f μs    %7.1f ms\n"
-            "  set_bits          %7.1f μs    %7.1f ms\n"
-            "  score_update      %7.1f μs    %7.1f ms\n"
-            "  winner_disable    %7.1f μs    %7.1f ms\n",
-            (unsigned long long)result.iterations,
-            ms_avg(t_argmax_ns)        * 1000, ms_tot(t_argmax_ns),
-            ms_avg(t_maxloc_ns)        * 1000, ms_tot(t_maxloc_ns),
-            ms_avg(t_patchid_bcast_ns) * 1000, ms_tot(t_patchid_bcast_ns),
-            ms_avg(t_build_kernel_ns)  * 1000, ms_tot(t_build_kernel_ns),
-            ms_avg(t_nccl_bcast_ns)    * 1000, ms_tot(t_nccl_bcast_ns),
-            ms_avg(t_set_bits_ns)      * 1000, ms_tot(t_set_bits_ns),
-            ms_avg(t_score_update_ns)  * 1000, ms_tot(t_score_update_ns),
-            ms_avg(t_winner_disable_ns)* 1000, ms_tot(t_winner_disable_ns));
+    if (comm_.getRank() == 0) {
+        gpu_prof.report(stderr, "[usc-profile gpu]", result.iterations);
+        host_prof.report(stderr, "[usc-profile host]", result.iterations);
     }
 
     return result;
@@ -614,7 +586,7 @@ PatchSelection UscPatchSelectorImpl::select() {
 
 void UscPatchSelectorImpl::print_selection(const PatchSelection& r) const {
     if (comm_.getRank() != 0) return;
-    std::cout << "fullchipUSC patch-select\n"
+    std::cout << "USC patch-select\n"
               << "  universe N=" << N_
               << " ranks=" << comm_.getSize() << "\n"
               << "  result: selected=" << r.selected.size()

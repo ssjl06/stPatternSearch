@@ -1,4 +1,4 @@
-# fullchipUSC — Roadmap (M5.5+)
+# stPatternSearch — Roadmap (M5.5+)
 
 This file describes what's still planned. See [STATUS.md](STATUS.md) for
 completed work and the M5 profile baseline that drives the new ordering.
@@ -31,8 +31,8 @@ completed work and the M5 profile baseline that drives the new ordering.
 ### One-shot setup
 
 ```bash
-git clone <fullchipUSC remote>
-cd fullchipUSC && git checkout gpu
+git clone <stPatternSearch remote>
+cd stPatternSearch && git checkout main
 ./scripts/setup-env.sh
 # then build per STATUS.md "Build & run"
 ```
@@ -245,6 +245,7 @@ Capture format spec from the OPC team before designing the reader.
 - **Stream awareness**: All kernels use the default stream. Per-step streams
   + explicit `cudaStreamSynchronize` would document intent and unlock
   comm/compute overlap.
-- **Profile gating**: `FULLCHIPUSC_PROFILE=1` instrumentation lives in
-  `solve()`; off path has no sync. Kept through M5.5 (used to confirm the
-  78% → 18% shift); next useful for a possible argmax rework.
+- **Profile gating**: `-DUSC_PROFILE=ON` compiles in the per-stage
+  `GpuProfiler` (CUDA events) + `HostProfiler` (host wall-clock) instrumentation
+  in `patch_select()`; off path has no sync. Used to confirm the 78% → 18%
+  shift; next useful for a possible argmax rework.
