@@ -3,12 +3,20 @@ add_library(stPS STATIC
     core/csr.cpp
     core/inverted_index.cpp
     core/device_buffer.cu
+    core/gpu_profiler.cu
+    core/host_profiler.cpp
     core/usc_patch_selector_impl.cu
     core/brute_force.cpp
     data/synthetic.cpp
     data/partition.cpp
 )
 add_library(stPS::stPS ALIAS stPS)
+
+# -DUSC_PROFILE=ON compiles in the per-stage profiler calls (usc_patch_selector_impl.cu
+# guards them behind #ifdef USC_PROFILE); off by default = zero-overhead hot path.
+if(USC_PROFILE)
+    target_compile_definitions(stPS PRIVATE USC_PROFILE)
+endif()
 
 # usc_patch_selector_impl.cu / device_buffer.cu are compiled by nvcc — link the CUDA runtime
 # so DeviceBuffer's cudaMalloc/cudaFree resolve. PIC + separable compilation let
@@ -49,5 +57,5 @@ install(TARGETS stPS
 # Demo / CLI driver. main.cpp lives in src/, so its quote-include of the
 # internal "data/synthetic.hpp" resolves relative to it; it drives the selection
 # through the public stPS::UscPatchSelector from <stPS/...> (carried by the link below).
-add_executable(fullchipusc-patch-select main.cpp)
-target_link_libraries(fullchipusc-patch-select PRIVATE stPS)
+add_executable(usc-patch-select main.cpp)
+target_link_libraries(usc-patch-select PRIVATE stPS)

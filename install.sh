@@ -1,5 +1,5 @@
 #!/bin/bash
-# fullchipUSC (stPS) installation script
+# stPatternSearch (stPS) installation script
 
 set -e
 

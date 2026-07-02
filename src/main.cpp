@@ -4,11 +4,13 @@
 #include <stComm/stComm.h>
 
 #include <cuda_runtime.h>
+#include <mpi.h>          // top-level error path only: MPI_Abort / rank for logging
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <string>
 
@@ -29,7 +31,7 @@ int pick_device_for_rank(int rank) {
     cudaError_t err = cudaGetDeviceCount(&num_gpus);
     if (err != cudaSuccess || num_gpus <= 0) {
         std::fprintf(stderr,
-            "rank %d: no CUDA device available (%s). fullchipUSC is GPU-only.\n",
+            "rank %d: no CUDA device available (%s). USC is GPU-only.\n",
             rank, cudaGetErrorString(err));
         std::exit(2);
     }
@@ -84,7 +86,7 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
 int main(int argc, char** argv) {
     stComm::Comm::initialize(&argc, &argv);
     int exit_code = 0;
-    {
+    try {
         CliOptions opt;
         if (!parse_args(argc, argv, opt)) { exit_code = 1; }
         else {
@@ -106,7 +108,7 @@ int main(int argc, char** argv) {
             auto t1 = std::chrono::steady_clock::now();
 
             if (comm.getRank() == 0) {
-                std::cout << "fullchipUSC patch-select\n"
+                std::cout << "USC patch-select\n"
                           << "  ranks=" << comm.getSize() << "\n"
                           << "  result: selected=" << result.selected.size()
                           << " covered=" << result.covered_count
@@ -124,6 +126,17 @@ int main(int argc, char** argv) {
                 }
             }
         }
+    }
+    catch (const std::exception& e) {
+        // stComm now throws on a backend (CUDA/NCCL/MPI) failure. Such a fault
+        // typically hits one rank mid-collective, leaving the others blocked, so
+        // falling through to finalize() would deadlock the job. Log with the
+        // rank for context and MPI_Abort to tear every rank down at once.
+        int rank = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        std::fprintf(stderr, "rank %d: fatal error: %s\n", rank, e.what());
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;  // unreachable: MPI_Abort does not return
     }
     stComm::Comm::finalize();
     return exit_code;

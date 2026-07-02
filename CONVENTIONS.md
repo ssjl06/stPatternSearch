@@ -1,4 +1,4 @@
-# fullchipUSC — Collaboration Conventions
+# stPatternSearch — Collaboration Conventions
 
 Notes for future Claude sessions (and human collaborators) about how this
 project has been developed. Patterns observed across M1–M4 that should
@@ -24,10 +24,10 @@ continue.
 ## Design preferences (from user feedback)
 
 ### 1. All communication code lives in stComm
-- fullchipUSC must not wrap MPI/NCCL calls in its own classes. There was
+- stPS must not wrap MPI/NCCL calls in its own classes. There was
   briefly a `Communicator` wrapper in M1; M2 removed it.
 - If a comm protocol is missing from stComm, add it to stComm (upstream
-  PR), don't reinvent in fullchipUSC.
+  PR), don't reinvent in stPS.
 - The one allowed pattern: USCSolver holds a `CommT&` (template) and calls
   `comm_.bcast<T>(...)`, `comm_.allreduceMaxloc<T>(...)` directly.
 
@@ -76,7 +76,7 @@ continue.
   GPUs (no MPS / oversubscription — NCCL needs 1:1 process:device mapping).
 
 ### 7. GPU is required, no fallbacks
-- fullchipUSC is GPU-first by premise. Don't add CPU fallbacks, optional-GPU
+- stPS is GPU-first by premise. Don't add CPU fallbacks, optional-GPU
   toggles, or `--backend mpi` flags. If GPUs (or NCCL) aren't available, fail
   loud at startup.
 - The CPU-only M3 baseline still lives on `main` branch for bisect-style
@@ -117,9 +117,9 @@ verification passes. The user can see live progress in the spinner.
 - `mpirun -n 1 ctest` — single-rank correctness
 - `mpirun -n <num_gpus> ctest` — multi-rank correctness (NCCL needs 1
   process per GPU, no oversubscription). Default ctest is `-n 2`; override
-  via `-DFULLCHIPUSC_TEST_NRANKS=<n>`.
-- `mpirun -n <num_gpus> ... fullchipusc-solve --N ...` — smoke at scale.
-- `FULLCHIPUSC_PROFILE=1 mpirun -n <num_gpus> -x FULLCHIPUSC_PROFILE ...`
+  via `-DSTPS_TEST_NRANKS=<n>`.
+- `mpirun -n <num_gpus> ... usc-patch-select --N ...` — smoke at scale.
+- Configure with `-DUSC_PROFILE=ON`, then `mpirun -n <num_gpus> ... usc-patch-select ...`
   — per-stage breakdown when investigating regressions or new bottlenecks.
 
 Smoke output baseline lives in [STATUS.md](STATUS.md). When changing

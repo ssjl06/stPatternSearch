@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fullchipUSC environment bootstrap
+# stPatternSearch environment bootstrap
 #
 # Installs the build prerequisites that aren't shipped with the repo and stages
 # the stComm dependency so `cmake -S . -B build` can find it. Re-runnable: each
@@ -46,7 +46,7 @@ command -v mpicxx  >/dev/null 2>&1 || need_apt+=(openmpi-bin libopenmpi-dev)
 command -v git     >/dev/null 2>&1 || need_apt+=(git)
 command -v wget    >/dev/null 2>&1 || need_apt+=(wget ca-certificates)
 command -v curl    >/dev/null 2>&1 || need_apt+=(curl)
-# Both stComm and fullchipUSC call find_package(GTest) to link the test suite
+# Both stComm and stPatternSearch call find_package(GTest) to link the test suite
 # against a system-installed GoogleTest — apt provides prebuilt libs on Ubuntu
 # 22.04+. Point CMake at a custom install via -DGTEST_ROOT / -DCMAKE_PREFIX_PATH.
 [ -f /usr/include/gtest/gtest.h ]  || need_apt+=(libgtest-dev libgmock-dev)

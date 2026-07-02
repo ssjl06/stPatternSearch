@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
         if (num_gpus < size) {
             if (rank == 0) {
                 std::fprintf(stderr,
-                    "fullchipusc_tests: requires >= %d GPUs but only %d visible. "
+                    "stps_tests: requires >= %d GPUs but only %d visible. "
                     "Re-run with mpirun -n <=%d.\n", size, num_gpus, num_gpus);
             }
             stComm::Comm::finalize();

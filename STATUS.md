@@ -1,4 +1,4 @@
-# fullchipUSC — Status (as of M5.5 completion, 2026-05-29)
+# stPatternSearch — Status (as of M5.5 completion, 2026-05-29)
 
 ## Project
 
@@ -99,7 +99,7 @@ tests/
 | stComm | `~/install/stComm` | branch `add-nccl-bcast` — adds `NCCLComm::bcast<T>` on top of `add-bcast-maxloc-exscan` |
 | CUDA Toolkit | `/usr/local/cuda` (12.x) | nvcc compiles `usc_solver.cu`, `device_buffer.cu` |
 | NCCL | system (`libnccl-dev`) | required at runtime for the hot-path bcast |
-| GoogleTest | system (`libgtest-dev`) for stComm; FetchContent 1.15.2 for fullchipUSC | |
+| GoogleTest | system (`libgtest-dev`) for stComm; FetchContent 1.15.2 for stPS | |
 
 ### Per-iteration host/device boundary (M5)
 
@@ -125,7 +125,7 @@ API (root/count must be host scalars).
    the alternative (`USCSolver<NCCLComm>` for the full path) would have
    required reworking setup for device-resident data, which is M6+ territory.
 
-2. **GPU is required, no fallbacks** — fullchipUSC is GPU-first by premise.
+2. **GPU is required, no fallbacks** — stPS is GPU-first by premise.
    No CPU-only path, no `--backend mpi` toggle. The CPU baseline lives on the
    `main` branch for bisect, not in product code.
 
@@ -138,7 +138,7 @@ API (root/count must be host scalars).
    template wrapper). `device_buffer.cu` is the only TU that touches
    `cuda_runtime.h`.
 
-5. **All collective comm lives in stComm** — fullchipUSC never wraps MPI/NCCL
+5. **All collective comm lives in stComm** — stPS never wraps MPI/NCCL
    calls. Custom protocols (e.g., sparse bcast) become free functions or
    stComm extensions, not USCSolver methods.
 
@@ -163,8 +163,9 @@ API (root/count must be host scalars).
    of −1 (no 64-bit `atomicSub` exists); decrements commute, so scores stay
    deterministic. The strategy-B kernel lives on the `main` branch for bisect.
 
-8. **Optional profile instrumentation in solve()** — gated by env var
-   `FULLCHIPUSC_PROFILE=1`; off path has no sync overhead. Used to pinpoint
+8. **Optional profile instrumentation in patch_select()** — compiled in by
+   `-DUSC_PROFILE=ON` (`GpuProfiler` CUDA-event timers + `HostProfiler` host
+   wall-clock timers); off path has no sync overhead. Used to pinpoint
    per-stage cost. See "Profile baseline" below.
 
 ## Verification baseline (M5)
@@ -206,7 +207,7 @@ is constant, so its share of solve time shrinks with scale, while
 Setup scales near-ideal at 20× — sample sort + alltoallv + H2D are all
 work-distributable across ranks.
 
-### Profile baseline — 20× workload, `FULLCHIPUSC_PROFILE=1`
+### Profile baseline — 20× workload, `-DUSC_PROFILE=ON`
 
 The original M5 profile (2×A100) had `score_update` at **78% of solve**:
 
@@ -269,7 +270,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=80
 cmake --build build -j
 
 # Run tests — needs num_gpus >= mpirun -n. Default ctest uses -n 2.
-# Override with -DFULLCHIPUSC_TEST_NRANKS=<n> at configure time if you have n GPUs.
+# Override with -DSTPS_TEST_NRANKS=<n> at configure time if you have n GPUs.
 export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 # On hosts where GPU-to-GPU PCIe P2P is broken (see "Known issues" below) the
 # NCCL bcast deadlocks — export NCCL_P2P_DISABLE=1 first. Harmless on NVLink
@@ -278,11 +279,12 @@ export NCCL_P2P_DISABLE=1
 (cd build && ctest --output-on-failure)
 
 # Smoke
-mpirun -n 2 -x NCCL_P2P_DISABLE ./build/src/fullchipusc-solve --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
+mpirun -n 2 -x NCCL_P2P_DISABLE ./build/src/usc-patch-select --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
 
-# Profile breakdown
-FULLCHIPUSC_PROFILE=1 mpirun -n 2 -x FULLCHIPUSC_PROFILE -x NCCL_P2P_DISABLE \
-    ./build/src/fullchipusc-solve --N 500000 --M 10000 --K 300 --overlap 0.3 --seed 1
+# Profile breakdown — configure with -DUSC_PROFILE=ON, then run normally
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=80 -DUSC_PROFILE=ON && cmake --build build -j
+mpirun -n 2 -x NCCL_P2P_DISABLE \
+    ./build/src/usc-patch-select --N 500000 --M 10000 --K 300 --overlap 0.3 --seed 1
 ```
 
 ## Known issues

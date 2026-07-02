@@ -1,4 +1,4 @@
-# fullchipUSC
+# stPatternSearch
 
 Distributed greedy minimum set cover for OPC segment dedup (USC: Unique Segment Correction).
 
@@ -50,7 +50,7 @@ STCOMM_PREFIX=~/install/stComm ./build.sh        # or: ./build.sh --clean / --de
 cd build && ctest --output-on-failure
 
 # Smoke (the CLI driver, which uses the public stPS::UscPatchSelector under the hood)
-mpirun -n 4 --oversubscribe ./build/src/fullchipusc-patch-select \
+mpirun -n 4 --oversubscribe ./build/src/usc-patch-select \
     --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
 # Expected: selected=353 covered=6019 iterations=353
 ```
