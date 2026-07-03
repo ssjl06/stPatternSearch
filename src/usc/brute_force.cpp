@@ -1,4 +1,4 @@
-#include "core/brute_force.hpp"
+#include "usc/brute_force.hpp"
 
 #include "core/bitset.hpp"
 
