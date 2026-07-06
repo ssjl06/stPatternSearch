@@ -19,7 +19,8 @@ covers every unique hash. Design rationale lives in [`greedy_set_cover.md`](gree
 | — | Segmented argmax (tried, no gain — loop is latency-bound) | ⛔ Reverted | |
 | M6 | Element-partitioned covered bitset (§7.3) | ✅ Done (opt-in `PartitionMode::ByElement`) | `m6-element-partition` |
 | M6.5 | Device-resident ByElement loop (Full-GPU iteration track) | ✅ Done | `device-resident-loop` |
-| M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ In progress (io infra parked on `m7-io-infra`) | |
+| M7a | Patch-file io infra (`PatchReader` + `.stps` + `--input`/`--dump`) | ✅ Done | `m7-io-infra` |
+| M7b | Real OPC format reader + 2D partition (§7.4) | ⏳ Blocked on the OPC team's format spec | |
 
 > **Next-work note (2026-05-29):** the per-iteration hot loop is **latency/
 > launch-bound, not compute-bound** (argmax ≈ 20 µs flat across a 5× M range).
@@ -88,6 +89,9 @@ src/
 │   ├── main.cpp                   # CLI entry; device pick + Comm::onDevice
 │   ├── usc_patch_selector_impl.{hpp,cu}  # ByPatch + ByElement impls, kernels, facade
 │   └── brute_force.{hpp,cpp}      # single-process reference for tests
+├── io/                            # patch file readers/writers (M7)
+│   ├── patch_reader.hpp           # PatchReader interface + open_patch_file
+│   └── stps_binary.cpp            # v1 .stps binary CSR reader/writer
 └── data/
     ├── synthetic.{hpp,cpp}        # deterministic synthetic generator
     └── partition.cpp              # slice_patches_by_rank impl
