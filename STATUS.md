@@ -18,7 +18,8 @@ covers every unique hash. Design rationale lives in [`greedy_set_cover.md`](gree
 | M5.5 | score_update strategy A (inverted-index, affected-only) | ✅ Done | `gpu` |
 | — | Segmented argmax (tried, no gain — loop is latency-bound) | ⛔ Reverted | |
 | M6 | Element-partitioned covered bitset (§7.3) | ✅ Done (opt-in `PartitionMode::ByElement`) | `m6-element-partition` |
-| M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ Planned | |
+| M6.5 | Device-resident ByElement loop (Full-GPU iteration track) | ✅ Done | `device-resident-loop` |
+| M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ In progress (io infra parked on `m7-io-infra`) | |
 
 > **Next-work note (2026-05-29):** the per-iteration hot loop is **latency/
 > launch-bound, not compute-bound** (argmax ≈ 20 µs flat across a 5× M range).
@@ -105,7 +106,7 @@ tests/
 | Dep | Where | Notes |
 |---|---|---|
 | MPI (OpenMPI/MPICH) | system | `mpicxx`, `find_package(MPI)` |
-| stComm | `~/install/stComm` | branch `add-allreduce` — adds element-wise `allreduce<T>(op)` (MPI_Iallreduce / native ncclAllReduce), required by `PartitionMode::ByElement` |
+| stComm | `~/install/stComm` | branch `add-getstream` — element-wise `allreduce<T>(op)` (merged PR #6) + `NCCLComm::getStream()` for the device-resident loop |
 | CUDA Toolkit | `/usr/local/cuda` (12.x) | nvcc compiles `usc_solver.cu`, `device_buffer.cu` |
 | NCCL | system (`libnccl-dev`) | required at runtime for the hot-path bcast |
 | GoogleTest | system (`libgtest-dev`) for stComm; FetchContent 1.15.2 for stPS | |
@@ -162,11 +163,44 @@ dominates), exactly as the design doc predicted:
 All three scales bit-identical between modes and sizes 1/2 (`selected` =
 353 / 5378 / 14889).
 
-**Full-GPU synergy note**: ByElement's loop has no data-dependent collective
-count and no root — the exact blockers that killed the earlier multi-rank
-device-resident attempt (see ROADMAP "Full-GPU iteration track"). A CUDA-graph
-device-resident loop over this mode is the natural next step if NVLink-class
-hardware shows the latency win.
+### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
+
+Because ByElement's one collective has a fixed count and no root (the exact
+blockers that killed the earlier multi-rank device-resident attempt), the host
+now enqueues **batches of 128 whole iterations blind** on the NCCL stream —
+ncclAllReduce + CUB ArgMax + a single-thread `elem_commit_winner` kernel
+(winner append, covered_count, winner disable, done flag, all on device) +
+three fixed-grid grid-stride update kernels — and syncs once per batch to read
+a 24 B loop state. **Zero per-iteration D2H/H2D round-trips.** At size == 1
+the allreduce is skipped (partials are the full scores) — this is the
+single-rank device-resident loop the ROADMAP prototype validated at 2.7×.
+Iterations enqueued past termination no-op on device; `done` derives only from
+allreduced values, so all ranks leave after the same batch.
+
+Measured (patch-select total = setup + solve, ms; same-mode host-loop "before"
+from the M6 table — identical setup, so the delta is pure solve):
+
+| Workload | elem `-n 1` before → after | elem `-n 2` before → after | ByPatch `-n 2` (ref) |
+|---|---|---|---|
+| Small | 34 → **22** | 319 → 483 ⚠ | 318 |
+| LARGE | 1553 → **1341** | 1205 → **1034** | 1087 |
+| 4× | — → 5393 | 4501 → **3914** | 3278 |
+| 20× | | — → 43224 | 31470 |
+
+All bit-identical (353 / 5378 / 14889 / 35824), 31/31 ctest. ⚠ Small `-n 2`
+regresses: at a few-hundred-iteration scale the deeply pipelined NCCL enqueue
+costs more than the host round-trips it removes (unprofiled; irrelevant to the
+mode's target regime). ByElement stays comm-bound by the M×8 B allreduce on
+this PCIe/SHM box (20×: 800 KB × 35.8 K iters), so **ByPatch remains the
+faster multi-rank mode on this hardware** — the device-resident win (~15%
+end-to-end, ~30% solve-only at LARGE/4×) compounds where ByElement is actually
+needed: huge N, NVLink-class interconnects. Next comm levers if pursued:
+int32 wire scores (halves the allreduce), CUDA-graph capture of the batch
+(cuts launch overhead), NVLink validation.
+
+`-DUSC_PROFILE` stage timers are absent from this loop by design — no
+per-iteration syncs means no host-visible stage boundaries; profile with
+Nsight Systems.
 
 ## Key design decisions (recorded for future maintainers)
 

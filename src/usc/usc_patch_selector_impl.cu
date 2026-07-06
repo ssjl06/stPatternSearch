@@ -123,6 +123,148 @@ __global__ void score_update_invidx_kernel(const ElementId*     newly_ids,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Device-resident ByElement loop kernels (Full-GPU iteration track).
+//
+// The host enqueues whole batches of iterations blind, so every launch here
+// uses a FIXED grid and reads the winner's range / newly-covered count from
+// device memory — the host knows neither when it enqueues. All control flow
+// that the ByPatch loop keeps on the host (winner resolution, covered_count,
+// termination, winner disable) lives in the single-thread commit kernel.
+// ---------------------------------------------------------------------------
+
+constexpr int kElemGridBlocks   = 256;  // fixed grid for the grid-stride kernels
+constexpr int kElemBlockThreads = 128;
+
+// Device-resident loop state — the commit kernel is its only writer; the host
+// reads it once per batch (24 B D2H) to decide whether to enqueue more.
+struct ElemLoopState {
+    std::uint64_t covered_count;
+    std::uint64_t num_selected;   // == iterations executed
+    std::uint32_t done;
+    std::uint32_t pad_;
+};
+
+// Per-iteration winner scratch: written by the commit kernel, consumed by the
+// three update kernels of the same (stream-ordered) iteration.
+struct ElemWinnerInfo {
+    std::uint64_t start;          // winner's shard-local sub-CSR range
+    std::uint64_t end;
+    unsigned int  newly_count;    // atomic output of the build kernel
+    unsigned int  pad_;
+};
+
+// Single-thread commit: consume the argmax result entirely on device — the
+// decision the host used to make each iteration. Appends the winner slot,
+// advances covered_count by the (globally identical) winner score, resolves
+// the winner's sub-CSR range for the update kernels, fuses the winner disable,
+// and raises `done` on termination. Once done, every later enqueued iteration
+// sees start == end and newly_count == 0 and no-ops — a batch may overshoot
+// the end of the solve but never changes the result, and `done` derives only
+// from allreduced values, so it flips on every rank in the same iteration.
+__global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, Score>* argmax,
+                                          const std::uint64_t* sub_offsets,
+                                          std::uint64_t        N,
+                                          Score*               scores_partial,
+                                          PatchId*             selected_slots,
+                                          ElemLoopState*       st,
+                                          ElemWinnerInfo*      w) {
+    w->newly_count = 0;
+    w->start = 0;
+    w->end   = 0;
+    if (st->done) return;
+    const Score score = argmax->value;
+    if (score <= 0) { st->done = 1; return; }
+    const int slot = argmax->key;
+    selected_slots[st->num_selected] = static_cast<PatchId>(slot);
+    st->num_selected  += 1;
+    st->covered_count += static_cast<std::uint64_t>(score);
+    if (st->covered_count >= N) st->done = 1;
+    w->start = sub_offsets[slot];
+    w->end   = sub_offsets[slot + 1];
+    // Winner disable, fused. The strategy-A update of this same iteration will
+    // further decrement it by this shard's newly-covered count — it stays
+    // permanently negative either way, so the selection sequence is identical
+    // to the host loop's update-then-disable order.
+    scores_partial[slot] = kDisabledScore;
+}
+
+// build_newly_covered, fixed-grid grid-stride: the range comes from w; the
+// compact output count is w->newly_count (same non-deterministic order /
+// deterministic set as build_newly_covered_kernel).
+__global__ void elem_build_newly_kernel(const ElementId*     patch_data,
+                                        const std::uint64_t* covered,
+                                        ElementId*           out_ids,
+                                        ElemWinnerInfo*      w) {
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t i = w->start
+             + blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+         i < w->end; i += stride) {
+        const ElementId id = patch_data[i];
+        if (((covered[id >> 6] >> (id & 63)) & 1ULL) == 0) {
+            const unsigned int slot = atomicAdd(&w->newly_count, 1u);
+            out_ids[slot] = id;
+        }
+    }
+}
+
+// set_bits, fixed-grid grid-stride over w->newly_count (final by stream order:
+// the build kernel completed before this launch starts).
+__global__ void elem_set_bits_kernel(std::uint64_t*        bitset,
+                                     const ElementId*      ids,
+                                     const ElemWinnerInfo* w) {
+    const unsigned int n = w->newly_count;
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t i =
+             blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+         i < n; i += stride) {
+        const ElementId id = ids[i];
+        atomicOr(reinterpret_cast<unsigned long long*>(&bitset[id >> 6]),
+                 static_cast<unsigned long long>(1ULL << (id & 63)));
+    }
+}
+
+// Strategy-A score update, fixed-grid: blocks stride over the newly covered
+// elements instead of grid == count. Per-element logic matches
+// score_update_invidx_kernel (shared-memory range resolve + per-patch −1).
+__global__ void elem_score_update_kernel(const ElementId*      newly_ids,
+                                         const ElemWinnerInfo* w,
+                                         const ElementId*      inv_keys,
+                                         std::uint64_t         inv_keys_n,
+                                         const std::uint64_t*  inv_offsets,
+                                         const PatchId*        inv_data,
+                                         Score*                scores) {
+    const unsigned int n = w->newly_count;
+    __shared__ std::uint64_t s_start;
+    __shared__ std::uint64_t s_end;
+    for (std::uint64_t e = blockIdx.x; e < n; e += gridDim.x) {
+        if (threadIdx.x == 0) {
+            const ElementId id = newly_ids[e];
+            std::uint64_t lo = 0, hi = inv_keys_n;
+            while (lo < hi) {                       // lower_bound over sorted keys
+                const std::uint64_t mid = lo + ((hi - lo) >> 1);
+                if (inv_keys[mid] < id) lo = mid + 1;
+                else                    hi = mid;
+            }
+            if (lo < inv_keys_n && inv_keys[lo] == id) {
+                s_start = inv_offsets[lo];
+                s_end   = inv_offsets[lo + 1];
+            } else {
+                s_start = 0;        // element not on this shard → empty range
+                s_end   = 0;
+            }
+        }
+        __syncthreads();
+        for (std::uint64_t i = s_start + threadIdx.x; i < s_end; i += blockDim.x) {
+            atomicAdd(reinterpret_cast<unsigned long long*>(&scores[inv_data[i]]),
+                      static_cast<unsigned long long>(-1LL));
+        }
+        __syncthreads();  // all readers done before thread 0 overwrites s_start/s_end
+    }
+}
+
 // Small helper: launch + sync-check. Aborts on any kernel error so a bug
 // surfaces at the responsible kernel rather than later as an opaque memcpy fail.
 inline void cuda_launch_check(const char* what) {
@@ -566,15 +708,23 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 
     d_scores_partial_.resize(M_global_);
     d_scores_sum_.resize(M_global_);
+    max_sub_len_ = 0;
     if (M_global_) {
         // Initial partial score = this shard's slice of each patch (full score
-        // arrives via the per-iteration AllReduce<SUM>).
+        // arrives via the per-iteration AllReduce<SUM>). Also record the widest
+        // sub-patch — it bounds the newly-covered scratch for the whole solve.
         std::vector<Score> init(M_global_);
-        for (std::uint64_t s = 0; s < M_global_; ++s)
-            init[s] = static_cast<Score>(sub.offsets[s + 1] - sub.offsets[s]);
+        for (std::uint64_t s = 0; s < M_global_; ++s) {
+            const std::uint64_t len = sub.offsets[s + 1] - sub.offsets[s];
+            init[s] = static_cast<Score>(len);
+            max_sub_len_ = std::max(max_sub_len_, len);
+        }
         d_scores_partial_.copy_from_host(init.data(), M_global_);
+        // Offsets mirror — the commit kernel resolves winner ranges on device,
+        // so the host never touches the sub-CSR during the loop.
+        d_sub_offsets_.resize(sub.offsets.size());
+        d_sub_offsets_.copy_from_host(sub.offsets.data(), sub.offsets.size());
     }
-    sub_offsets_ = std::move(sub.offsets);
 
     d_covered_.resize((shard_extent_ + 63) / 64);
     d_covered_.zero();
@@ -582,156 +732,120 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     return select();
 }
 
-// Element-partitioned greedy loop (§7.3). Per iteration:
+// Element-partitioned greedy loop (§7.3) — DEVICE-RESIDENT (Full-GPU track).
 //
-//        Comm.allreduce<Device, SUM>(d_scores_partial_, d_scores_sum_, M)   ← only collective
-//   [device] CUB ArgMax over the (identical) full scores → 16 B D2H
-//        — every rank picked the same winner; covered_count += winner_score
-//          with NO further communication —
-//   [device] build_newly_covered (this shard's slice of the winner)
-//   [device] set_bits (shard covered) + score_update_invidx (partials)
-//        H2D 8 B winner partial = kDisabledScore
+// Per iteration, all enqueued on the NCCL stream with no host knowledge of
+// the outcome:
 //
-// The ByPatch loop's MAXLOC, winner-PatchId bcast and newly-covered NCCL bcast
-// are all gone: the fixed-size, root-less AllReduce makes every rank's view of
-// the scores identical, and each shard updates itself locally.
+//        ncclAllReduce<SUM>(d_scores_partial_ → d_scores_sum_, M)   ← only collective
+//   [device] CUB ArgMax over the (identical) full scores
+//   [device] elem_commit_winner: append slot, covered_count += score,
+//            winner range resolve, winner disable, done flag   (1 thread)
+//   [device] elem_build_newly / elem_set_bits / elem_score_update
+//            (fixed grids; range/count read from device memory)
+//
+// The host enqueues kBatch iterations at a time and then syncs ONCE to read
+// the 24 B loop state — there are no per-iteration D2H/H2D round-trips. This
+// is only possible in ByElement: its collective has a fixed count and no
+// root, so it needs no host scalars (the exact blockers that keep the
+// ByPatch multi-rank loop host-driven; see ROADMAP "Full-GPU iteration
+// track"). Iterations enqueued past termination no-op on device, and `done`
+// derives only from allreduced values, so every rank leaves after the same
+// batch — collectives stay matched.
+//
+// size == 1 additionally skips the allreduce (partials ARE the full scores):
+// the pure kernel chain is the single-rank device-resident loop the ROADMAP
+// prototype validated at 2.7×.
+//
+// -DUSC_PROFILE stage timers are deliberately absent here: with no
+// per-iteration syncs there are no host-visible stage boundaries to time.
+// Profile this loop with Nsight Systems instead.
 PatchSelection UscElemPatchSelectorImpl::select() {
     PatchSelection result;
     result.covered_count = 0;
     result.iterations    = 0;
+    if (M_global_ == 0 || N_ == 0) return result;   // agreed on every rank
 
-    const std::uint64_t M_glob = M_global_;
+    const int size = comm_.getSize();
+    // Kernels ride the same stream as the collectives, so batch ordering is
+    // carried by the stream alone — no events, no per-iteration syncs.
+    cudaStream_t stream = comm_.nccl().getStream();
 
-    DeviceBuffer<ElementId>    d_newly_ids;
-    DeviceBuffer<unsigned int> d_newly_count(1);
+    DeviceBuffer<ElemLoopState>  d_state(1);
+    DeviceBuffer<ElemWinnerInfo> d_winner(1);
+    d_state.zero();
+    d_winner.zero();
+    DeviceBuffer<PatchId>   d_selected(M_global_);
+    DeviceBuffer<ElementId> d_newly_ids(std::max<std::uint64_t>(max_sub_len_, 1));
+
+    // size == 1: the partial scores ARE the full scores — no allreduce at all.
+    const Score* d_full_scores = (size == 1) ? d_scores_partial_.data()
+                                             : d_scores_sum_.data();
 
     using ArgmaxPair = cub::KeyValuePair<int, Score>;
+    DeviceBuffer<ArgmaxPair>   d_argmax_result(1);
     DeviceBuffer<std::uint8_t> d_argmax_temp;
-    DeviceBuffer<ArgmaxPair>   d_argmax_result(M_glob > 0 ? 1 : 0);
-    if (M_glob > 0) {
+    {
         std::size_t temp_bytes = 0;
-        cub::DeviceReduce::ArgMax(nullptr, temp_bytes,
-                                  d_scores_sum_.data(),
+        cub::DeviceReduce::ArgMax(nullptr, temp_bytes, d_full_scores,
                                   d_argmax_result.data(),
-                                  static_cast<int>(M_glob));
+                                  static_cast<int>(M_global_));
         d_argmax_temp.resize(temp_bytes);
     }
 
-#ifdef USC_PROFILE
-    constexpr bool kProfile = true;
-#else
-    constexpr bool kProfile = false;
-#endif
-    enum GpuStage  { kArgmax = 0, kBuildKernel, kSetBits, kScoreUpdate, kWinnerDisable };
-    enum HostStage { kAllreduce = 0 };
-    detail::GpuProfiler gpu_prof(
-        {"argmax+D2H", "build_kernel+cnt", "set_bits", "score_update", "winner_disable"},
-        kProfile);
-    detail::HostProfiler host_prof({"score_allreduce"}, kProfile);
-
-    while (result.covered_count < N_ && M_glob > 0) {
-        // 1. Partial → full scores: the iteration's ONLY collective. Integer
-        // sums are exact and identical on every rank.
-        host_prof.begin(kAllreduce);
-        comm_.allreduce<stComm::Space::Device, Score>(d_scores_partial_.data(),
-                                                      d_scores_sum_.data(), M_glob,
-                                                      stComm::ReduceOp::Sum)->wait();
-        host_prof.end(kAllreduce);
-
-        // 2. Same argmax everywhere → same winner, no MAXLOC/bcast. Ties go to
-        // the smallest slot (CUB returns the first maximum).
-        gpu_prof.begin(kArgmax);
-        std::size_t temp_bytes = d_argmax_temp.bytes();
-        cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
-                                  d_scores_sum_.data(),
-                                  d_argmax_result.data(),
-                                  static_cast<int>(M_glob));
-        cuda_launch_check("cub::DeviceReduce::ArgMax (elem)");
-        ArgmaxPair host_result{};
-        cudaMemcpy(&host_result, d_argmax_result.data(),
-                   sizeof(host_result), cudaMemcpyDeviceToHost);
-        const Score   winner_score = host_result.value;
-        const PatchId winner_slot  = static_cast<PatchId>(host_result.key);
-        gpu_prof.end(kArgmax);
-
-        if (winner_score <= 0) break;
-
-        // Winner + its (global) fresh-coverage count are known on every rank —
-        // covered_count advances with zero additional communication.
-        result.covered_count += static_cast<std::uint64_t>(winner_score);
-        result.selected.push_back(slot_to_gid_[winner_slot]);
-
-        // 3. Shard-local newly covered = sub_patch(winner) ∩ ¬covered_local.
-        // n_local (this shard's share of winner_score) sizes the two update
-        // launches below — a local 4 B D2H, not a collective.
-        gpu_prof.begin(kBuildKernel);
-        const std::uint64_t start = sub_offsets_[winner_slot];
-        const std::uint64_t end   = sub_offsets_[winner_slot + 1];
-        const std::uint64_t len   = end - start;
-        unsigned int n_local = 0;
-        if (len > 0) {
-            if (d_newly_ids.size() < len) d_newly_ids.resize(len);
-            d_newly_count.zero();
-            const int block = 128;
-            const int grid  = static_cast<int>((len + block - 1) / block);
-            build_newly_covered_kernel<<<grid, block>>>(
-                d_patch_data_.data(), start, end,
-                d_covered_.data(),
-                d_newly_ids.data(),
-                d_newly_count.data());
-            cuda_launch_check("build_newly_covered_kernel (elem)");
-            cudaMemcpy(&n_local, d_newly_count.data(), sizeof(n_local),
-                       cudaMemcpyDeviceToHost);
-        }
-        gpu_prof.end(kBuildKernel);
-
-        // 4. Fold into this shard's covered bits + strategy-A partial-score
-        // update through the shard-local inverted index (same kernels as
-        // ByPatch — they only ever see shard-local IDs here).
-        gpu_prof.begin(kSetBits);
-        if (n_local > 0) {
-            const int block = 128;
-            const int grid  = static_cast<int>((n_local + block - 1) / block);
-            set_bits_kernel<<<grid, block>>>(d_covered_.data(),
-                                             d_newly_ids.data(), n_local);
-            cuda_launch_check("set_bits_kernel (elem)");
-        }
-        gpu_prof.end(kSetBits);
-
-        gpu_prof.begin(kScoreUpdate);
-        if (n_local > 0) {
-            score_update_invidx_kernel<<<n_local, kScoreBlockThreads>>>(
-                d_newly_ids.data(),
-                static_cast<std::uint64_t>(n_local),
-                d_inv_keys_.data(),
-                inv_.num_keys(),
-                d_inv_offsets_.data(),
-                d_inv_data_.data(),
+    constexpr int kBatch = 128;
+    ElemLoopState h_state{};
+    while (true) {
+        for (int b = 0; b < kBatch; ++b) {
+            if (size > 1) {
+                // Enqueue-only — no wait. Stream order makes iteration k's
+                // updated partials the input of iteration k+1's allreduce.
+                comm_.allreduce<stComm::Space::Device, Score>(
+                    d_scores_partial_.data(), d_scores_sum_.data(), M_global_,
+                    stComm::ReduceOp::Sum);
+            }
+            std::size_t temp_bytes = d_argmax_temp.bytes();
+            cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
+                                      d_full_scores,
+                                      d_argmax_result.data(),
+                                      static_cast<int>(M_global_), stream);
+            elem_commit_winner_kernel<<<1, 1, 0, stream>>>(
+                d_argmax_result.data(), d_sub_offsets_.data(), N_,
+                d_scores_partial_.data(), d_selected.data(),
+                d_state.data(), d_winner.data());
+            elem_build_newly_kernel<<<kElemGridBlocks, kElemBlockThreads, 0, stream>>>(
+                d_patch_data_.data(), d_covered_.data(),
+                d_newly_ids.data(), d_winner.data());
+            elem_set_bits_kernel<<<kElemGridBlocks, kElemBlockThreads, 0, stream>>>(
+                d_covered_.data(), d_newly_ids.data(), d_winner.data());
+            elem_score_update_kernel<<<kElemGridBlocks, kScoreBlockThreads, 0, stream>>>(
+                d_newly_ids.data(), d_winner.data(),
+                d_inv_keys_.data(), inv_.num_keys(),
+                d_inv_offsets_.data(), d_inv_data_.data(),
                 d_scores_partial_.data());
-            cuda_launch_check("score_update_invidx_kernel (elem)");
         }
-        gpu_prof.end(kScoreUpdate);
-
-        // 5. Winner disable — every rank writes kDisabledScore to its partial.
-        // (The partial is 0 after step 4: all its shard elements are now
-        // covered.) The summed score becomes P·kDisabledScore < 0, so the
-        // winner can never be re-selected.
-        gpu_prof.begin(kWinnerDisable);
-        {
-            const Score neg = kDisabledScore;
-            cudaMemcpy(&d_scores_partial_.data()[winner_slot], &neg, sizeof(Score),
-                       cudaMemcpyHostToDevice);
+        cuda_launch_check("device-resident batch (elem)");
+        cudaMemcpyAsync(&h_state, d_state.data(), sizeof(h_state),
+                        cudaMemcpyDeviceToHost, stream);
+        const cudaError_t err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("CUDA error in device-resident batch (elem): ") +
+                cudaGetErrorString(err));
         }
-        gpu_prof.end(kWinnerDisable);
-
-        ++result.iterations;
+        if (h_state.done) break;
     }
 
-    if (comm_.getRank() == 0) {
-        gpu_prof.report(stderr, "[usc-elem-profile gpu]", result.iterations);
-        host_prof.report(stderr, "[usc-elem-profile host]", result.iterations);
+    // Drain the device-side result: selected slots → caller PatchIds.
+    result.covered_count = h_state.covered_count;
+    result.iterations    = h_state.num_selected;
+    if (h_state.num_selected) {
+        std::vector<PatchId> slots(h_state.num_selected);
+        cudaMemcpy(slots.data(), d_selected.data(),
+                   h_state.num_selected * sizeof(PatchId), cudaMemcpyDeviceToHost);
+        result.selected.reserve(slots.size());
+        for (PatchId s : slots) result.selected.push_back(slot_to_gid_[s]);
     }
-
     return result;
 }
 
