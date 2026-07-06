@@ -238,8 +238,12 @@ Deviation from the original sketch: `generate_synthetic` stays in `src/data/`
 - ~~**stComm `Allreduce<T>(op)` PR**: blocks M6.~~ — DONE with M6: stComm branch
   `add-allreduce` adds element-wise `allreduce<T>(op)` on both Spaces. Merge the
   stComm PR upstream.
-- **CI / automated regression**: GitHub Actions or similar with MPI + CUDA
-  matrix. Trigger on PR. Currently a manual `ctest` discipline.
+- ~~**CI / automated regression**~~ — DONE (2026-07-06): GitHub Actions on push
+  to main + PRs, in both repos. Hosted runner (no GPU): full nvcc compile via
+  `scripts/setup-env.sh` + host-only smoke here; stComm additionally RUNS its
+  Host-space suite under `mpirun -n 2` (Device tests self-skip). The full
+  36-case GPU ctest matrix runs on a self-hosted GPU runner when one is
+  registered — set repo variable `HAS_GPU_RUNNER=true` to enable the job.
 - **`patches_` / `inv_` host memory free after H2D**: currently both stay in
   host RAM after `setup()` copies to device, doubling host footprint.
   `build_newly_covered_kernel` still reads `patches_.offsets[lbp]` on host —

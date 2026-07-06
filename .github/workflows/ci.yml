@@ -1,0 +1,66 @@
+# stPatternSearch CI.
+#
+# GitHub-hosted runners have no GPU, so the `build` job is a full nvcc
+# compile check (library + CLI + tests) plus the host-only smoke paths; it
+# bootstraps the environment with scripts/setup-env.sh — the same script
+# developers use — so the script itself stays regression-tested.
+#
+# The real correctness matrix (36 ctest cases, 1 MPI rank per GPU) needs
+# GPUs: register a self-hosted runner with 2+ NVIDIA GPUs and labels
+# [self-hosted, gpu], then set the repository variable HAS_GPU_RUNNER=true
+# (Settings → Secrets and variables → Actions → Variables) to enable the
+# `gpu-test` job. Until then it shows as skipped.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: build + host smoke (CUDA 12.4 toolchain, no GPU)
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      # git must exist before actions/checkout so it clones a real work tree
+      # (the API-tarball fallback works too, but a git tree matches dev setups).
+      - name: Install git
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Bootstrap prerequisites + stComm (scripts/setup-env.sh)
+        run: |
+          git config --global --add safe.directory '*'
+          ./scripts/setup-env.sh
+      - name: Build (library + CLI + tests)
+        run: ./build.sh
+      - name: Host-only smoke — .stps dump writer
+        run: |
+          ./build/src/usc-patch-select --N 2000 --M 200 --K 20 --overlap 0.4 --seed 42 \
+              --dump ci-smoke.stps
+          test -s ci-smoke.stps
+
+  gpu-test:
+    name: ctest (self-hosted GPU runner)
+    if: vars.HAS_GPU_RUNNER == 'true'
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap + build
+        run: |
+          ./scripts/setup-env.sh
+          ./build.sh
+      - name: ctest (1 MPI rank per GPU)
+        env:
+          # Containers/VMs without NVLink often have broken GPU-pair PCIe P2P,
+          # which deadlocks the NCCL hot path — see STATUS.md "Known issues".
+          NCCL_P2P_DISABLE: "1"
+          OMPI_ALLOW_RUN_AS_ROOT: "1"
+          OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+        run: |
+          export LD_LIBRARY_PATH="$HOME/install/stComm/lib:${LD_LIBRARY_PATH:-}"
+          cd build && ctest --output-on-failure
