@@ -28,7 +28,8 @@ void expect_match(const PatchSelection& selection, const PatchSelection& bf,
 }
 
 void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
-              double overlap, std::uint64_t seed) {
+              double overlap, std::uint64_t seed,
+              PartitionMode mode = PartitionMode::ByPatch) {
     SyntheticParams params;
     params.N = N; params.M = M; params.K_mean = K; params.overlap = overlap; params.seed = seed;
 
@@ -36,7 +37,7 @@ void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
     // UscPatchSelector on the shared device-enabled Comm — one patch_select()
     // does load + setup + select.
     stComm::Comm& comm = test_helpers::comm();
-    UscPatchSelector selector(comm);
+    UscPatchSelector selector(comm, mode);
     auto raw_full = generate_synthetic(params);
     auto slice    = slice_patches_by_rank(raw_full, comm.getRank(), comm.getSize());
     const auto multi = selector.patch_select(std::move(slice.patches), std::move(slice.global_ids));
@@ -49,9 +50,10 @@ void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
 
     char tag[128];
     std::snprintf(tag, sizeof(tag),
-                  "N=%lu M=%lu K=%u overlap=%.2f seed=%lu ranks=%d",
+                  "N=%lu M=%lu K=%u overlap=%.2f seed=%lu ranks=%d mode=%s",
                   (unsigned long)N, (unsigned long)M, (unsigned)K, overlap,
-                  (unsigned long)seed, comm.getSize());
+                  (unsigned long)seed, comm.getSize(),
+                  mode == PartitionMode::ByElement ? "element" : "patch");
     expect_match(multi, bf, tag);
 
     EXPECT_EQ(multi.covered_count, local.N) << "[" << tag << "] coverage incomplete";
@@ -77,4 +79,22 @@ TEST(SolverEquivalence, MediumHighOverlap) {
 
 TEST(SolverEquivalence, LargerMidOverlap) {
     run_case(10000, 500, 50, 0.5, 1);
+}
+
+// PartitionMode::ByElement (§7.3) must select the exact same cover as the
+// brute-force reference (and therefore as ByPatch) on every workload shape.
+TEST(SolverEquivalenceElem, SmallLowOverlap) {
+    for (std::uint64_t seed : {1u, 2u, 3u}) run_case(100, 50, 10, 0.3, seed, PartitionMode::ByElement);
+}
+
+TEST(SolverEquivalenceElem, MediumLowOverlap) {
+    for (std::uint64_t seed : {1u, 2u, 3u}) run_case(1000, 200, 30, 0.1, seed, PartitionMode::ByElement);
+}
+
+TEST(SolverEquivalenceElem, MediumHighOverlap) {
+    for (std::uint64_t seed : {1u, 2u, 3u}) run_case(1000, 200, 30, 0.7, seed, PartitionMode::ByElement);
+}
+
+TEST(SolverEquivalenceElem, LargerMidOverlap) {
+    run_case(10000, 500, 50, 0.5, 1, PartitionMode::ByElement);
 }
