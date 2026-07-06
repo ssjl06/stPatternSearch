@@ -81,6 +81,15 @@ private:
 // winner-payload broadcast, and covered_count advances by the (globally known)
 // winner score with zero extra communication. Communication per iteration is
 // O(M_global), independent of N.
+//
+// The loop is DEVICE-RESIDENT (Full-GPU iteration track): because the one
+// collective has a fixed count and no root, the host can enqueue whole batches
+// of iterations — ncclAllReduce + CUB ArgMax + the four update kernels, all on
+// the NCCL stream — without knowing any iteration's outcome. A single-thread
+// commit kernel consumes the argmax result on device (append selected slot,
+// advance covered_count, winner disable, set a done flag); the host syncs once
+// per kBatch iterations to read the 24 B loop state. There are no per-iteration
+// D2H/H2D round-trips at all.
 class UscElemPatchSelectorImpl {
 public:
     // `comm` must be a device-enabled Comm (Comm::onDevice).
@@ -102,18 +111,21 @@ private:
     std::uint64_t shard_base_   = 0;   // first element ID owned by this rank
     std::uint64_t shard_extent_ = 0;   // number of element IDs owned
 
-    // Host-side views. sub_offsets_ is the local sub-CSR's offsets (size
-    // M_global_+1) — kept on host for the winner's range lookup, mirroring the
-    // ByPatch loop. slot_to_gid_ maps global slot → caller-provided PatchId
-    // (replicated on every rank for result reporting).
-    std::vector<std::uint64_t> sub_offsets_;
-    std::vector<PatchId>       slot_to_gid_;
-    InvertedIndex              inv_;   // shard-local: keys are shard-local IDs
+    // Host-side views. slot_to_gid_ maps global slot → caller-provided PatchId
+    // (replicated on every rank; consumed once when draining the device-side
+    // selected list into the result). max_sub_len_ bounds any winner's
+    // shard-local sub-patch, sizing the newly-covered scratch once up front.
+    std::vector<PatchId> slot_to_gid_;
+    InvertedIndex        inv_;   // shard-local: keys are shard-local IDs
+    std::uint64_t        max_sub_len_ = 0;
 
     // Device state. d_patch_data_ stores SHARD-LOCAL element IDs (global ID −
     // shard_base_), so the covered bitset and the kernels index the local shard
-    // exactly like the ByPatch mode indexes the full universe.
+    // exactly like the ByPatch mode indexes the full universe. d_sub_offsets_
+    // is the sub-CSR offsets mirror — the commit kernel resolves the winner's
+    // range on device, so the host never needs it during the loop.
     DeviceBuffer<ElementId>     d_patch_data_;      // sub-CSR data (local IDs)
+    DeviceBuffer<std::uint64_t> d_sub_offsets_;     // M_global+1 offsets
     DeviceBuffer<ElementId>     d_inv_keys_;        // shard-local inverted index
     DeviceBuffer<std::uint64_t> d_inv_offsets_;
     DeviceBuffer<PatchId>       d_inv_data_;        // values are global slots

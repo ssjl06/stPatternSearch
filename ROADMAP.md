@@ -89,7 +89,23 @@ constant in M. The segmented version cut a non-bottleneck and added launch
 overhead (1 kernel → 3). **Lesson: the per-iteration hot loop on this box is
 latency/overhead-bound, not compute-bound — optimize launches/syncs, not FLOPs.**
 
-## Full-GPU iteration track — single-rank PROTOTYPED (2.7×), multi-rank reverted
+## Full-GPU iteration track — ✅ SHIPPED for ByElement (M6.5, 2026-07-06)
+
+> The ByElement loop is now device-resident in production: batches of 128
+> iterations enqueued blind on the NCCL stream (fixed-count root-less
+> allreduce + on-device commit kernel + fixed-grid updates), one 24 B state
+> read per batch, zero per-iteration host round-trips. size == 1 skips the
+> allreduce — subsuming the single-rank prototype below. Bit-identical at all
+> scales, 31/31 ctest; LARGE/4× solve ~30% faster, Small `-n 2` regresses
+> (deep-pipeline overhead; see STATUS "M6.5"). ByPatch multi-rank stays
+> host-driven — its NCCL bcast root/count are data-dependent host scalars,
+> which is exactly what ByElement designed away. Remaining ideas: int32 wire
+> scores, CUDA-graph batch capture, NVLink validation.
+>
+> Historical notes below kept for the design rationale and the failed-attempt
+> post-mortem.
+
+### (historical) single-rank PROTOTYPED (2.7×), multi-rank reverted
 
 Bigger lever for the latency-bound loop: keep the **entire iteration device-
 resident** so the host enqueues the kernel chain without blocking and the GPU
