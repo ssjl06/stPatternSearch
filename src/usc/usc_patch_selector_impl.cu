@@ -1,4 +1,4 @@
-#include "core/usc_patch_selector_impl.hpp"
+#include "usc/usc_patch_selector_impl.hpp"
 
 #include "core/gpu_profiler.hpp"
 #include "core/host_profiler.hpp"
@@ -13,9 +13,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <iostream>
-#include <numeric>
+#include <memory>
 #include <stdexcept>
-#include <unordered_map>
+#include <vector>
 
 namespace stPS {
 
@@ -139,70 +139,6 @@ inline void cuda_sync_check(const char* what) {
     }
 }
 
-// Distributed sample sort splitter selection. Every rank computes the same
-// (size-1) splitter values from gathered samples; afterwards each hash is
-// routed to its target rank via upper_bound over splitters. This guarantees
-// balanced bucket sizes regardless of hash distribution (unlike `hash % size`
-// which assumes uniform distribution).
-//
-// Returns a sorted vector of size (size-1) splitter Hash values. For size == 1
-// returns empty (no partitioning needed).
-std::vector<Hash> compute_splitters(const std::vector<Hash>& local_uniq_sorted,
-                                    stComm::Comm& comm) {
-    constexpr int kSamplesPerRank = 128;
-    const int size = comm.getSize();
-    if (size <= 1) return {};
-
-    // Step 1: pick kSamplesPerRank evenly-spaced indices from local_uniq_sorted.
-    // If we have fewer hashes than samples, pad by repeating the last element
-    // so every rank contributes the same fixed count (simplifies allgather).
-    std::vector<Hash> local_sample(kSamplesPerRank);
-    const std::size_t n = local_uniq_sorted.size();
-    if (n == 0) {
-        // Edge case: rank has no hashes. Use 0 as a placeholder — these samples
-        // will be sorted with the real ones; bias is minimal since other ranks
-        // contribute meaningful samples.
-        std::fill(local_sample.begin(), local_sample.end(), Hash{0});
-    } else if (n <= static_cast<std::size_t>(kSamplesPerRank)) {
-        for (int i = 0; i < kSamplesPerRank; ++i) {
-            local_sample[i] = local_uniq_sorted[std::min<std::size_t>(i, n - 1)];
-        }
-    } else {
-        for (int i = 0; i < kSamplesPerRank; ++i) {
-            const std::size_t idx =
-                (static_cast<std::size_t>(i) * (n - 1)) / (kSamplesPerRank - 1);
-            local_sample[i] = local_uniq_sorted[idx];
-        }
-    }
-
-    // Step 2: allgatherv all samples — uniform recvcounts since every rank
-    // sends exactly kSamplesPerRank hashes.
-    const std::size_t total_samples = static_cast<std::size_t>(size) * kSamplesPerRank;
-    std::vector<Hash> all_samples(total_samples);
-    std::vector<int>  recvcounts(static_cast<std::size_t>(size), kSamplesPerRank);
-    comm.allgatherv<stComm::Space::Host, Hash>(local_sample.data(), kSamplesPerRank,
-                                   all_samples.data(), recvcounts.data())->wait();
-
-    // Step 3: sort all samples (every rank computes identical splitters).
-    std::sort(all_samples.begin(), all_samples.end());
-
-    // Step 4: pick (size-1) splitters at positions kSamplesPerRank, 2*kSamplesPerRank, ...
-    std::vector<Hash> splitters;
-    splitters.reserve(static_cast<std::size_t>(size - 1));
-    for (int r = 1; r < size; ++r) {
-        splitters.push_back(
-            all_samples[static_cast<std::size_t>(r) * kSamplesPerRank]);
-    }
-    return splitters;
-}
-
-// Map a hash to its target rank via splitter binary search.
-// For size=1 returns 0 unconditionally.
-inline int target_rank_for_hash(Hash h, const std::vector<Hash>& splitters) {
-    return static_cast<int>(
-        std::upper_bound(splitters.begin(), splitters.end(), h) - splitters.begin());
-}
-
 }  // namespace
 
 UscPatchSelectorImpl::UscPatchSelectorImpl(stComm::Comm& comm)
@@ -214,182 +150,36 @@ UscPatchSelectorImpl::UscPatchSelectorImpl(stComm::Comm& comm)
     }
 }
 
-void UscPatchSelectorImpl::load(std::vector<std::vector<Hash>> raw_patches,
-                            std::vector<PatchId>           patch_global_ids) {
-    raw_patches_      = std::move(raw_patches);
-    patch_global_ids_ = std::move(patch_global_ids);
-}
+PatchSelection UscPatchSelectorImpl::patch_select(
+        std::vector<std::vector<Hash>> raw_patches,
+        std::vector<PatchId>           global_ids) {
+    patch_global_ids_ = std::move(global_ids);
 
-void UscPatchSelectorImpl::setup() {
-    const int size = comm_.getSize();
-    const int rank = comm_.getRank();
+    // Shared preprocessing: distributed hash→id mapping + PatchCsr + InvertedIndex
+    // + device mirrors. USC owns only the score/covered state initialized below.
+    patch_set_ = std::make_unique<PatchSet>(comm_, std::move(raw_patches));
 
-    // Stage 2 (M3) — design doc §5.1 distributed setup, hash % size partitioning.
-    //
-    // Patches are already partitioned across ranks (permanent). Within setup we
-    // perform a *temporary* hash partition: each unique hash is routed to its
-    // owner rank (owner = hash % size), the owner assigns a contiguous block of
-    // global IDs to its bucket, then each rank receives back the IDs for the
-    // hashes it originally held. The hash partition is discarded; solve() uses
-    // only the resulting patch CSR + inverted index, both still partitioned by
-    // patch ID. See [[reference-design-doc]] §5.2 for the two-partition model.
+    const std::uint64_t M_local = patch_set_->M_local();
+    const std::uint64_t N       = patch_set_->N();
 
-    // Step 1: flatten + dedupe this rank's local hash set.
-    std::vector<Hash> local_uniq;
-    {
-        std::size_t total = 0;
-        for (const auto& p : raw_patches_) total += p.size();
-        local_uniq.reserve(total);
-        for (const auto& p : raw_patches_) {
-            local_uniq.insert(local_uniq.end(), p.begin(), p.end());
-        }
-        std::sort(local_uniq.begin(), local_uniq.end());
-        local_uniq.erase(std::unique(local_uniq.begin(), local_uniq.end()), local_uniq.end());
-    }
-
-    // Step 2: sample-sort based partitioning. Every rank computes the same
-    // (size-1) splitters from gathered samples, then routes each hash to its
-    // target rank via splitter binary search. This balances buckets regardless
-    // of hash distribution. local_uniq is already sorted from Step 1.
-    const std::vector<Hash> splitters = compute_splitters(local_uniq, comm_);
-
-    std::vector<int>  sendcounts(static_cast<std::size_t>(size), 0);
-    for (Hash h : local_uniq) ++sendcounts[target_rank_for_hash(h, splitters)];
-
-    std::vector<int>  send_offsets(static_cast<std::size_t>(size), 0);
-    for (int r = 1; r < size; ++r) send_offsets[r] = send_offsets[r - 1] + sendcounts[r - 1];
-
-    std::vector<Hash> sendbuf(local_uniq.size());
-    {
-        std::vector<int> cursor = send_offsets;  // per-target write head
-        for (Hash h : local_uniq) {
-            const int target = target_rank_for_hash(h, splitters);
-            sendbuf[cursor[target]++] = h;
-        }
-    }
-
-    // Step 3: exchange sendcounts so every rank learns its own recv counts.
-    // stComm has no plain allgather; emulate via allgatherv with uniform
-    // recv length = size (each rank contributes its full sendcounts row).
-    std::vector<int> all_sendcounts(static_cast<std::size_t>(size) * size);
-    {
-        std::vector<int> uniform(static_cast<std::size_t>(size), size);
-        comm_.allgatherv<stComm::Space::Host, int>(sendcounts.data(), size,
-                                       all_sendcounts.data(), uniform.data())->wait();
-    }
-    std::vector<int> recvcounts(static_cast<std::size_t>(size), 0);
-    for (int s = 0; s < size; ++s) recvcounts[s] = all_sendcounts[s * size + rank];
-
-    // Step 4: alltoallv — every hash flies to its owner rank.
-    const int total_recv = std::accumulate(recvcounts.begin(), recvcounts.end(), 0);
-    std::vector<Hash> recvbuf(static_cast<std::size_t>(total_recv));
-    comm_.alltoallv<stComm::Space::Host, Hash>(sendbuf.data(), sendcounts.data(),
-                                   recvbuf.data(), recvcounts.data())->wait();
-
-    // Step 5: form this rank's bucket universe — sorted unique view of recvbuf.
-    // Keep recvbuf intact for the per-arrival-slot lookup in Step 8.
-    std::vector<Hash> bucket(recvbuf);
-    std::sort(bucket.begin(), bucket.end());
-    bucket.erase(std::unique(bucket.begin(), bucket.end()), bucket.end());
-
-    // Step 6: Exscan over bucket sizes → this rank's first global ID.
-    // exscan is async on the unified Comm; wait() immediately for the scalar.
-    const std::uint64_t local_shard_size = bucket.size();
-    std::uint64_t global_id_start = 0;
-    comm_.exscan<stComm::Space::Host>(local_shard_size, &global_id_start,
-                                      stComm::ReduceOp::Sum)->wait();
-
-    // Step 7: only the last rank knows N at this point; broadcast it.
-    std::uint64_t N_total = (rank == size - 1) ? (global_id_start + local_shard_size) : 0;
-    comm_.bcast<stComm::Space::Host, std::uint64_t>(&N_total, 1, size - 1)->wait();
-    N_ = N_total;
-
-    // Step 8: for every slot in recvbuf (in arrival order, possibly with dupes),
-    // produce the corresponding global ID. The reverse alltoallv expects responses
-    // in the same slot order as recvbuf — that's how it routes back to senders.
-    std::vector<std::uint64_t> id_response(static_cast<std::size_t>(total_recv));
-    for (std::size_t i = 0; i < recvbuf.size(); ++i) {
-        const auto it = std::lower_bound(bucket.begin(), bucket.end(), recvbuf[i]);
-        id_response[i] = global_id_start + static_cast<std::uint64_t>(it - bucket.begin());
-    }
-
-    // Step 9: reverse alltoallv — IDs travel back to original senders. The
-    // sendcounts and recvcounts arrays swap roles relative to Step 4.
-    std::vector<std::uint64_t> id_back(sendbuf.size());
-    comm_.alltoallv<stComm::Space::Host, std::uint64_t>(id_response.data(), recvcounts.data(),
-                                            id_back.data(),     sendcounts.data())->wait();
-
-    // Step 10: sendbuf[i] ↔ id_back[i] are paired by construction. Build this
-    // rank's hash → id map.
-    std::unordered_map<Hash, ElementId> hash_to_id;
-    hash_to_id.reserve(sendbuf.size() * 2);
-    for (std::size_t i = 0; i < sendbuf.size(); ++i) {
-        hash_to_id.emplace(sendbuf[i], static_cast<ElementId>(id_back[i]));
-    }
-
-    // Step 11: translate raw_patches_ into ID-space, sort + dedupe per patch.
-    std::vector<std::vector<ElementId>> id_patches(raw_patches_.size());
-    for (std::size_t p = 0; p < raw_patches_.size(); ++p) {
-        const auto& src = raw_patches_[p];
-        auto& dst = id_patches[p];
-        dst.resize(src.size());
-        for (std::size_t i = 0; i < src.size(); ++i) {
-            dst[i] = hash_to_id.at(src[i]);
-        }
-        std::sort(dst.begin(), dst.end());
-        dst.erase(std::unique(dst.begin(), dst.end()), dst.end());
-    }
-
-    patches_ = build_patch_csr(id_patches);
-    inv_     = build_inverted_index(patches_, N_);
-
-    // id_to_hash_ used to hold the full universe (Stage 1). With distributed
-    // setup it can only meaningfully hold this rank's bucket — keep it for
-    // optional debug inspection, but no algorithm path depends on it.
-    id_to_hash_ = std::move(bucket);
-
-    raw_patches_.clear();
-    raw_patches_.shrink_to_fit();
-
-    // Mirror host state to device. solve() will gradually migrate hot paths to
-    // use these GPU buffers; for now they're populated but unused — exercises
-    // the allocation/copy path so any CUDA misconfiguration surfaces here, not
-    // mid-iteration.
-    const std::size_t patch_data_n   = patches_.data.size();
-    const std::size_t patch_offs_n   = patches_.offsets.size();
-    const std::size_t inv_keys_n     = inv_.keys.size();
-    const std::size_t inv_offs_n     = inv_.offsets.size();
-    const std::size_t inv_data_n     = inv_.data.size();
-    const std::size_t M_local        = patches_.M();
-    const std::size_t covered_words  = (N_ + 63) / 64;
-
-    d_patch_data_.resize(patch_data_n);
-    d_patch_offsets_.resize(patch_offs_n);
-    d_inv_keys_.resize(inv_keys_n);
-    d_inv_offsets_.resize(inv_offs_n);
-    d_inv_data_.resize(inv_data_n);
+    // USC-specific device state: initial scores = patch sizes; covered empty.
     d_scores_.resize(M_local);
-    d_covered_.resize(covered_words);
-
-    if (patch_data_n) d_patch_data_.copy_from_host(patches_.data.data(),    patch_data_n);
-    if (patch_offs_n) d_patch_offsets_.copy_from_host(patches_.offsets.data(), patch_offs_n);
-    if (inv_keys_n)   d_inv_keys_.copy_from_host(inv_.keys.data(),         inv_keys_n);
-    if (inv_offs_n)   d_inv_offsets_.copy_from_host(inv_.offsets.data(),   inv_offs_n);
-    if (inv_data_n)   d_inv_data_.copy_from_host(inv_.data.data(),         inv_data_n);
-
-    // Initial scores = patch sizes (matches solve()'s host-side initialization).
-    std::vector<Score> initial_scores(M_local);
-    for (std::size_t p = 0; p < M_local; ++p) {
-        initial_scores[p] = static_cast<Score>(patches_.patch_size(p));
+    d_covered_.resize((N + 63) / 64);
+    if (M_local) {
+        const PatchCsr& patches = patch_set_->patches();
+        std::vector<Score> initial_scores(M_local);
+        for (std::size_t p = 0; p < M_local; ++p) {
+            initial_scores[p] = static_cast<Score>(patches.patch_size(p));
+        }
+        d_scores_.copy_from_host(initial_scores.data(), M_local);
     }
-    if (M_local) d_scores_.copy_from_host(initial_scores.data(), M_local);
-
-    // covered starts empty.
     d_covered_.zero();
+
+    return select();
 }
 
 // Multi-rank greedy loop. Hot data (PatchCsr, scores, covered, newly_covered)
-// lives on the device after setup() and stays there throughout solve().
+// lives on the device after patch_select() builds the PatchSet and stays there.
 // Each iteration touches host memory only for the small metadata that NCCL's
 // API requires as host scalars:
 //
@@ -402,7 +192,17 @@ void UscPatchSelectorImpl::setup() {
 //   [device] set_bits (d_covered_) + score_update_invidx_kernel (strategy A)
 //        H2D 1 Score = -1 (winner only)
 PatchSelection UscPatchSelectorImpl::select() {
-    const std::uint64_t M_loc = patches_.M();
+    // Views into the shared PatchSet (built in patch_select). USC keeps only
+    // d_scores_ / d_covered_ of its own; everything else is read from here.
+    const PatchCsr&      patches       = patch_set_->patches();
+    const InvertedIndex& inv           = patch_set_->inverted_index();
+    const std::uint64_t  N             = patch_set_->N();
+    const ElementId*     d_patch_data  = patch_set_->d_patch_data();
+    const ElementId*     d_inv_keys    = patch_set_->d_inv_keys();
+    const std::uint64_t* d_inv_offsets = patch_set_->d_inv_offsets();
+    const PatchId*       d_inv_data    = patch_set_->d_inv_data();
+
+    const std::uint64_t M_loc = patches.M();
     PatchSelection result;
     result.covered_count = 0;
     result.iterations    = 0;
@@ -448,7 +248,7 @@ PatchSelection UscPatchSelectorImpl::select() {
     detail::HostProfiler host_prof(
         {"maxloc", "patchid_bcast", "nccl_bcast"}, kProfile);
 
-    while (result.covered_count < N_) {
+    while (result.covered_count < N) {
         gpu_prof.begin(kArgmax);
         Score   local_best_score = kDisabledScore;
         PatchId local_best_patch = 0;
@@ -495,15 +295,15 @@ PatchSelection UscPatchSelectorImpl::select() {
             d_newly_covered_ids.resize(static_cast<std::size_t>(winner_score));
         }
         if (comm_.getRank() == winner_rank) {
-            const std::uint64_t start = patches_.offsets[local_best_patch];
-            const std::uint64_t end   = patches_.offsets[local_best_patch + 1];
+            const std::uint64_t start = patches.offsets[local_best_patch];
+            const std::uint64_t end   = patches.offsets[local_best_patch + 1];
             const std::uint64_t patch_len = end - start;
             d_newly_count.zero();
             if (patch_len > 0) {
                 const int block = 128;
                 const int grid  = static_cast<int>((patch_len + block - 1) / block);
                 build_newly_covered_kernel<<<grid, block>>>(
-                    d_patch_data_.data(), start, end,
+                    d_patch_data, start, end,
                     d_covered_.data(),
                     d_newly_covered_ids.data(),
                     d_newly_count.data());
@@ -554,10 +354,10 @@ PatchSelection UscPatchSelectorImpl::select() {
                                          kScoreBlockThreads>>>(
                 d_newly_covered_ids.data(),
                 static_cast<std::uint64_t>(winner_score),
-                d_inv_keys_.data(),
-                inv_.num_keys(),
-                d_inv_offsets_.data(),
-                d_inv_data_.data(),
+                d_inv_keys,
+                inv.num_keys(),
+                d_inv_offsets,
+                d_inv_data,
                 d_scores_.data());
             cuda_launch_check("score_update_invidx_kernel");
         }
@@ -586,18 +386,19 @@ PatchSelection UscPatchSelectorImpl::select() {
 
 void UscPatchSelectorImpl::print_selection(const PatchSelection& r) const {
     if (comm_.getRank() != 0) return;
+    const std::uint64_t N = patch_set_->N();
     std::cout << "USC patch-select\n"
-              << "  universe N=" << N_
+              << "  universe N=" << N
               << " ranks=" << comm_.getSize() << "\n"
               << "  result: selected=" << r.selected.size()
-              << " covered=" << r.covered_count << "/" << N_
+              << " covered=" << r.covered_count << "/" << N
               << " iterations=" << r.iterations << "\n";
 }
 
-std::uint64_t        UscPatchSelectorImpl::N() const            { return N_; }
-std::uint64_t        UscPatchSelectorImpl::M_local() const      { return patches_.M(); }
-const PatchCsr&      UscPatchSelectorImpl::patches() const      { return patches_; }
-const InvertedIndex& UscPatchSelectorImpl::inverted_index() const { return inv_; }
+std::uint64_t        UscPatchSelectorImpl::N() const            { return patch_set_->N(); }
+std::uint64_t        UscPatchSelectorImpl::M_local() const      { return patch_set_->M_local(); }
+const PatchCsr&      UscPatchSelectorImpl::patches() const      { return patch_set_->patches(); }
+const InvertedIndex& UscPatchSelectorImpl::inverted_index() const { return patch_set_->inverted_index(); }
 
 // ============================================================================
 // Public facade: stPS::UscPatchSelector — pImpl over UscPatchSelectorImpl
@@ -616,9 +417,7 @@ UscPatchSelector& UscPatchSelector::operator=(UscPatchSelector&&) noexcept = def
 
 PatchSelection UscPatchSelector::patch_select(std::vector<std::vector<Hash>> patches,
                                               std::vector<PatchId>           global_ids) {
-    impl_->usc.load(std::move(patches), std::move(global_ids));
-    impl_->usc.setup();
-    return impl_->usc.select();
+    return impl_->usc.patch_select(std::move(patches), std::move(global_ids));
 }
 
 }  // namespace stPS

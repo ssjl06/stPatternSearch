@@ -1,5 +1,5 @@
 #include <stPS/stPS.h>          // public API under test: UscPatchSelector, slice, types
-#include "core/brute_force.hpp"  // white-box reference (brute_force_select)
+#include "usc/brute_force.hpp"  // white-box reference (brute_force_select)
 #include "data/synthetic.hpp"
 #include "helpers/local_setup.hpp"
 #include "test_nccl_env.hpp"

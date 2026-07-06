@@ -1,18 +1,22 @@
 add_library(stPS STATIC
+    # core/ — shared, algorithm-neutral primitives + the hashed patch set
     core/bitset.cpp
     core/csr.cpp
     core/inverted_index.cpp
     core/device_buffer.cu
     core/gpu_profiler.cu
     core/host_profiler.cpp
-    core/usc_patch_selector_impl.cu
-    core/brute_force.cpp
+    core/patch_set.cpp
+    # usc/ — greedy minimum set-cover algorithm
+    usc/usc_patch_selector_impl.cu
+    usc/brute_force.cpp
+    # data/ — demo/test data generation + partitioning
     data/synthetic.cpp
     data/partition.cpp
 )
 add_library(stPS::stPS ALIAS stPS)
 
-# -DUSC_PROFILE=ON compiles in the per-stage profiler calls (usc_patch_selector_impl.cu
+# -DUSC_PROFILE=ON compiles in the per-stage profiler calls (usc/usc_patch_selector_impl.cu
 # guards them behind #ifdef USC_PROFILE); off by default = zero-overhead hot path.
 if(USC_PROFILE)
     target_compile_definitions(stPS PRIVATE USC_PROFILE)
@@ -54,8 +58,9 @@ install(TARGETS stPS
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
-# Demo / CLI driver. main.cpp lives in src/, so its quote-include of the
-# internal "data/synthetic.hpp" resolves relative to it; it drives the selection
-# through the public stPS::UscPatchSelector from <stPS/...> (carried by the link below).
-add_executable(usc-patch-select main.cpp)
+# Demo / CLI driver. usc/main.cpp quote-includes the internal "data/synthetic.hpp",
+# resolved via the src/ include root added below; it drives the selection through
+# the public stPS::UscPatchSelector from <stPS/...> (carried by the link below).
+add_executable(usc-patch-select usc/main.cpp)
+target_include_directories(usc-patch-select PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(usc-patch-select PRIVATE stPS)
