@@ -28,6 +28,11 @@ include(GoogleTest)
 # setup. Single-component tests (bitset/csr/inv_index/...) ignore rank count;
 # the solver equivalence test exercises the distributed path.
 set(STPS_TEST_NRANKS 2 CACHE STRING "MPI ranks for ctest (= visible GPUs)")
+# PRE_TEST defers test discovery from build time to the first ctest run: the
+# discovery step executes the test binary, which exits(2) on GPU-less hosts
+# (test_main guards num_gpus >= world size) — POST_BUILD discovery would make
+# `cmake --build` itself fail on such hosts (e.g. the CI compile-only runner).
 gtest_discover_tests(stps_tests
     EXEC_WRAPPER ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${STPS_TEST_NRANKS} ${MPIEXEC_PREFLAGS}
+    DISCOVERY_MODE PRE_TEST
 )
