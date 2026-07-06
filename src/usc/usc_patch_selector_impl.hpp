@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device_buffer.hpp"
+#include "core/inverted_index.hpp"
 #include "core/patch_set.hpp"
 #include <stPS/usc_patch_selector.hpp>   // PatchSelection + the public UscPatchSelector this backs
 #include <stPS/types.hpp>
@@ -60,6 +61,65 @@ private:
     // consumed by the greedy kernels. Empty until then.
     DeviceBuffer<Score>         d_scores_;     // per-patch remaining-coverage score
     DeviceBuffer<std::uint64_t> d_covered_;    // N/64 words, cumulative covered bitset
+};
+
+// Internal implementation of the public UscPatchSelector in
+// PartitionMode::ByElement — design doc §7.3, the element-partitioned covered
+// bitset. The element ID space [0, N) is statically sharded across ranks
+// (contiguous ranges; sample sort already balances ID density). Each rank holds
+// ONLY:
+//   - its shard of the cumulative covered bitset (N/(64·P) words), and
+//   - for EVERY global patch, the sub-list of its elements falling in this
+//     shard (redistributed once at setup as (slot, element) incidences) plus
+//     the matching shard-local inverted index.
+//
+// Scores are maintained as per-rank partials (uncovered count within the local
+// shard, strategy-A decrements). Each iteration re-forms the full scores on
+// every rank with ONE fixed-size AllReduce<SUM> over M_global — the iteration's
+// only collective. Integer sums are exact and NCCL delivers identical results
+// on every rank, so each rank computes the same argmax locally: no MAXLOC, no
+// winner-payload broadcast, and covered_count advances by the (globally known)
+// winner score with zero extra communication. Communication per iteration is
+// O(M_global), independent of N.
+class UscElemPatchSelectorImpl {
+public:
+    // `comm` must be a device-enabled Comm (Comm::onDevice).
+    explicit UscElemPatchSelectorImpl(stComm::Comm& comm);
+
+    // Same collective contract as UscPatchSelectorImpl::patch_select.
+    PatchSelection patch_select(std::vector<std::vector<Hash>> raw_patches,
+                                std::vector<PatchId>           global_ids);
+
+private:
+    // Greedy main loop over the element-sharded state built by patch_select().
+    PatchSelection select();
+
+    stComm::Comm& comm_;
+
+    // Problem geometry (identical on every rank except the shard bounds).
+    std::uint64_t N_            = 0;   // global universe size
+    std::uint64_t M_global_     = 0;   // total patch count across ranks
+    std::uint64_t shard_base_   = 0;   // first element ID owned by this rank
+    std::uint64_t shard_extent_ = 0;   // number of element IDs owned
+
+    // Host-side views. sub_offsets_ is the local sub-CSR's offsets (size
+    // M_global_+1) — kept on host for the winner's range lookup, mirroring the
+    // ByPatch loop. slot_to_gid_ maps global slot → caller-provided PatchId
+    // (replicated on every rank for result reporting).
+    std::vector<std::uint64_t> sub_offsets_;
+    std::vector<PatchId>       slot_to_gid_;
+    InvertedIndex              inv_;   // shard-local: keys are shard-local IDs
+
+    // Device state. d_patch_data_ stores SHARD-LOCAL element IDs (global ID −
+    // shard_base_), so the covered bitset and the kernels index the local shard
+    // exactly like the ByPatch mode indexes the full universe.
+    DeviceBuffer<ElementId>     d_patch_data_;      // sub-CSR data (local IDs)
+    DeviceBuffer<ElementId>     d_inv_keys_;        // shard-local inverted index
+    DeviceBuffer<std::uint64_t> d_inv_offsets_;
+    DeviceBuffer<PatchId>       d_inv_data_;        // values are global slots
+    DeviceBuffer<Score>         d_scores_partial_;  // M_global; this shard's part
+    DeviceBuffer<Score>         d_scores_sum_;      // M_global; allreduced full
+    DeviceBuffer<std::uint64_t> d_covered_;         // shard_extent_/64 words
 };
 
 }  // namespace stPS

@@ -20,6 +20,7 @@ using namespace stPS;
 
 struct CliOptions {
     SyntheticParams params;
+    PartitionMode   mode = PartitionMode::ByPatch;
     bool print_solution = false;
 };
 
@@ -48,6 +49,8 @@ void print_usage(const char* prog) {
         "  --K <int>           average elements per patch (default %u)\n"
         "  --overlap <float>   patch overlap, 0..1 (default %.2f)\n"
         "  --seed <int>        RNG seed (default %lu)\n"
+        "  --partition <mode>  patch | element (default patch; element = §7.3\n"
+        "                      element-sharded covered bitset, comm scales with M not N)\n"
         "  --print-solution    print the selected patch IDs\n"
         "  -h, --help          show this help\n",
         prog,
@@ -71,6 +74,13 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
         else if (a == "--K")        { const char* v = next_val(); if (!v) return false; opt.params.K_mean = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10)); }
         else if (a == "--overlap")  { const char* v = next_val(); if (!v) return false; opt.params.overlap = std::strtod(v, nullptr); }
         else if (a == "--seed")     { const char* v = next_val(); if (!v) return false; opt.params.seed   = std::strtoull(v, nullptr, 10); }
+        else if (a == "--partition") {
+            const char* v = next_val(); if (!v) return false;
+            const std::string m = v;
+            if      (m == "patch")   opt.mode = PartitionMode::ByPatch;
+            else if (m == "element") opt.mode = PartitionMode::ByElement;
+            else { std::fprintf(stderr, "Unknown --partition mode: %s\n", v); return false; }
+        }
         else if (a == "--print-solution") { opt.print_solution = true; }
         else {
             std::fprintf(stderr, "Unknown argument: %s\n", a.c_str());
@@ -97,7 +107,7 @@ int main(int argc, char** argv) {
 
             // The whole library API: build a UscPatchSelector on the comm, hand
             // it this rank's patches + their global IDs, get the cover back.
-            stPS::UscPatchSelector selector(comm);
+            stPS::UscPatchSelector selector(comm, opt.mode);
             auto slice = stPS::slice_patches_by_rank(
                 generate_synthetic(opt.params), comm.getRank(), comm.getSize());
             const std::size_t m_local = slice.patches.size();  // capture before move
@@ -109,7 +119,9 @@ int main(int argc, char** argv) {
 
             if (comm.getRank() == 0) {
                 std::cout << "USC patch-select\n"
-                          << "  ranks=" << comm.getSize() << "\n"
+                          << "  ranks=" << comm.getSize()
+                          << " partition=" << (opt.mode == stPS::PartitionMode::ByElement
+                                               ? "element" : "patch") << "\n"
                           << "  result: selected=" << result.selected.size()
                           << " covered=" << result.covered_count
                           << " iterations=" << result.iterations << "\n"

@@ -18,9 +18,10 @@ Design rationale lives in [`greedy_set_cover.md`](./greedy_set_cover.md).
 | M1 | Single-rank end-to-end | ✅ |
 | M2 | Multi-rank MPI via stComm | ✅ |
 | M3 | Distributed sample sort setup (§5.1) + sparse bcast (§7.2) | ✅ |
-| M4 | GPU port (CUDA kernels, CUB ArgMax) | ✅ on `gpu` branch |
-| M5 | NCCL device-direct broadcast | ⏳ Planned |
-| M6 | Element-partitioned covered bitset (§7.3) | ⏳ Planned |
+| M4 | GPU port (CUDA kernels, CUB ArgMax) | ✅ |
+| M5 | NCCL device-direct broadcast | ✅ |
+| M5.5 | score_update strategy A (inverted-index, affected-only) | ✅ |
+| M6 | Element-partitioned covered bitset (§7.3) — `PartitionMode::ByElement` | ✅ opt-in |
 | M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ Planned |
 
 Branches:

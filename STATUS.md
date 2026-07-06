@@ -1,4 +1,4 @@
-# stPatternSearch — Status (as of M5.5 completion, 2026-05-29)
+# stPatternSearch — Status (as of M6 completion, 2026-07-06)
 
 ## Project
 
@@ -17,7 +17,7 @@ covers every unique hash. Design rationale lives in [`greedy_set_cover.md`](gree
 | M5 | NCCL device-direct broadcast for newly_covered_ids | ✅ Done | `gpu` |
 | M5.5 | score_update strategy A (inverted-index, affected-only) | ✅ Done | `gpu` |
 | — | Segmented argmax (tried, no gain — loop is latency-bound) | ⛔ Reverted | |
-| M6 | Element-partitioned covered bitset (§7.3) | ⏸ Deferred (speculative; needs real N/M×K) | |
+| M6 | Element-partitioned covered bitset (§7.3) | ✅ Done (opt-in `PartitionMode::ByElement`) | `m6-element-partition` |
 | M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ Planned | |
 
 > **Next-work note (2026-05-29):** the per-iteration hot loop is **latency/
@@ -69,26 +69,35 @@ gpu   <M5 tip> M5 complete (NCCL device-direct + profile instrumentation)
 ### Source layout
 
 ```
+include/stPS/                      # public API (no MPI/NCCL/CUDA leaks; pImpl)
+├── stPS.h                         # umbrella header
+├── types.hpp                      # ElementId, PatchId, Score, Hash, kDisabledScore
+├── partition.hpp                  # slice_patches_by_rank
+└── usc_patch_selector.hpp         # UscPatchSelector, PatchSelection, PartitionMode
+
 src/
-├── main.cpp                       # CLI entry; CUDA device pick + NCCLComm bootstrap
-├── core/
-│   ├── types.hpp                  # ElementId, PatchId, Score, Hash, kDisabledScore
+├── core/                          # shared, algorithm-neutral primitives
 │   ├── bitset.{hpp,cpp}           # DenseBitset (host) — used by brute_force only
 │   ├── csr.{hpp,cpp}              # PatchCsr (CSR layout, design doc §3)
 │   ├── inverted_index.{hpp,cpp}   # Sparse CSR transpose (§4)
-│   ├── usc_solver.{hpp,cu}        # USCSolver<CommT> template (algorithm core)
-│   ├── brute_force.{hpp,cpp}      # Single-process reference for tests
-│   └── device_buffer.{hpp,cu}     # DeviceBuffer<T> RAII wrapper (M4)
+│   ├── patch_set.{hpp,cpp}        # map_hashes_to_element_ids (§5.1) + PatchSet
+│   ├── device_buffer.{hpp,cu}     # DeviceBuffer<T> RAII wrapper (M4)
+│   └── {gpu,host}_profiler.*      # -DUSC_PROFILE stage timers
+├── usc/                           # greedy minimum set-cover algorithm
+│   ├── main.cpp                   # CLI entry; device pick + Comm::onDevice
+│   ├── usc_patch_selector_impl.{hpp,cu}  # ByPatch + ByElement impls, kernels, facade
+│   └── brute_force.{hpp,cpp}      # single-process reference for tests
 └── data/
-    └── synthetic.{hpp,cpp}        # Deterministic synthetic generator + rank slicer
+    ├── synthetic.{hpp,cpp}        # deterministic synthetic generator
+    └── partition.cpp              # slice_patches_by_rank impl
 
 tests/
-├── test_main.cpp                  # GTest main; bootstraps process-global NCCLComm
-├── test_nccl_env.hpp              # accessor for the global NCCLComm
-├── test_*.cpp                     # Unit tests per module
-├── test_solver_equivalence.cpp    # USCSolver vs brute_force (correctness test)
+├── test_main.cpp                  # GTest main; bootstraps process-global Comm
+├── test_nccl_env.hpp              # accessor for the global Comm
+├── test_*.cpp                     # unit tests per module
+├── test_solver_equivalence.cpp    # both PartitionModes vs brute_force
 └── helpers/
-    └── local_setup.{hpp,cpp}      # Single-process setup for brute_force ref
+    └── local_setup.{hpp,cpp}      # single-process setup for brute_force ref
 ```
 
 ### Dependencies
@@ -96,7 +105,7 @@ tests/
 | Dep | Where | Notes |
 |---|---|---|
 | MPI (OpenMPI/MPICH) | system | `mpicxx`, `find_package(MPI)` |
-| stComm | `~/install/stComm` | branch `add-nccl-bcast` — adds `NCCLComm::bcast<T>` on top of `add-bcast-maxloc-exscan` |
+| stComm | `~/install/stComm` | branch `add-allreduce` — adds element-wise `allreduce<T>(op)` (MPI_Iallreduce / native ncclAllReduce), required by `PartitionMode::ByElement` |
 | CUDA Toolkit | `/usr/local/cuda` (12.x) | nvcc compiles `usc_solver.cu`, `device_buffer.cu` |
 | NCCL | system (`libnccl-dev`) | required at runtime for the hot-path bcast |
 | GoogleTest | system (`libgtest-dev`) for stComm; FetchContent 1.15.2 for stPS | |
@@ -116,6 +125,48 @@ tests/
 The payload (`d_newly_covered_ids`, sized winner_score × 8 B) **never visits host
 memory** in M5. Only the 16 B MAXLOC metadata is host-side, dictated by the NCCL
 API (root/count must be host scalars).
+
+## M6 architecture (`PartitionMode::ByElement`, opt-in)
+
+Design doc §7.3 — the N-scaling mode. The element ID space [0, N) is statically
+sharded across ranks; each rank holds only its shard of the covered bitset
+(N/(8·P) bytes) plus every patch's shard-restricted sub-CSR + inverted index
+(each incidence on exactly one rank: M·K/P per rank — tighter than §7.5's full
+patch replication). Scores are per-rank partials over the local shard.
+
+Per-iteration hot loop — ONE fixed-size, root-less collective:
+
+| Step | Where | Cost |
+|---|---|---|
+| **`allreduce<Device,SUM>` partial→full scores** | **device-direct (stComm/NCCL)** | **M_global × 8 B** |
+| CUB ArgMax over identical full scores + 16 B D2H | device + host stub | every rank picks the same winner |
+| build_newly / set_bits / score_update (strategy A) | device, shard-local | same three kernels as ByPatch |
+| winner partial disable | 8 B H2D | tiny |
+
+MAXLOC, winner-id bcast and the newly-covered payload bcast are all gone;
+communication is O(M_global)/iter, independent of N. Selection is provably
+identical to ByPatch/brute-force: integer sums are exact, and the
+smallest-slot tie-break (rank-major slots) equals the smallest-PatchId rule.
+
+**When to use**: N large enough that the replicated covered bitset (or the
+ByPatch newly-covered bcast) hurts — the design-doc trigger is N ≥ 10^10+.
+At current test scales it is *slower* than ByPatch (the M×8 B allreduce
+dominates), exactly as the design doc predicted:
+
+| Workload (`-n 2`, 2×RTX 4000 Ada, patch-select total ms) | ByPatch | ByElement |
+|---|---|---|
+| Small (N=10K, M=1K) | 318 | 319 |
+| LARGE (univ 350K, M=10K) | 1087 | 1205 |
+| 4× (univ 1.4M, M=20K) | 3278 | 4501 |
+
+All three scales bit-identical between modes and sizes 1/2 (`selected` =
+353 / 5378 / 14889).
+
+**Full-GPU synergy note**: ByElement's loop has no data-dependent collective
+count and no root — the exact blockers that killed the earlier multi-rank
+device-resident attempt (see ROADMAP "Full-GPU iteration track"). A CUDA-graph
+device-resident loop over this mode is the natural next step if NVLink-class
+hardware shows the latency win.
 
 ## Key design decisions (recorded for future maintainers)
 

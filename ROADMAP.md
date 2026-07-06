@@ -151,54 +151,41 @@ winner-sequence diff harness to catch the first divergence.
 
 ---
 
-## M6 — Element-partitioned covered bitset (§7.3) — DEFERRED (speculative)
+## M6 — Element-partitioned covered bitset (§7.3) ✅ DONE (2026-07-06)
 
-> Deferred 2026-05-29: M6 swaps M5's patch-partition for **element-partition +
-> patch-replicate**. But patch replication holds M×K incidence data on every rank
-> (M×K ≥ N always: every element is in ≥1 patch), so it shrinks the *smaller*
-> replicated structure (covered, N/8 B) while keeping the *larger* one (patches,
-> ≥ 8N B) fully replicated. It only helps in the narrow regime where N breaks GPU
-> covered memory yet M×K still fits one node's RAM. Whether the real OPC workload
-> is in that regime is **unmeasured** (design doc §9: N and M×K unknown). At our
-> test scales (N ≤ 10⁷) it gives no benefit and adds an M×8 B AllReduce per iter.
-> Revisit once real N / M×K numbers exist; the general scaling answer is the
-> §7.4 2D partition (M7), not M6.
+Implemented as the opt-in `PartitionMode::ByElement` (public ctor enum; CLI
+`--partition element`). See STATUS.md "M6 architecture" for the full write-up.
 
-### Goal
-When N is large enough that `d_covered_` (N/64 words per rank) becomes a
-real memory pressure, partition the covered bitset across ranks so each
-holds only its shard.
+Deviations from the original spec, and how the deferral concerns resolved:
 
-### Trigger conditions
-- N ≥ 10^10 → d_covered_ = 1.25 GB per rank (fits A100 80 GB easily)
-- N ≥ 10^11 → 12.5 GB per rank (still fits A100)
-- N ≥ 10^12 → only on H100 80 GB / multi-GPU per rank
+- **No patch replication.** The deferral note assumed §7.5's element-partition
+  + patch-*replicate* (M×K on every rank). The implementation instead
+  redistributes each (slot, element) incidence to the element's owner shard —
+  every incidence lives on exactly one rank (M×K/P per rank), so ByElement is
+  a strict memory win over ByPatch on *both* axes (covered N/(8P), incidences
+  M·K/P), not just covered.
+- **Newly-covered broadcast eliminated entirely** (the spec still had the
+  winner broadcasting it). Each rank already holds the winner's sub-patch for
+  its own shard, so it folds covered/scores locally; the per-iteration
+  communication is exactly one fixed-size `allreduce<Device,SUM>` of M_global
+  scores. `covered_count` advances by the globally-known winner score — the
+  spec's Step F scalar AllReduce is unnecessary.
+- **Static shard partition** (open decision resolved): contiguous ⌈N/P⌉
+  ranges; the §5.1 sample sort already balances ID density.
+- **stComm dependency**: `allreduce<T>(op)` added on stComm branch
+  `add-allreduce` (MPI_Iallreduce host / native ncclAllReduce device).
 
-For the M5 test scales (N ≤ 10^7) this is unnecessary. M6 is a scaling
-upgrade, not a perf win at current sizes.
+Verification (2×RTX 4000 Ada, `NCCL_P2P_DISABLE=1`): 31/31 ctest at -n 2
+(4 new `SolverEquivalenceElem` cases vs brute force); bit-identical
+`selected` at sizes 1/2 for Small=353, LARGE=5378, 4×=14889. As predicted,
+*slower* than ByPatch at test scales (4×: 4501 vs 3278 ms — the M×8 B/iter
+allreduce): it is the N-scaling mode, not a perf win at N ≤ 10⁷. ByPatch
+stays the default.
 
-### Algorithm change (design doc §7.3)
-- Element ID space [0, N) divided into P shards (size N/P each).
-- Rank r owns shard r.
-- Per iteration:
-  - Each rank computes **partial scores** for its patches against only its
-    shard of covered.
-  - Partial scores `AllReduce<SUM>` across ranks → full scores.
-  - argmax on full scores.
-  - Winner broadcasts `newly_covered`; each rank only OR's IDs belonging to
-    its shard.
-
-### USCSolver impact
-- `d_covered_` becomes per-shard (size N/(64·P)).
-- Score kernel maps each element ID to a shard, counts intersections
-  within own shard only.
-- Requires adding `allreduce<T>(op)` to stComm (currently only
-  `allreduceMaxloc<T>`).
-
-### Open decisions
-- Static shard partition vs hash-based? Static is simpler when IDs are
-  approximately uniform (sample sort already enforces this).
-- Score AllReduce bandwidth (M × 4 B per iter) vs current N-bit bcast.
+Follow-up (unassigned): ByElement makes the multi-rank device-resident loop
+tractable — its one collective is fixed-size and root-less, removing the
+host-scalar blockers of the reverted all-NCCL attempt (see "Full-GPU
+iteration track / If resumed"). Prototype on NVLink-class hardware.
 
 ---
 
@@ -224,7 +211,9 @@ Capture format spec from the OPC team before designing the reader.
 
 ## Cross-cutting follow-ups (no milestone assigned)
 
-- **stComm `Allreduce<T>(op)` PR**: blocks M6. Currently only `allreduceMaxloc<T>`.
+- ~~**stComm `Allreduce<T>(op)` PR**: blocks M6.~~ — DONE with M6: stComm branch
+  `add-allreduce` adds element-wise `allreduce<T>(op)` on both Spaces. Merge the
+  stComm PR upstream.
 - **CI / automated regression**: GitHub Actions or similar with MPI + CUDA
   matrix. Trigger on PR. Currently a manual `ctest` discipline.
 - **`patches_` / `inv_` host memory free after H2D**: currently both stay in

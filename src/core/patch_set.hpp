@@ -14,6 +14,22 @@ namespace stComm { class Comm; }
 
 namespace stPS {
 
+// Result of the distributed hash → dense-ID mapping (design doc §5.1): this
+// rank's patches translated into ElementId space (each patch sorted + unique,
+// local input order preserved), plus the global universe size N. Shared by both
+// partitioning strategies — PatchSet builds its patch-partitioned structures on
+// top of it, and the element-partitioned selector (§7.3) redistributes it by
+// element shard instead.
+struct IdMappedPatches {
+    std::vector<std::vector<ElementId>> id_patches;
+    std::uint64_t                       N = 0;
+};
+
+// Collective: distributed sample-sort hash → ID mapping (§5.1 steps 1–11).
+// Every rank must call together with its own local patches.
+IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
+                                          std::vector<std::vector<Hash>> raw_patches);
+
 // Distributed, algorithm-neutral "hashed patch set" — the shared preprocessing
 // every patch algorithm (USC greedy set-cover, UPS pattern counting, ...) builds
 // on. Given each rank's patches as lists of Hash, it performs the distributed

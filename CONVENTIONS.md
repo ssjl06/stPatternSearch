@@ -31,13 +31,16 @@ continue.
 - The one allowed pattern: USCSolver holds a `CommT&` (template) and calls
   `comm_.bcast<T>(...)`, `comm_.allreduceMaxloc<T>(...)` directly.
 
-### 2. USCSolver is algorithm-pure
-- No MPI lifecycle methods on USCSolver (`initialize_mpi` / `finalize_mpi`).
-  Those go in `main()`.
-- No `rank()` / `size()` accessors on USCSolver. If `main()` needs them,
-  it keeps its own `stComm::MPIComm world` handle.
-- USCSolver only exposes `load`, `setup`, `solve`, `print_solution`,
-  and algorithm-state inspectors (N, M_local, patches, inverted_index).
+### 2. The selector impls are algorithm-pure
+- No MPI lifecycle methods on the selector classes (`initialize_mpi` /
+  `finalize_mpi`). Those go in `main()`.
+- No `rank()` / `size()` accessors on the selectors. If `main()` needs them,
+  it keeps its own `stComm::Comm` handle.
+- The public `UscPatchSelector` exposes only `patch_select` (+ the
+  `PartitionMode` ctor choice); the internal impls add algorithm-state
+  inspectors (N, M_local, patches, inverted_index) at most.
+  (Pre-rename this section said `USCSolver` with `load`/`setup`/`solve` —
+  the single collective `patch_select` replaced that API.)
 
 ### 3. Header hygiene
 - Public headers (`*.hpp`) should not include CUDA headers when possible.

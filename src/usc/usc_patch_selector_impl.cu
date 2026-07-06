@@ -13,7 +13,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -401,23 +403,367 @@ const PatchCsr&      UscPatchSelectorImpl::patches() const      { return patch_s
 const InvertedIndex& UscPatchSelectorImpl::inverted_index() const { return patch_set_->inverted_index(); }
 
 // ============================================================================
-// Public facade: stPS::UscPatchSelector — pImpl over UscPatchSelectorImpl
-// (hides all internals).
+// UscElemPatchSelectorImpl — PartitionMode::ByElement (design doc §7.3)
+// ============================================================================
+
+UscElemPatchSelectorImpl::UscElemPatchSelectorImpl(stComm::Comm& comm)
+    : comm_(comm) {
+    if (!comm_.hasDevice()) {
+        throw std::invalid_argument(
+            "UscElemPatchSelectorImpl requires a device-enabled Comm (Comm::onDevice) — "
+            "USC is GPU-only.");
+    }
+}
+
+PatchSelection UscElemPatchSelectorImpl::patch_select(
+        std::vector<std::vector<Hash>> raw_patches,
+        std::vector<PatchId>           global_ids) {
+    const int size = comm_.getSize();
+    const int rank = comm_.getRank();
+
+    // Shared §5.1 preprocessing: hash → dense ElementId translation.
+    IdMappedPatches mapped = map_hashes_to_element_ids(comm_, std::move(raw_patches));
+    N_ = mapped.N;
+
+    // ---- Global slot assignment (rank-major input order) --------------------
+    // Slot of local patch p on rank r = (Σ M_local below r) + p. With
+    // slice_patches_by_rank's contiguous IDs this equals ascending global-ID
+    // order, so the smallest-slot tie-break in select() matches
+    // brute_force_select's smallest-PatchId rule (and ByPatch's
+    // smallest-rank-then-smallest-local-index MAXLOC rule).
+    const std::uint64_t M_local = mapped.id_patches.size();
+    std::uint64_t slot_start = 0;
+    comm_.exscan<stComm::Space::Host>(M_local, &slot_start, stComm::ReduceOp::Sum)->wait();
+    std::uint64_t M_global = (rank == size - 1) ? slot_start + M_local : 0;
+    comm_.bcast<stComm::Space::Host, std::uint64_t>(&M_global, 1, size - 1)->wait();
+    M_global_ = M_global;
+    if (M_global_ > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(
+            "ByElement mode: M_global exceeds CUB ArgMax's int index range");
+    }
+
+    // Replicated slot → caller PatchId map (used only to report the result).
+    std::vector<int> mcounts(static_cast<std::size_t>(size), 0);
+    {
+        std::vector<int> ones(static_cast<std::size_t>(size), 1);
+        const int m_local_int = static_cast<int>(M_local);
+        comm_.allgatherv<stComm::Space::Host, int>(&m_local_int, 1,
+                                                   mcounts.data(), ones.data())->wait();
+    }
+    slot_to_gid_.resize(M_global_);
+    comm_.allgatherv<stComm::Space::Host, PatchId>(global_ids.data(),
+                                                   static_cast<int>(M_local),
+                                                   slot_to_gid_.data(), mcounts.data())->wait();
+
+    // ---- Shard geometry ------------------------------------------------------
+    // Static contiguous ranges: rank r owns [r·⌈N/P⌉, (r+1)·⌈N/P⌉) ∩ [0, N).
+    // Static (not hash-based) is enough: the §5.1 sample sort already assigns
+    // dense IDs with balanced per-rank density.
+    const std::uint64_t P          = static_cast<std::uint64_t>(size);
+    const std::uint64_t shard_size = (N_ + P - 1) / P;
+    shard_base_ = std::min<std::uint64_t>(static_cast<std::uint64_t>(rank) * shard_size, N_);
+    const std::uint64_t shard_end =
+        std::min<std::uint64_t>((static_cast<std::uint64_t>(rank) + 1) * shard_size, N_);
+    shard_extent_ = shard_end - shard_base_;
+
+    // ---- Incidence redistribution --------------------------------------------
+    // Every (slot, element) incidence flies to the element's owner shard. Each
+    // rank then holds, for ALL M_global patches, the sub-list inside its shard —
+    // every incidence stored on exactly one rank (M·K/P per rank), tighter than
+    // §7.5's conservative full patch replication.
+    std::vector<int> sendcounts(static_cast<std::size_t>(size), 0);
+    for (const auto& p : mapped.id_patches)
+        for (ElementId e : p)
+            ++sendcounts[shard_size ? static_cast<int>(e / shard_size) : 0];
+
+    std::vector<int> send_offsets(static_cast<std::size_t>(size), 0);
+    for (int r = 1; r < size; ++r) send_offsets[r] = send_offsets[r - 1] + sendcounts[r - 1];
+
+    const std::size_t total_send =
+        std::accumulate(sendcounts.begin(), sendcounts.end(), std::size_t{0});
+    std::vector<PatchId>   send_slots(total_send);
+    std::vector<ElementId> send_elems(total_send);
+    {
+        std::vector<int> cursor = send_offsets;  // per-target write head
+        for (std::uint64_t p = 0; p < M_local; ++p) {
+            const PatchId slot = slot_start + p;
+            for (ElementId e : mapped.id_patches[p]) {
+                const int target = shard_size ? static_cast<int>(e / shard_size) : 0;
+                send_slots[cursor[target]] = slot;
+                send_elems[cursor[target]] = e;
+                ++cursor[target];
+            }
+        }
+    }
+    mapped.id_patches.clear();
+    mapped.id_patches.shrink_to_fit();
+
+    // Exchange counts (same allgatherv trick as §5.1 step 3), then ship the
+    // incidences as two parallel alltoallv's sharing one count layout.
+    std::vector<int> all_sendcounts(static_cast<std::size_t>(size) * size);
+    {
+        std::vector<int> uniform(static_cast<std::size_t>(size), size);
+        comm_.allgatherv<stComm::Space::Host, int>(sendcounts.data(), size,
+                                                   all_sendcounts.data(), uniform.data())->wait();
+    }
+    std::vector<int> recvcounts(static_cast<std::size_t>(size), 0);
+    for (int s = 0; s < size; ++s) recvcounts[s] = all_sendcounts[s * size + rank];
+    const std::size_t total_recv =
+        std::accumulate(recvcounts.begin(), recvcounts.end(), std::size_t{0});
+
+    std::vector<PatchId>   recv_slots(total_recv);
+    std::vector<ElementId> recv_elems(total_recv);
+    comm_.alltoallv<stComm::Space::Host, PatchId>(send_slots.data(), sendcounts.data(),
+                                                  recv_slots.data(), recvcounts.data())->wait();
+    comm_.alltoallv<stComm::Space::Host, ElementId>(send_elems.data(), sendcounts.data(),
+                                                    recv_elems.data(), recvcounts.data())->wait();
+    send_slots.clear(); send_slots.shrink_to_fit();
+    send_elems.clear(); send_elems.shrink_to_fit();
+
+    // ---- Shard-local sub-CSR over all M_global patches -----------------------
+    // Store SHARD-LOCAL element IDs (global − shard_base_): the covered bitset
+    // and every kernel then index the local shard exactly like ByPatch indexes
+    // the full universe. Incidences are globally unique, so no dedupe needed.
+    struct Incidence { PatchId slot; ElementId elem; };
+    std::vector<Incidence> inc(total_recv);
+    for (std::size_t i = 0; i < total_recv; ++i)
+        inc[i] = { recv_slots[i], recv_elems[i] - shard_base_ };
+    recv_slots.clear(); recv_slots.shrink_to_fit();
+    recv_elems.clear(); recv_elems.shrink_to_fit();
+    std::sort(inc.begin(), inc.end(), [](const Incidence& a, const Incidence& b) {
+        return a.slot != b.slot ? a.slot < b.slot : a.elem < b.elem;
+    });
+
+    PatchCsr sub;
+    sub.offsets.assign(M_global_ + 1, 0);
+    sub.data.resize(total_recv);
+    for (const Incidence& x : inc) ++sub.offsets[x.slot + 1];
+    for (std::uint64_t s = 0; s < M_global_; ++s) sub.offsets[s + 1] += sub.offsets[s];
+    for (std::size_t i = 0; i < inc.size(); ++i) sub.data[i] = inc[i].elem;
+    inc.clear(); inc.shrink_to_fit();
+
+    // Shard-local inverted index (keys are shard-local IDs, values are global
+    // slots) — drives the strategy-A partial-score update.
+    inv_ = build_inverted_index(sub, shard_extent_ ? shard_extent_ : 1);
+
+    // ---- Device mirrors + algorithm state -------------------------------------
+    if (!sub.data.empty()) {
+        d_patch_data_.resize(sub.data.size());
+        d_patch_data_.copy_from_host(sub.data.data(), sub.data.size());
+    }
+    if (!inv_.keys.empty()) {
+        d_inv_keys_.resize(inv_.keys.size());
+        d_inv_keys_.copy_from_host(inv_.keys.data(), inv_.keys.size());
+    }
+    if (!inv_.offsets.empty()) {
+        d_inv_offsets_.resize(inv_.offsets.size());
+        d_inv_offsets_.copy_from_host(inv_.offsets.data(), inv_.offsets.size());
+    }
+    if (!inv_.data.empty()) {
+        d_inv_data_.resize(inv_.data.size());
+        d_inv_data_.copy_from_host(inv_.data.data(), inv_.data.size());
+    }
+
+    d_scores_partial_.resize(M_global_);
+    d_scores_sum_.resize(M_global_);
+    if (M_global_) {
+        // Initial partial score = this shard's slice of each patch (full score
+        // arrives via the per-iteration AllReduce<SUM>).
+        std::vector<Score> init(M_global_);
+        for (std::uint64_t s = 0; s < M_global_; ++s)
+            init[s] = static_cast<Score>(sub.offsets[s + 1] - sub.offsets[s]);
+        d_scores_partial_.copy_from_host(init.data(), M_global_);
+    }
+    sub_offsets_ = std::move(sub.offsets);
+
+    d_covered_.resize((shard_extent_ + 63) / 64);
+    d_covered_.zero();
+
+    return select();
+}
+
+// Element-partitioned greedy loop (§7.3). Per iteration:
+//
+//        Comm.allreduce<Device, SUM>(d_scores_partial_, d_scores_sum_, M)   ← only collective
+//   [device] CUB ArgMax over the (identical) full scores → 16 B D2H
+//        — every rank picked the same winner; covered_count += winner_score
+//          with NO further communication —
+//   [device] build_newly_covered (this shard's slice of the winner)
+//   [device] set_bits (shard covered) + score_update_invidx (partials)
+//        H2D 8 B winner partial = kDisabledScore
+//
+// The ByPatch loop's MAXLOC, winner-PatchId bcast and newly-covered NCCL bcast
+// are all gone: the fixed-size, root-less AllReduce makes every rank's view of
+// the scores identical, and each shard updates itself locally.
+PatchSelection UscElemPatchSelectorImpl::select() {
+    PatchSelection result;
+    result.covered_count = 0;
+    result.iterations    = 0;
+
+    const std::uint64_t M_glob = M_global_;
+
+    DeviceBuffer<ElementId>    d_newly_ids;
+    DeviceBuffer<unsigned int> d_newly_count(1);
+
+    using ArgmaxPair = cub::KeyValuePair<int, Score>;
+    DeviceBuffer<std::uint8_t> d_argmax_temp;
+    DeviceBuffer<ArgmaxPair>   d_argmax_result(M_glob > 0 ? 1 : 0);
+    if (M_glob > 0) {
+        std::size_t temp_bytes = 0;
+        cub::DeviceReduce::ArgMax(nullptr, temp_bytes,
+                                  d_scores_sum_.data(),
+                                  d_argmax_result.data(),
+                                  static_cast<int>(M_glob));
+        d_argmax_temp.resize(temp_bytes);
+    }
+
+#ifdef USC_PROFILE
+    constexpr bool kProfile = true;
+#else
+    constexpr bool kProfile = false;
+#endif
+    enum GpuStage  { kArgmax = 0, kBuildKernel, kSetBits, kScoreUpdate, kWinnerDisable };
+    enum HostStage { kAllreduce = 0 };
+    detail::GpuProfiler gpu_prof(
+        {"argmax+D2H", "build_kernel+cnt", "set_bits", "score_update", "winner_disable"},
+        kProfile);
+    detail::HostProfiler host_prof({"score_allreduce"}, kProfile);
+
+    while (result.covered_count < N_ && M_glob > 0) {
+        // 1. Partial → full scores: the iteration's ONLY collective. Integer
+        // sums are exact and identical on every rank.
+        host_prof.begin(kAllreduce);
+        comm_.allreduce<stComm::Space::Device, Score>(d_scores_partial_.data(),
+                                                      d_scores_sum_.data(), M_glob,
+                                                      stComm::ReduceOp::Sum)->wait();
+        host_prof.end(kAllreduce);
+
+        // 2. Same argmax everywhere → same winner, no MAXLOC/bcast. Ties go to
+        // the smallest slot (CUB returns the first maximum).
+        gpu_prof.begin(kArgmax);
+        std::size_t temp_bytes = d_argmax_temp.bytes();
+        cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
+                                  d_scores_sum_.data(),
+                                  d_argmax_result.data(),
+                                  static_cast<int>(M_glob));
+        cuda_launch_check("cub::DeviceReduce::ArgMax (elem)");
+        ArgmaxPair host_result{};
+        cudaMemcpy(&host_result, d_argmax_result.data(),
+                   sizeof(host_result), cudaMemcpyDeviceToHost);
+        const Score   winner_score = host_result.value;
+        const PatchId winner_slot  = static_cast<PatchId>(host_result.key);
+        gpu_prof.end(kArgmax);
+
+        if (winner_score <= 0) break;
+
+        // Winner + its (global) fresh-coverage count are known on every rank —
+        // covered_count advances with zero additional communication.
+        result.covered_count += static_cast<std::uint64_t>(winner_score);
+        result.selected.push_back(slot_to_gid_[winner_slot]);
+
+        // 3. Shard-local newly covered = sub_patch(winner) ∩ ¬covered_local.
+        // n_local (this shard's share of winner_score) sizes the two update
+        // launches below — a local 4 B D2H, not a collective.
+        gpu_prof.begin(kBuildKernel);
+        const std::uint64_t start = sub_offsets_[winner_slot];
+        const std::uint64_t end   = sub_offsets_[winner_slot + 1];
+        const std::uint64_t len   = end - start;
+        unsigned int n_local = 0;
+        if (len > 0) {
+            if (d_newly_ids.size() < len) d_newly_ids.resize(len);
+            d_newly_count.zero();
+            const int block = 128;
+            const int grid  = static_cast<int>((len + block - 1) / block);
+            build_newly_covered_kernel<<<grid, block>>>(
+                d_patch_data_.data(), start, end,
+                d_covered_.data(),
+                d_newly_ids.data(),
+                d_newly_count.data());
+            cuda_launch_check("build_newly_covered_kernel (elem)");
+            cudaMemcpy(&n_local, d_newly_count.data(), sizeof(n_local),
+                       cudaMemcpyDeviceToHost);
+        }
+        gpu_prof.end(kBuildKernel);
+
+        // 4. Fold into this shard's covered bits + strategy-A partial-score
+        // update through the shard-local inverted index (same kernels as
+        // ByPatch — they only ever see shard-local IDs here).
+        gpu_prof.begin(kSetBits);
+        if (n_local > 0) {
+            const int block = 128;
+            const int grid  = static_cast<int>((n_local + block - 1) / block);
+            set_bits_kernel<<<grid, block>>>(d_covered_.data(),
+                                             d_newly_ids.data(), n_local);
+            cuda_launch_check("set_bits_kernel (elem)");
+        }
+        gpu_prof.end(kSetBits);
+
+        gpu_prof.begin(kScoreUpdate);
+        if (n_local > 0) {
+            score_update_invidx_kernel<<<n_local, kScoreBlockThreads>>>(
+                d_newly_ids.data(),
+                static_cast<std::uint64_t>(n_local),
+                d_inv_keys_.data(),
+                inv_.num_keys(),
+                d_inv_offsets_.data(),
+                d_inv_data_.data(),
+                d_scores_partial_.data());
+            cuda_launch_check("score_update_invidx_kernel (elem)");
+        }
+        gpu_prof.end(kScoreUpdate);
+
+        // 5. Winner disable — every rank writes kDisabledScore to its partial.
+        // (The partial is 0 after step 4: all its shard elements are now
+        // covered.) The summed score becomes P·kDisabledScore < 0, so the
+        // winner can never be re-selected.
+        gpu_prof.begin(kWinnerDisable);
+        {
+            const Score neg = kDisabledScore;
+            cudaMemcpy(&d_scores_partial_.data()[winner_slot], &neg, sizeof(Score),
+                       cudaMemcpyHostToDevice);
+        }
+        gpu_prof.end(kWinnerDisable);
+
+        ++result.iterations;
+    }
+
+    if (comm_.getRank() == 0) {
+        gpu_prof.report(stderr, "[usc-elem-profile gpu]", result.iterations);
+        host_prof.report(stderr, "[usc-elem-profile host]", result.iterations);
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Public facade: stPS::UscPatchSelector — pImpl routing to the ByPatch or
+// ByElement implementation (hides all internals).
 // ============================================================================
 
 struct UscPatchSelector::Impl {
-    UscPatchSelectorImpl usc;
-    explicit Impl(stComm::Comm& comm) : usc(comm) {}
+    // Exactly one is engaged, per the ctor's PartitionMode.
+    std::unique_ptr<UscPatchSelectorImpl>     by_patch;
+    std::unique_ptr<UscElemPatchSelectorImpl> by_element;
+    Impl(stComm::Comm& comm, PartitionMode mode) {
+        if (mode == PartitionMode::ByElement) {
+            by_element = std::make_unique<UscElemPatchSelectorImpl>(comm);
+        } else {
+            by_patch = std::make_unique<UscPatchSelectorImpl>(comm);
+        }
+    }
 };
 
-UscPatchSelector::UscPatchSelector(stComm::Comm& comm) : impl_(std::make_unique<Impl>(comm)) {}
+UscPatchSelector::UscPatchSelector(stComm::Comm& comm, PartitionMode mode)
+    : impl_(std::make_unique<Impl>(comm, mode)) {}
 UscPatchSelector::~UscPatchSelector() = default;
 UscPatchSelector::UscPatchSelector(UscPatchSelector&&) noexcept = default;
 UscPatchSelector& UscPatchSelector::operator=(UscPatchSelector&&) noexcept = default;
 
 PatchSelection UscPatchSelector::patch_select(std::vector<std::vector<Hash>> patches,
                                               std::vector<PatchId>           global_ids) {
-    return impl_->usc.patch_select(std::move(patches), std::move(global_ids));
+    return impl_->by_element
+        ? impl_->by_element->patch_select(std::move(patches), std::move(global_ids))
+        : impl_->by_patch->patch_select(std::move(patches), std::move(global_ids));
 }
 
 }  // namespace stPS
