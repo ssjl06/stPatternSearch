@@ -54,6 +54,11 @@ cd build && ctest --output-on-failure
 mpirun -n 4 --oversubscribe ./build/src/usc-patch-select \
     --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42
 # Expected: selected=353 covered=6019 iterations=353
+
+# File input (M7): dump a patch set to the .stps binary format once, then feed
+# it back — each rank reads only its own slice; results are bit-identical.
+./build/src/usc-patch-select --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42 --dump patches.stps
+mpirun -n 2 ./build/src/usc-patch-select --input patches.stps
 ```
 
 `build.sh` configures + builds against stComm and prints the artifact paths;

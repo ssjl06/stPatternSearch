@@ -207,21 +207,29 @@ iteration track / If resumed"). Prototype on NVLink-class hardware.
 
 ## M7 — Real OPC input parser + 2D partition (§7.4)
 
-### Goal
-- Replace synthetic generator with real OPC binary/HDF5 reader.
+### M7a — file-input infrastructure ✅ DONE (2026-07-06)
+
+`src/io/` shipped: a `PatchReader` interface (`patch_count()` header probe +
+`read_slice(begin, end)` per-rank contiguous reads), an `open_patch_file()`
+magic-sniffing factory, and the **v1 `.stps` binary CSR format** (header +
+offsets[M+1] + hashes — mirrors the in-memory PatchCsr, so a rank's slice is
+two contiguous `fseek`+`fread`s; multi-rank setup I/O stays proportional to
+each rank's share, no MPI-IO). CLI: `--input <path>` (per-rank slice reads,
+same split rule as `slice_patches_by_rank` → bit-identical solves) and
+`--dump <path>` (synthetic → file data-prep tool, host-only). 5 `PatchIo`
+tests: round-trip, slice-vs-slicer equality across splits, range/corruption
+rejection, and a distributed file-vs-synthetic solve equivalence; 36/36 ctest.
+
+Deviation from the original sketch: `generate_synthetic` stays in `src/data/`
+(not `tests/helpers/`) — it remains the CLI's default demo/bench path and the
+`--dump` source until real data exists (CONVENTIONS §5 pragmatism).
+
+### M7b — remaining (blocked on the OPC team's format spec)
+- Concrete OPC reader (binary/HDF5/whatever the toolchain emits) implementing
+  `PatchReader`; dispatch by magic in `open_patch_file()`.
 - If M × K exceeds single-node RAM (~2 TB / 8 = 256 GB of patches per node),
   add 2D partition (patch shard × element shard) per design doc §7.4.
-
-### Likely structure
-- `src/io/` with a `PatchReader` interface and concrete implementations
-  (binary, HDF5, …).
-- Move `generate_synthetic` + `slice_patches_by_rank` to `tests/helpers/`
-  since synthetic is no longer the production path.
-- App accepts `--input <path>` and dispatches to the appropriate reader.
-
-### Note
-Most uncertain milestone — depends on what the actual OPC toolchain emits.
-Capture format spec from the OPC team before designing the reader.
+- Capture the format spec from the OPC team before designing the reader.
 
 ---
 
