@@ -22,6 +22,8 @@ using namespace stPS;
 struct CliOptions {
     SyntheticParams params;
     PartitionMode   mode = PartitionMode::ByPatch;
+    std::string     input;   // read patches from a .stps file instead of synthetic
+    std::string     dump;    // write synthetic patches to a .stps file and exit
     bool print_solution = false;
 };
 
@@ -52,6 +54,10 @@ void print_usage(const char* prog) {
         "  --seed <int>        RNG seed (default %lu)\n"
         "  --partition <mode>  patch | element (default patch; element = §7.3\n"
         "                      element-sharded covered bitset, comm scales with M not N)\n"
+        "  --input <path>      read patches from a .stps file (synthetic params ignored;\n"
+        "                      each rank reads only its own contiguous patch slice)\n"
+        "  --dump <path>       write the synthetic patches to a .stps file and exit\n"
+        "                      (data-prep tool mode; no GPU needed)\n"
         "  --print-solution    print the selected patch IDs\n"
         "  -h, --help          show this help\n",
         prog,
@@ -82,6 +88,8 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
             else if (m == "element") opt.mode = PartitionMode::ByElement;
             else { std::fprintf(stderr, "Unknown --partition mode: %s\n", v); return false; }
         }
+        else if (a == "--input") { const char* v = next_val(); if (!v) return false; opt.input = v; }
+        else if (a == "--dump")  { const char* v = next_val(); if (!v) return false; opt.dump  = v; }
         else if (a == "--print-solution") { opt.print_solution = true; }
         else {
             std::fprintf(stderr, "Unknown argument: %s\n", a.c_str());
@@ -89,7 +97,22 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
             return false;
         }
     }
+    if (!opt.input.empty() && !opt.dump.empty()) {
+        std::fprintf(stderr, "--input and --dump are mutually exclusive\n");
+        return false;
+    }
     return true;
+}
+
+// This rank's contiguous patch range in file order — the same split rule as
+// slice_patches_by_rank, so file input and synthetic input produce identical
+// rank slices (and therefore identical solves) for the same data.
+stPS::PatchSlice read_input_slice(const std::string& path, int rank, int size) {
+    auto reader = stPS::open_patch_file(path);
+    const std::uint64_t M     = reader->patch_count();
+    const std::uint64_t begin = (M * static_cast<std::uint64_t>(rank))     / size;
+    const std::uint64_t end   = (M * (static_cast<std::uint64_t>(rank)+1)) / size;
+    return reader->read_slice(begin, end);
 }
 
 }  // namespace
@@ -100,6 +123,16 @@ int main(int argc, char** argv) {
     try {
         CliOptions opt;
         if (!parse_args(argc, argv, opt)) { exit_code = 1; }
+        else if (!opt.dump.empty()) {
+            // Data-prep tool mode: write the synthetic set to a .stps file and
+            // exit. Host-only — no GPU, no NCCL bootstrap.
+            if (stComm::Comm{}.getRank() == 0) {
+                const auto patches = generate_synthetic(opt.params);
+                stPS::write_patch_file(opt.dump, patches);
+                std::cout << "dumped M=" << patches.size()
+                          << " patches to " << opt.dump << "\n";
+            }
+        }
         else {
             const int rank = stComm::Comm{}.getRank();      // host probe for device pick
             const int device_id = pick_device_for_rank(rank);
@@ -109,8 +142,13 @@ int main(int argc, char** argv) {
             // The whole library API: build a UscPatchSelector on the comm, hand
             // it this rank's patches + their global IDs, get the cover back.
             stPS::UscPatchSelector selector(comm, opt.mode);
-            auto slice = stPS::slice_patches_by_rank(
-                generate_synthetic(opt.params), comm.getRank(), comm.getSize());
+            // --input: each rank reads only its own slice of the patch file;
+            // otherwise every rank generates the (deterministic) synthetic set
+            // and keeps its slice.
+            auto slice = !opt.input.empty()
+                ? read_input_slice(opt.input, comm.getRank(), comm.getSize())
+                : stPS::slice_patches_by_rank(
+                      generate_synthetic(opt.params), comm.getRank(), comm.getSize());
             const std::size_t m_local = slice.patches.size();  // capture before move
 
             auto t0 = std::chrono::steady_clock::now();
