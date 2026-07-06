@@ -99,8 +99,10 @@ latency/overhead-bound, not compute-bound — optimize launches/syncs, not FLOPs
 > scales, 31/31 ctest; LARGE/4× solve ~30% faster, Small `-n 2` regresses
 > (deep-pipeline overhead; see STATUS "M6.5"). ByPatch multi-rank stays
 > host-driven — its NCCL bcast root/count are data-dependent host scalars,
-> which is exactly what ByElement designed away. Remaining ideas: int32 wire
-> scores, CUDA-graph batch capture, NVLink validation.
+> which is exactly what ByElement designed away. int32 wire scores landed as a
+> follow-up (allreduce halved; solve −21~27% at LARGE/4×/20×, setup-time
+> overflow proof — see STATUS). Remaining ideas: CUDA-graph batch capture,
+> NVLink validation.
 >
 > Historical notes below kept for the design rationale and the failed-attempt
 > post-mortem.

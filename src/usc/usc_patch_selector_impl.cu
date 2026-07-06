@@ -162,10 +162,10 @@ struct ElemWinnerInfo {
 // sees start == end and newly_count == 0 and no-ops — a batch may overshoot
 // the end of the solve but never changes the result, and `done` derives only
 // from allreduced values, so it flips on every rank in the same iteration.
-__global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, Score>* argmax,
+__global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore>* argmax,
                                           const std::uint64_t* sub_offsets,
                                           std::uint64_t        N,
-                                          Score*               scores_partial,
+                                          WireScore*           scores_partial,
                                           PatchId*             selected_slots,
                                           ElemLoopState*       st,
                                           ElemWinnerInfo*      w) {
@@ -173,7 +173,7 @@ __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, Score>* a
     w->start = 0;
     w->end   = 0;
     if (st->done) return;
-    const Score score = argmax->value;
+    const WireScore score = argmax->value;
     if (score <= 0) { st->done = 1; return; }
     const int slot = argmax->key;
     selected_slots[st->num_selected] = static_cast<PatchId>(slot);
@@ -186,7 +186,7 @@ __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, Score>* a
     // further decrement it by this shard's newly-covered count — it stays
     // permanently negative either way, so the selection sequence is identical
     // to the host loop's update-then-disable order.
-    scores_partial[slot] = kDisabledScore;
+    scores_partial[slot] = kDisabledWireScore;
 }
 
 // build_newly_covered, fixed-grid grid-stride: the range comes from w; the
@@ -235,7 +235,7 @@ __global__ void elem_score_update_kernel(const ElementId*      newly_ids,
                                          std::uint64_t         inv_keys_n,
                                          const std::uint64_t*  inv_offsets,
                                          const PatchId*        inv_data,
-                                         Score*                scores) {
+                                         WireScore*            scores) {
     const unsigned int n = w->newly_count;
     __shared__ std::uint64_t s_start;
     __shared__ std::uint64_t s_end;
@@ -258,8 +258,8 @@ __global__ void elem_score_update_kernel(const ElementId*      newly_ids,
         }
         __syncthreads();
         for (std::uint64_t i = s_start + threadIdx.x; i < s_end; i += blockDim.x) {
-            atomicAdd(reinterpret_cast<unsigned long long*>(&scores[inv_data[i]]),
-                      static_cast<unsigned long long>(-1LL));
+            // WireScore is int32 — native atomicSub, no two's-complement dance.
+            atomicSub(reinterpret_cast<int*>(&scores[inv_data[i]]), 1);
         }
         __syncthreads();  // all readers done before thread 0 overwrites s_start/s_end
     }
@@ -713,10 +713,10 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
         // Initial partial score = this shard's slice of each patch (full score
         // arrives via the per-iteration AllReduce<SUM>). Also record the widest
         // sub-patch — it bounds the newly-covered scratch for the whole solve.
-        std::vector<Score> init(M_global_);
+        std::vector<WireScore> init(M_global_);
         for (std::uint64_t s = 0; s < M_global_; ++s) {
             const std::uint64_t len = sub.offsets[s + 1] - sub.offsets[s];
-            init[s] = static_cast<Score>(len);
+            init[s] = static_cast<WireScore>(len);
             max_sub_len_ = std::max(max_sub_len_, len);
         }
         d_scores_partial_.copy_from_host(init.data(), M_global_);
@@ -724,6 +724,26 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
         // so the host never touches the sub-CSR during the loop.
         d_sub_offsets_.resize(sub.offsets.size());
         d_sub_offsets_.copy_from_host(sub.offsets.data(), sub.offsets.size());
+
+        // Prove the int32 wire fits, once. Initial global scores (= deduped
+        // patch sizes) are the solve's maxima — scores only decrease — so if
+        // every initial sum fits with a P-sized margin (the disabled floor is
+        // −P − patch_size), every value the wire ever carries fits. A one-time
+        // host allreduce of the int64 partials makes the check exact.
+        std::vector<std::int64_t> init64(M_global_), sum64(M_global_);
+        for (std::uint64_t s = 0; s < M_global_; ++s) init64[s] = init[s];
+        comm_.allreduce<stComm::Space::Host, std::int64_t>(
+            init64.data(), sum64.data(), M_global_, stComm::ReduceOp::Sum)->wait();
+        const std::int64_t wire_max =
+            static_cast<std::int64_t>(std::numeric_limits<WireScore>::max()) - size - 1;
+        for (std::uint64_t s = 0; s < M_global_; ++s) {
+            if (sum64[s] > wire_max) {
+                throw std::invalid_argument(
+                    "ByElement mode: patch " + std::to_string(slot_to_gid_[s]) +
+                    " has " + std::to_string(sum64[s]) +
+                    " unique elements — exceeds the int32 score wire format");
+            }
+        }
     }
 
     d_covered_.resize((shard_extent_ + 63) / 64);
@@ -779,10 +799,10 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     DeviceBuffer<ElementId> d_newly_ids(std::max<std::uint64_t>(max_sub_len_, 1));
 
     // size == 1: the partial scores ARE the full scores — no allreduce at all.
-    const Score* d_full_scores = (size == 1) ? d_scores_partial_.data()
-                                             : d_scores_sum_.data();
+    const WireScore* d_full_scores = (size == 1) ? d_scores_partial_.data()
+                                                 : d_scores_sum_.data();
 
-    using ArgmaxPair = cub::KeyValuePair<int, Score>;
+    using ArgmaxPair = cub::KeyValuePair<int, WireScore>;
     DeviceBuffer<ArgmaxPair>   d_argmax_result(1);
     DeviceBuffer<std::uint8_t> d_argmax_temp;
     {
@@ -800,7 +820,9 @@ PatchSelection UscElemPatchSelectorImpl::select() {
             if (size > 1) {
                 // Enqueue-only — no wait. Stream order makes iteration k's
                 // updated partials the input of iteration k+1's allreduce.
-                comm_.allreduce<stComm::Space::Device, Score>(
+                // int32 wire: half the payload of the naive int64 scores —
+                // this allreduce is the mode's dominant cost (see STATUS).
+                comm_.allreduce<stComm::Space::Device, WireScore>(
                     d_scores_partial_.data(), d_scores_sum_.data(), M_global_,
                     stComm::ReduceOp::Sum);
             }
