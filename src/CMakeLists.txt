@@ -10,6 +10,8 @@ add_library(stPS STATIC
     # usc/ — greedy minimum set-cover algorithm
     usc/usc_patch_selector_impl.cu
     usc/brute_force.cpp
+    # io/ — patch file readers/writers (M7)
+    io/stps_binary.cpp
     # data/ — demo/test data generation + partitioning
     data/synthetic.cpp
     data/partition.cpp

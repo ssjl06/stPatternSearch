@@ -1,5 +1,6 @@
 #include <stPS/stPS.h>          // public library API (UscPatchSelector, partition, types)
 #include "data/synthetic.hpp"   // internal demo data generator (this exe only)
+#include "io/patch_reader.hpp"  // --input/--dump patch file support (M7)
 
 #include <stComm/stComm.h>
 
