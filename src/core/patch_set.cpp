@@ -81,7 +81,8 @@ inline int target_rank_for_hash(Hash h, const std::vector<Hash>& splitters) {
 
 }  // namespace
 
-PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches) {
+IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
+                                          std::vector<std::vector<Hash>> raw_patches) {
     const int size = comm.getSize();
     const int rank = comm.getRank();
 
@@ -90,7 +91,7 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     // each unique hash is routed to its owner rank, the owner assigns a
     // contiguous block of global IDs to its bucket, then each rank receives back
     // the IDs for the hashes it originally held. The hash partition is discarded;
-    // the resulting patch CSR + inverted index stay partitioned by patch ID.
+    // what survives is each patch translated into dense ElementId space.
 
     // Step 1: flatten + dedupe this rank's local hash set.
     std::vector<Hash> local_uniq;
@@ -158,7 +159,6 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     // Step 7: only the last rank knows N at this point; broadcast it.
     std::uint64_t N_total = (rank == size - 1) ? (global_id_start + local_shard_size) : 0;
     comm.bcast<stComm::Space::Host, std::uint64_t>(&N_total, 1, size - 1)->wait();
-    N_ = N_total;
 
     // Step 8: for every slot in recvbuf (arrival order, possibly with dupes),
     // produce the corresponding global ID. The reverse alltoallv expects responses
@@ -185,10 +185,12 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
 
     // Step 11: translate raw_patches into ID-space, sort + dedupe per patch. The
     // local patch index [0, M_local) is preserved in input order.
-    std::vector<std::vector<ElementId>> id_patches(raw_patches.size());
+    IdMappedPatches out;
+    out.N = N_total;
+    out.id_patches.resize(raw_patches.size());
     for (std::size_t p = 0; p < raw_patches.size(); ++p) {
         const auto& src = raw_patches[p];
-        auto& dst = id_patches[p];
+        auto& dst = out.id_patches[p];
         dst.resize(src.size());
         for (std::size_t i = 0; i < src.size(); ++i) {
             dst[i] = hash_to_id.at(src[i]);
@@ -196,8 +198,15 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
         std::sort(dst.begin(), dst.end());
         dst.erase(std::unique(dst.begin(), dst.end()), dst.end());
     }
+    return out;
+}
 
-    patches_ = build_patch_csr(id_patches);
+PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches) {
+    // Shared §5.1 hash → ID mapping, then the patch-partitioned structures:
+    // patch CSR + inverted index stay partitioned by patch ID.
+    IdMappedPatches mapped = map_hashes_to_element_ids(comm, std::move(raw_patches));
+    N_       = mapped.N;
+    patches_ = build_patch_csr(mapped.id_patches);
     inv_     = build_inverted_index(patches_, N_);
 
     // Mirror host state to device — consumed by the algorithm layers' kernels.
