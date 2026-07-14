@@ -58,6 +58,54 @@ TEST(PatchIo, RoundTrip) {
     }
 }
 
+TEST(PatchIo, RoundTripV1HasNoCoords) {
+    const auto patches = small_synthetic(19);
+    FileGuard g{rank_path("v1_nocoords")};
+    write_patch_file(g.path, patches);
+
+    auto reader = open_patch_file(g.path);
+    const PatchSlice all = reader->read_slice(0, patches.size());
+    EXPECT_TRUE(all.coords.empty());
+}
+
+TEST(PatchIo, RoundTripV2WithCoords) {
+    const auto patches = small_synthetic(23);
+    SyntheticParams p; p.seed = 23;
+    const auto coords = generate_synthetic_coords(p, patches);
+
+    FileGuard g{rank_path("v2_roundtrip")};
+    write_patch_file(g.path, patches, coords);
+
+    auto reader = open_patch_file(g.path);
+    ASSERT_EQ(reader->patch_count(), patches.size());
+
+    const PatchSlice all = reader->read_slice(0, patches.size());
+    ASSERT_EQ(all.patches.size(), patches.size());
+    ASSERT_EQ(all.coords.size(),  patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) {
+        EXPECT_EQ(all.patches[pi], patches[pi]) << "patch " << pi;
+        EXPECT_EQ(all.coords[pi],  coords[pi])  << "patch " << pi;
+    }
+
+    // Partial slices carry the matching coords window too.
+    const std::uint64_t mid = patches.size() / 2;
+    const PatchSlice back = reader->read_slice(mid, patches.size());
+    ASSERT_EQ(back.coords.size(), patches.size() - mid);
+    for (std::size_t pi = 0; pi < back.coords.size(); ++pi) {
+        EXPECT_EQ(back.coords[pi], coords[mid + pi]) << "patch " << (mid + pi);
+    }
+}
+
+TEST(PatchIo, RejectsCoordShapeMismatch) {
+    const auto patches = small_synthetic(29);
+    SyntheticParams p; p.seed = 29;
+    auto coords = generate_synthetic_coords(p, patches);
+    coords.back().pop_back();  // break shape
+
+    FileGuard g{rank_path("v2_shape")};
+    EXPECT_THROW(write_patch_file(g.path, patches, coords), std::runtime_error);
+}
+
 TEST(PatchIo, SliceMatchesRankSlicer) {
     const auto patches = small_synthetic(11);
     FileGuard g{rank_path("slices")};
@@ -76,6 +124,28 @@ TEST(PatchIo, SliceMatchesRankSlicer) {
             const PatchSlice ref = slice_patches_by_rank(patches, rank, size);
             EXPECT_EQ(got.patches,    ref.patches)    << "size=" << size << " rank=" << rank;
             EXPECT_EQ(got.global_ids, ref.global_ids) << "size=" << size << " rank=" << rank;
+        }
+    }
+}
+
+TEST(PatchIo, CoordSliceMatchesRankSlicer) {
+    const auto patches = small_synthetic(31);
+    SyntheticParams sp; sp.seed = 31;
+    const auto coords = generate_synthetic_coords(sp, patches);
+
+    FileGuard g{rank_path("v2_slices")};
+    write_patch_file(g.path, patches, coords);
+    auto reader = open_patch_file(g.path);
+    const std::uint64_t M = reader->patch_count();
+
+    for (int size : {1, 2, 3, 7}) {
+        for (int rank = 0; rank < size; ++rank) {
+            const std::uint64_t b = (M * static_cast<std::uint64_t>(rank))     / size;
+            const std::uint64_t e = (M * (static_cast<std::uint64_t>(rank)+1)) / size;
+            const PatchSlice got = reader->read_slice(b, e);
+            const PatchSlice ref = slice_patches_by_rank(patches, coords, rank, size);
+            EXPECT_EQ(got.patches, ref.patches) << "size=" << size << " rank=" << rank;
+            EXPECT_EQ(got.coords,  ref.coords)  << "size=" << size << " rank=" << rank;
         }
     }
 }
