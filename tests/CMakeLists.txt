@@ -4,6 +4,7 @@ add_executable(stps_tests
     test_csr.cpp
     test_inverted_index.cpp
     test_synthetic.cpp
+    test_patch_set.cpp
     test_brute_force.cpp
     test_solver_equivalence.cpp
     test_patch_io.cpp

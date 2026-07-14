@@ -184,9 +184,13 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     }
 
     // Step 11: translate raw_patches into ID-space, sort + dedupe per patch. The
-    // local patch index [0, M_local) is preserved in input order.
+    // local patch index [0, M_local) is preserved in input order. The bucket
+    // (this rank's element shard, sorted) survives as the ElementId → Hash
+    // reverse map: bucket[i] ↔ global ID (global_id_start + i) by Step 8.
     IdMappedPatches out;
-    out.N = N_total;
+    out.N            = N_total;
+    out.shard_hashes = std::move(bucket);
+    out.shard_start  = global_id_start;
     out.id_patches.resize(raw_patches.size());
     for (std::size_t p = 0; p < raw_patches.size(); ++p) {
         const auto& src = raw_patches[p];
@@ -205,9 +209,11 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     // Shared §5.1 hash → ID mapping, then the patch-partitioned structures:
     // patch CSR + inverted index stay partitioned by patch ID.
     IdMappedPatches mapped = map_hashes_to_element_ids(comm, std::move(raw_patches));
-    N_       = mapped.N;
-    patches_ = build_patch_csr(mapped.id_patches);
-    inv_     = build_inverted_index(patches_, N_);
+    N_            = mapped.N;
+    shard_hashes_ = std::move(mapped.shard_hashes);
+    shard_start_  = mapped.shard_start;
+    patches_      = build_patch_csr(mapped.id_patches);
+    inv_          = build_inverted_index(patches_, N_);
 
     // Mirror host state to device — consumed by the algorithm layers' kernels.
     const std::size_t patch_data_n = patches_.data.size();
