@@ -23,18 +23,22 @@ target_link_libraries(stps_tests PRIVATE
     GTest::gtest
 )
 
-include(GoogleTest)
 # Tests run with one MPI rank per visible GPU (NCCL requires 1:1 process:device
 # mapping). Override via -DSTPS_TEST_NRANKS=<n> at configure time when
 # you know the host has n GPUs; the default of 2 matches our reference dual-A100
 # setup. Single-component tests (bitset/csr/inv_index/...) ignore rank count;
-# the solver equivalence test exercises the distributed path.
+# the solver equivalence / patch-set / hash-stats tests exercise the
+# distributed path.
 set(STPS_TEST_NRANKS 2 CACHE STRING "MPI ranks for ctest (= visible GPUs)")
-# PRE_TEST defers test discovery from build time to the first ctest run: the
-# discovery step executes the test binary, which exits(2) on GPU-less hosts
-# (test_main guards num_gpus >= world size) — POST_BUILD discovery would make
-# `cmake --build` itself fail on such hosts (e.g. the CI compile-only runner).
-gtest_discover_tests(stps_tests
-    EXEC_WRAPPER ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${STPS_TEST_NRANKS} ${MPIEXEC_PREFLAGS}
-    DISCOVERY_MODE PRE_TEST
+
+# One ctest entry running the whole gtest suite under mpiexec. Deliberately NOT
+# gtest_discover_tests: its EXEC_WRAPPER "argument" does not exist (CMake
+# silently ignores unknown args), which had every test running single-process;
+# and discovery itself can't be wrapped — `--gtest_list_tests` under
+# `mpiexec -n 2` prints the list once per rank, corrupting the parse. One
+# mpiexec launch for the suite also beats one per test (MPI+NCCL bootstrap is
+# seconds per launch). gtest still reports per-test results in the output.
+add_test(NAME stps_tests
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${STPS_TEST_NRANKS}
+            ${MPIEXEC_PREFLAGS} $<TARGET_FILE:stps_tests>
 )
