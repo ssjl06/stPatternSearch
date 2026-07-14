@@ -33,21 +33,22 @@ struct CliOptions {
     std::uint64_t   output_limit = 100;
 };
 
-// Per-process GPU pick: rank-r uses GPU (r % visible_count) — same rule as
-// usc-patch-select. PatchSet setup is GPU-only (device mirrors), but the
-// stats path issues no device collectives, so no NCCL bootstrap: ranks may
-// share a GPU, and the plain host Comm below suffices. Switch to
-// Comm::onDevice once UPS grows device-side kernels that talk NCCL.
-void pick_device_for_rank(int rank) {
+// Per-process GPU pick: rank-r uses GPU (r % visible_count). Sets the active
+// device for this rank's own CUDA allocations and returns the device id to hand
+// to Comm::onDevice (which bootstraps NCCL on it) — same rule as
+// usc-patch-select. The pipeline is device-direct: kernels + NCCL alltoallv.
+int pick_device_for_rank(int rank) {
     int num_gpus = 0;
     cudaError_t err = cudaGetDeviceCount(&num_gpus);
     if (err != cudaSuccess || num_gpus <= 0) {
         std::fprintf(stderr,
-            "rank %d: no CUDA device available (%s). PatchSet setup is GPU-only.\n",
+            "rank %d: no CUDA device available (%s). UPS is GPU-only.\n",
             rank, cudaGetErrorString(err));
         std::exit(2);
     }
-    cudaSetDevice(rank % num_gpus);
+    const int device_id = rank % num_gpus;
+    cudaSetDevice(device_id);
+    return device_id;
 }
 
 void print_usage(const char* prog) {
@@ -147,8 +148,10 @@ int main(int argc, char** argv) {
             }
         }
         else {
-            stComm::Comm comm;                       // host collectives only (see above)
-            pick_device_for_rank(comm.getRank());    // device mirrors still need a GPU
+            const int rank = stComm::Comm{}.getRank();      // host probe for device pick
+            const int device_id = pick_device_for_rank(rank);
+            // onDevice bootstraps NCCL internally (uniqueId handshake + init).
+            stComm::Comm comm = stComm::Comm::onDevice(device_id);
 
             auto slice = !opt.input.empty()
                 ? read_input_slice(opt.input, comm.getRank(), comm.getSize())

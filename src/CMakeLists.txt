@@ -11,7 +11,7 @@ add_library(stPS STATIC
     usc/usc_patch_selector_impl.cu
     usc/brute_force.cpp
     # ups/ — pattern statistics (hash counts + representative locations)
-    ups/ups_pattern_stats.cpp
+    ups/ups_pattern_stats.cu
     ups/stats_file.cpp
     # io/ — patch file readers/writers (M7)
     io/stps_binary.cpp
