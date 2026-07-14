@@ -5,8 +5,8 @@
 # bootstraps the environment with scripts/setup-env.sh — the same script
 # developers use — so the script itself stays regression-tested.
 #
-# The real correctness matrix (36 ctest cases, 1 MPI rank per GPU) needs
-# GPUs: register a self-hosted runner with 2+ NVIDIA GPUs and labels
+# The real correctness matrix (the gtest suite under mpiexec, 1 MPI rank
+# per GPU) needs GPUs: register a self-hosted runner with 2+ NVIDIA GPUs and labels
 # [self-hosted, gpu], then set the repository variable HAS_GPU_RUNNER=true
 # (Settings → Secrets and variables → Actions → Variables) to enable the
 # `gpu-test` job. Until then it shows as skipped.
