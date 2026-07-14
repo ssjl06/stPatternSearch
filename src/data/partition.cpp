@@ -1,5 +1,6 @@
 #include <stPS/partition.hpp>
 
+#include <cassert>
 #include <cstdint>
 #include <utility>
 
@@ -19,6 +20,22 @@ PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
     for (std::uint64_t p = my_begin; p < my_end; ++p) {
         slice.patches.push_back(std::move(all_patches[p]));
         slice.global_ids.push_back(static_cast<PatchId>(p));
+    }
+    return slice;
+}
+
+PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
+                                 std::vector<std::vector<Point>> coords,
+                                 int rank, int size) {
+    assert(coords.size() == all_patches.size());
+    const std::uint64_t my_begin =
+        (all_patches.size() * static_cast<std::uint64_t>(rank)) /
+        static_cast<std::uint64_t>(size);
+
+    PatchSlice slice = slice_patches_by_rank(std::move(all_patches), rank, size);
+    slice.coords.reserve(slice.patches.size());
+    for (std::uint64_t p = 0; p < slice.patches.size(); ++p) {
+        slice.coords.push_back(std::move(coords[my_begin + p]));
     }
     return slice;
 }

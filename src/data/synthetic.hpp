@@ -28,4 +28,12 @@ struct SyntheticParams {
 // converted to IDs). Patch sizes vary mildly around K_mean.
 std::vector<std::vector<Hash>> generate_synthetic(const SyntheticParams& p);
 
+// Deterministic per-occurrence coordinates for a generated patch set: the
+// result mirrors `patches` shape (coords[p][i] belongs to patches[p][i]),
+// derived from p.seed only — same params + patches always give the same
+// coordinates. Kept separate from generate_synthetic so the USC path (which
+// has no use for locations) stays untouched.
+std::vector<std::vector<Point>> generate_synthetic_coords(
+    const SyntheticParams& p, const std::vector<std::vector<Hash>>& patches);
+
 }  // namespace stPS

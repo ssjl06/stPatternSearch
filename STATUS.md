@@ -1,4 +1,4 @@
-# stPatternSearch — Status (as of M6 completion, 2026-07-06)
+# stPatternSearch — Status (as of UPS-1 completion, 2026-07-14)
 
 ## Project
 
@@ -21,6 +21,7 @@ covers every unique hash. Design rationale lives in [`greedy_set_cover.md`](gree
 | M6.5 | Device-resident ByElement loop (Full-GPU iteration track) | ✅ Done | `device-resident-loop` |
 | M7a | Patch-file io infra (`PatchReader` + `.stps` + `--input`/`--dump`) | ✅ Done | `m7-io-infra` |
 | M7b | Real OPC format reader + 2D partition (§7.4) | ⏳ Blocked on the OPC team's format spec | |
+| UPS-1 | Hash statistics (global top-K counts + representative locations, `.stps` v2 coords) | ✅ Done | `ups-hash-stats` |
 
 > **Next-work note (2026-05-29):** the per-iteration hot loop is **latency/
 > launch-bound, not compute-bound** (argmax ≈ 20 µs flat across a 5× M range).
@@ -221,6 +222,38 @@ Bit-identical at all scales and both sizes; 36/36 ctest.
 `-DUSC_PROFILE` stage timers are absent from this loop by design — no
 per-iteration syncs means no host-visible stage boundaries; profile with
 Nsight Systems.
+
+## UPS-1 — hash statistics (2026-07-14)
+
+First UPS component: `ups-hash-stats` reports, for the global top-K hashes
+(count desc, hash asc), how many patches contain each hash and its
+**representative location** — the lexicographic-min (x, then y) coordinate over
+every occurrence on any rank. Occurrence coordinates arrive via the new
+`.stps` v2 format (`STPSPAT2` — v1 layout + a coords section indexed by the
+same CSR offsets) or `generate_synthetic_coords`; v1 inputs are rejected since
+UPS needs locations.
+
+Mechanics worth remembering:
+
+- **Global ID order == global hash order** (§5.1 splitters assign hash ranges
+  to ranks in order; shards are internally sorted). Two consequences UPS rides
+  on: a rank's hash-sorted local minima pair *positionally* with its sorted
+  `inv.keys`, and `PatchSet::shard_hashes()` (the retained §5.1 bucket) is the
+  ElementId → Hash reverse map — no extra tables or traffic.
+- Reduction: local inverted-index degrees + per-hash min locations routed to
+  each element's shard owner (host alltoallv), owner sums counts / mins
+  locations, per-shard top-K candidates allgathered and re-reduced identically
+  on every rank (exact: a global winner is always its owner's local winner).
+- Stats file: fixed-width 90 B records → every byte offset is a pure function
+  of the line index, so **all ranks pwrite disjoint ranges of one text file in
+  parallel** with zero comm; rank 0 truncates stale bytes after a barrier.
+  Assumes a POSIX-coherent shared filesystem (local disk, Lustre, GPFS).
+- The stats path has **no device collectives** — the driver uses a plain host
+  `Comm` (no NCCL bootstrap), so ranks may share a GPU (device mirrors only).
+  Switch to `Comm::onDevice` when UPS grows device kernels.
+
+Verified: stats file byte-identical across `-np 1/2/4` on the same data;
+`--dump` → `--input` reproduces the synthetic-path output exactly; 46/46 ctest.
 
 ## Key design decisions (recorded for future maintainers)
 

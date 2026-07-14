@@ -9,30 +9,37 @@
 #include <string>
 #include <vector>
 
-// stPS v1 binary patch file (.stps) — CSR on disk, little-endian:
+// stPS binary patch file (.stps) — CSR on disk, little-endian:
 //
 //   header (32 B):
-//     magic     8 B   "STPSPAT1"
+//     magic     8 B   "STPSPAT1" (v1) or "STPSPAT2" (v2)
 //     M         8 B   uint64 patch count
 //     total_K   8 B   uint64 total hash count (== offsets[M])
 //     reserved  8 B   0 (future flags/version bumps)
 //   offsets     (M+1) × 8 B uint64   patch p's hashes = hashes[offsets[p] .. offsets[p+1])
 //   hashes      total_K × 8 B uint64 raw hash values, patches concatenated in order
+//   coords      total_K × 16 B (x,y double)   v2 only: coords[j] is where
+//                                             occurrence hashes[j] sits (same
+//                                             CSR offsets index both sections)
 //
 // The layout deliberately mirrors the in-memory PatchCsr (design doc §3): a
 // rank reading patches [begin, end) seeks to its offsets window, then to its
-// hash window — two contiguous reads, no scan of the rest of the file. That
-// keeps multi-rank setup I/O proportional to each rank's own share (M7 goal),
-// with plain fseek/fread and no MPI-IO dependency.
+// hash window (and, for v2, its coords window) — contiguous reads only, no
+// scan of the rest of the file. That keeps multi-rank setup I/O proportional
+// to each rank's own share (M7 goal), with plain fseek/fread and no MPI-IO
+// dependency.
 //
 // Hashes are stored exactly as produced (duplicates within a patch allowed);
-// PatchSet's setup dedupes per patch, same as the synthetic path.
+// PatchSet's setup dedupes per patch, same as the synthetic path. v1 files
+// carry no locations — read_slice returns empty coords and location-consuming
+// callers (UPS) reject the input with a clear error.
 
 namespace stPS {
 
 namespace {
 
-constexpr char        kMagic[8]    = {'S','T','P','S','P','A','T','1'};
+constexpr char        kMagicV1[8]  = {'S','T','P','S','P','A','T','1'};
+constexpr char        kMagicV2[8]  = {'S','T','P','S','P','A','T','2'};
 constexpr std::size_t kHeaderBytes = 32;
 
 // RAII FILE* so every throw path closes the handle.
@@ -69,9 +76,9 @@ public:
         std::uint64_t header[3];  // M, total_K, reserved
         seek_to(file_.get(), 0, path_);
         read_exact(file_.get(), magic, sizeof(magic), path_);
-        if (std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) {
-            fail(path_, "bad magic (not a .stps patch file)");
-        }
+        if      (std::memcmp(magic, kMagicV1, sizeof(kMagicV1)) == 0) has_coords_ = false;
+        else if (std::memcmp(magic, kMagicV2, sizeof(kMagicV2)) == 0) has_coords_ = true;
+        else fail(path_, "bad magic (not a .stps patch file)");
         read_exact(file_.get(), header, sizeof(header), path_);
         M_       = header[0];
         total_K_ = header[1];
@@ -82,7 +89,8 @@ public:
         if (fseeko(file_.get(), 0, SEEK_END) != 0) fail(path_, "seek failed");
         const std::uint64_t file_bytes = static_cast<std::uint64_t>(ftello(file_.get()));
         const std::uint64_t want =
-            kHeaderBytes + (M_ + 1) * 8 + total_K_ * 8;
+            kHeaderBytes + (M_ + 1) * 8 + total_K_ * 8 +
+            (has_coords_ ? total_K_ * 16 : 0);
         if (file_bytes != want) {
             fail(path_, "size mismatch: header declares " + std::to_string(want) +
                         " bytes, file has " + std::to_string(file_bytes));
@@ -113,14 +121,27 @@ public:
         seek_to(file_.get(), hash_base + offs[0] * 8, path_);
         read_exact(file_.get(), flat.data(), flat.size() * 8, path_);
 
+        // v2: same window into the coords section (indexed by the same offsets).
+        std::vector<Point> flat_coords;
+        if (has_coords_) {
+            const std::uint64_t coord_base = hash_base + total_K_ * 8;
+            flat_coords.resize(flat.size());
+            seek_to(file_.get(), coord_base + offs[0] * 16, path_);
+            read_exact(file_.get(), flat_coords.data(), flat_coords.size() * 16, path_);
+        }
+
         PatchSlice slice;
         slice.patches.reserve(n);
         slice.global_ids.reserve(n);
+        if (has_coords_) slice.coords.reserve(n);
         for (std::uint64_t p = 0; p < n; ++p) {
             const std::uint64_t b = offs[p] - offs[0];
             const std::uint64_t e = offs[p + 1] - offs[0];
             slice.patches.emplace_back(flat.begin() + b, flat.begin() + e);
             slice.global_ids.push_back(static_cast<PatchId>(begin + p));
+            if (has_coords_) {
+                slice.coords.emplace_back(flat_coords.begin() + b, flat_coords.begin() + e);
+            }
         }
         return slice;
     }
@@ -128,8 +149,9 @@ public:
 private:
     FilePtr       file_;
     std::string   path_;
-    std::uint64_t M_       = 0;
-    std::uint64_t total_K_ = 0;
+    std::uint64_t M_          = 0;
+    std::uint64_t total_K_    = 0;
+    bool          has_coords_ = false;
 };
 
 }  // namespace
@@ -142,8 +164,14 @@ std::unique_ptr<PatchReader> open_patch_file(const std::string& path) {
     return std::make_unique<StpsBinaryReader>(std::move(f), path);
 }
 
-void write_patch_file(const std::string& path,
-                      const std::vector<std::vector<Hash>>& patches) {
+namespace {
+
+// Shared v1/v2 writer body: `coords` null → v1, non-null → v2 (must mirror
+// `patches` shape).
+void write_patch_file_impl(const std::string& path,
+                           const std::vector<std::vector<Hash>>& patches,
+                           const std::vector<std::vector<Point>>* coords) {
+    static_assert(sizeof(Point) == 16, "Point must serialize as two packed doubles");
     const std::uint64_t M = patches.size();
     std::vector<std::uint64_t> offsets(M + 1, 0);
     for (std::uint64_t p = 0; p < M; ++p) {
@@ -151,17 +179,44 @@ void write_patch_file(const std::string& path,
     }
     const std::uint64_t total_K = offsets[M];
 
+    if (coords) {
+        if (coords->size() != M) fail(path, "coords/patches shape mismatch");
+        for (std::uint64_t p = 0; p < M; ++p) {
+            if ((*coords)[p].size() != patches[p].size()) {
+                fail(path, "coords/patches shape mismatch at patch " + std::to_string(p));
+            }
+        }
+    }
+
     FilePtr f(std::fopen(path.c_str(), "wb"));
     if (!f) fail(path, "cannot create: " + std::string(std::strerror(errno)));
 
-    write_exact(f.get(), kMagic, sizeof(kMagic), path);
+    write_exact(f.get(), coords ? kMagicV2 : kMagicV1, 8, path);
     const std::uint64_t header[3] = {M, total_K, 0};
     write_exact(f.get(), header, sizeof(header), path);
     write_exact(f.get(), offsets.data(), offsets.size() * 8, path);
     for (const auto& p : patches) {
         write_exact(f.get(), p.data(), p.size() * 8, path);
     }
+    if (coords) {
+        for (const auto& c : *coords) {
+            write_exact(f.get(), c.data(), c.size() * 16, path);
+        }
+    }
     if (std::fflush(f.get()) != 0) fail(path, "flush failed");
+}
+
+}  // namespace
+
+void write_patch_file(const std::string& path,
+                      const std::vector<std::vector<Hash>>& patches) {
+    write_patch_file_impl(path, patches, nullptr);
+}
+
+void write_patch_file(const std::string& path,
+                      const std::vector<std::vector<Hash>>& patches,
+                      const std::vector<std::vector<Point>>& coords) {
+    write_patch_file_impl(path, patches, &coords);
 }
 
 }  // namespace stPS

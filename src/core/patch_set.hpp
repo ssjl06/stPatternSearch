@@ -23,6 +23,15 @@ namespace stPS {
 struct IdMappedPatches {
     std::vector<std::vector<ElementId>> id_patches;
     std::uint64_t                       N = 0;
+
+    // This rank's element shard from the temporary hash partition (§5.1 steps
+    // 5–6), kept as the ElementId → Hash reverse map: shard_hashes[i] is the
+    // original hash of global ID (shard_start + i), sorted ascending. Shards
+    // are contiguous and ordered by rank: rank r owns
+    // [shard_start_r, shard_start_r + shard_hashes_r.size()). O(unique/size)
+    // per rank — consumers that report hashes (UPS stats) read it back here.
+    std::vector<Hash> shard_hashes;
+    std::uint64_t     shard_start = 0;
 };
 
 // Collective: distributed sample-sort hash → ID mapping (§5.1 steps 1–11).
@@ -55,6 +64,12 @@ public:
     const PatchCsr&      patches() const noexcept { return patches_; }
     const InvertedIndex& inverted_index() const noexcept { return inv_; }
 
+    // ElementId → Hash reverse map for this rank's element shard (see
+    // IdMappedPatches::shard_hashes): shard_hashes()[i] is the hash of global
+    // ID (shard_start() + i). Shards are contiguous and rank-ordered.
+    const std::vector<Hash>& shard_hashes() const noexcept { return shard_hashes_; }
+    std::uint64_t            shard_start()  const noexcept { return shard_start_; }
+
     // Device mirrors (populated at construction) — raw const pointers for kernels.
     const ElementId*     d_patch_data()    const noexcept { return d_patch_data_.data(); }
     const std::uint64_t* d_patch_offsets() const noexcept { return d_patch_offsets_.data(); }
@@ -66,6 +81,9 @@ private:
     PatchCsr      patches_;
     InvertedIndex inv_;
     std::uint64_t N_ = 0;
+
+    std::vector<Hash> shard_hashes_;
+    std::uint64_t     shard_start_ = 0;
 
     DeviceBuffer<ElementId>     d_patch_data_;
     DeviceBuffer<std::uint64_t> d_patch_offsets_;

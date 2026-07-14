@@ -70,4 +70,22 @@ std::vector<std::vector<Hash>> generate_synthetic(const SyntheticParams& p) {
     return patches;
 }
 
+std::vector<std::vector<Point>> generate_synthetic_coords(
+    const SyntheticParams& p, const std::vector<std::vector<Hash>>& patches) {
+    // Independent RNG stream (seed offset) so coordinates don't perturb — and
+    // aren't perturbed by — the hash sampling above. Uniform over a synthetic
+    // 1mm × 1mm die in nm units; occurrences of the same hash land at
+    // different spots, exercising the representative-location (lexicographic
+    // min) reduction.
+    std::mt19937_64 rng(p.seed ^ 0xC0A2D5EEDULL);  // "coord seed" stream offset
+    std::uniform_real_distribution<double> pos(0.0, 1.0e6);
+
+    std::vector<std::vector<Point>> coords(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) {
+        coords[pi].resize(patches[pi].size());
+        for (auto& pt : coords[pi]) pt = Point{pos(rng), pos(rng)};
+    }
+    return coords;
+}
+
 }  // namespace stPS

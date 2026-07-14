@@ -41,4 +41,10 @@ std::unique_ptr<PatchReader> open_patch_file(const std::string& path);
 void write_patch_file(const std::string& path,
                       const std::vector<std::vector<Hash>>& patches);
 
+// v2: same, plus per-occurrence coordinates (coords must mirror `patches`
+// shape; read_slice hands them back in PatchSlice::coords).
+void write_patch_file(const std::string& path,
+                      const std::vector<std::vector<Hash>>& patches,
+                      const std::vector<std::vector<Point>>& coords);
+
 }  // namespace stPS

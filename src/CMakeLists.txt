@@ -10,6 +10,8 @@ add_library(stPS STATIC
     # usc/ — greedy minimum set-cover algorithm
     usc/usc_patch_selector_impl.cu
     usc/brute_force.cpp
+    # ups/ — pattern statistics (hash counts + representative locations)
+    ups/hash_stats.cpp
     # io/ — patch file readers/writers (M7)
     io/stps_binary.cpp
     # data/ — demo/test data generation + partitioning
@@ -66,3 +68,9 @@ install(TARGETS stPS
 add_executable(usc-patch-select usc/main.cpp)
 target_include_directories(usc-patch-select PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(usc-patch-select PRIVATE stPS)
+
+# UPS driver: top-K hash statistics (count + representative location) over the
+# shared PatchSet setup, written to a single file by all ranks in parallel.
+add_executable(ups-hash-stats ups/main.cpp)
+target_include_directories(ups-hash-stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ups-hash-stats PRIVATE stPS)

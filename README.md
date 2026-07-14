@@ -59,6 +59,12 @@ mpirun -n 4 --oversubscribe ./build/src/usc-patch-select \
 # it back — each rank reads only its own slice; results are bit-identical.
 ./build/src/usc-patch-select --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42 --dump patches.stps
 mpirun -n 2 ./build/src/usc-patch-select --input patches.stps
+
+# UPS hash statistics: top-K hashes by patch count, with each hash's
+# representative (lexicographic-min) location, written to one text file by all
+# ranks in parallel. --dump here emits .stps v2 (with per-occurrence coords).
+mpirun -n 2 ./build/src/ups-hash-stats --N 10000 --M 1000 --K 50 \
+    --output stats.txt --output-limit 100
 ```
 
 `build.sh` configures + builds against stComm and prints the artifact paths;
