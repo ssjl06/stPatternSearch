@@ -8,6 +8,7 @@ add_executable(stps_tests
     test_brute_force.cpp
     test_solver_equivalence.cpp
     test_patch_io.cpp
+    test_hash_stats.cpp
     helpers/local_setup.cpp
 )
 # test_main.cpp uses cuda_runtime + NCCL via test_nccl_env.hpp.
