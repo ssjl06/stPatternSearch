@@ -1,19 +1,16 @@
-#include "ups/hash_stats.hpp"
+#include <stPS/ups_pattern_stats.hpp>
+
+#include "core/patch_set.hpp"
 
 #include <stComm/stComm.h>
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cassert>
-#include <cerrno>
-#include <cstdio>
-#include <cstring>
+#include <cstdint>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace stPS {
@@ -22,25 +19,19 @@ namespace {
 
 // Ordering for statistics output: most patches first, then smaller hash —
 // deterministic across ranks so every rank derives the identical top-k list.
-bool stat_before(const HashStat& a, const HashStat& b) {
+bool stat_before(const PatternStat& a, const PatternStat& b) {
     return a.count != b.count ? a.count > b.count : a.hash < b.hash;
 }
 
-[[noreturn]] void fail_io(const std::string& path, const std::string& what) {
-    throw std::runtime_error("ups-stats: " + path + ": " + what +
-                             ": " + std::strerror(errno));
-}
-
-}  // namespace
-
+// Local pre-pass (no comm): collapse this rank's occurrences to one
+// lexicographic-min location per unique hash, sorted by hash. Runs BEFORE the
+// PatchSet consumes `patches`; pattern_stats relies on this hash-sorted order
+// aligning 1:1 with the PatchSet's inverted-index keys.
 std::vector<std::pair<Hash, Point>> local_min_locations(
     const std::vector<std::vector<Hash>>& patches,
     const std::vector<std::vector<Point>>& coords) {
-    assert(coords.size() == patches.size());
-
     std::unordered_map<Hash, Point> best;
     for (std::size_t p = 0; p < patches.size(); ++p) {
-        assert(coords[p].size() == patches[p].size());
         for (std::size_t i = 0; i < patches[p].size(); ++i) {
             auto [it, inserted] = best.emplace(patches[p][i], coords[p][i]);
             if (!inserted && coords[p][i] < it->second) it->second = coords[p][i];
@@ -53,9 +44,12 @@ std::vector<std::pair<Hash, Point>> local_min_locations(
     return out;
 }
 
-std::vector<HashStat> global_top_k(stComm::Comm& comm, const PatchSet& ps,
-                                   const std::vector<std::pair<Hash, Point>>& minloc,
-                                   std::uint64_t k) {
+// Collective: global top-k pattern statistics (count desc, hash asc),
+// identical on every rank. `minloc` is this rank's local_min_locations result
+// for the same patches the PatchSet was built from.
+std::vector<PatternStat> global_top_k(stComm::Comm& comm, const PatchSet& ps,
+                                      const std::vector<std::pair<Hash, Point>>& minloc,
+                                      std::uint64_t k) {
     const int size = comm.getSize();
     const int rank = comm.getRank();
     const InvertedIndex& inv = ps.inverted_index();
@@ -66,9 +60,8 @@ std::vector<HashStat> global_top_k(stComm::Comm& comm, const PatchSet& ps,
     const std::size_t n_local = inv.keys.size();
     if (minloc.size() != n_local) {
         throw std::invalid_argument(
-            "global_top_k: minloc/inverted-index size mismatch (" +
-            std::to_string(minloc.size()) + " vs " + std::to_string(n_local) +
-            ") — was local_min_locations run on the same patches?");
+            "pattern_stats: minloc/inverted-index size mismatch (" +
+            std::to_string(minloc.size()) + " vs " + std::to_string(n_local) + ")");
     }
 
     // Owner boundaries: rank r owns IDs [starts[r], starts[r+1]).
@@ -128,7 +121,7 @@ std::vector<HashStat> global_top_k(stComm::Comm& comm, const PatchSet& ps,
     // the lexicographic-min location. shard_hashes maps slot → original hash.
     const std::vector<Hash>& shard = ps.shard_hashes();
     const std::uint64_t shard_start = ps.shard_start();
-    std::vector<HashStat> stats(shard.size());
+    std::vector<PatternStat> stats(shard.size());
     for (std::size_t i = 0; i < shard.size(); ++i) {
         stats[i].hash = shard[i];
         stats[i].rep  = Point{0.0, 0.0};
@@ -136,7 +129,6 @@ std::vector<HashStat> global_top_k(stComm::Comm& comm, const PatchSet& ps,
     std::vector<bool> seen(shard.size(), false);
     for (std::size_t j = 0; j < total_recv; ++j) {
         const std::size_t slot = static_cast<std::size_t>(recv_ids[j] - shard_start);
-        assert(slot < shard.size());
         stats[slot].count += recv_deg[j];
         const Point pt{recv_x[j], recv_y[j]};
         if (!seen[slot] || pt < stats[slot].rep) { stats[slot].rep = pt; seen[slot] = true; }
@@ -180,9 +172,9 @@ std::vector<HashStat> global_top_k(stComm::Comm& comm, const PatchSet& ps,
     comm.allgatherv<stComm::Space::Host, double>(c_y.data(), n_cand,
                                    all_y.data(), cand_counts.data())->wait();
 
-    std::vector<HashStat> merged(total_cand);
+    std::vector<PatternStat> merged(total_cand);
     for (std::size_t i = 0; i < total_cand; ++i) {
-        merged[i] = HashStat{all_hash[i], all_cnt[i], Point{all_x[i], all_y[i]}};
+        merged[i] = PatternStat{all_hash[i], all_cnt[i], Point{all_x[i], all_y[i]}};
     }
     const std::size_t k_global = std::min<std::size_t>(k, merged.size());
     std::partial_sort(merged.begin(), merged.begin() + k_global, merged.end(), stat_before);
@@ -190,70 +182,38 @@ std::vector<HashStat> global_top_k(stComm::Comm& comm, const PatchSet& ps,
     return merged;
 }
 
-void write_stats_file(stComm::Comm& comm, const std::string& path,
-                      const std::vector<HashStat>& topk) {
-    const int size = comm.getSize();
-    const int rank = comm.getRank();
+}  // namespace
 
-    // Fixed-width records: every offset is a pure function of the line index,
-    // so ranks write disjoint byte ranges with no coordination. %.17e
-    // round-trips doubles exactly; width 25 covers sign + 3-digit exponent.
-    //   hash 16-hex TAB count 20 TAB x 25 TAB y 25 NL = 90 bytes
-    constexpr std::size_t kLineBytes = 90;
-    constexpr const char* kLineFmt   = "%016lx\t%20lu\t%25.17e\t%25.17e\n";
+struct UpsPatternStats::Impl {
+    stComm::Comm& comm;
+};
 
-    // The header uses only values every rank already agrees on, so its length
-    // — and with it every line offset — is known everywhere without comm.
-    char header[128];
-    const int header_len = std::snprintf(header, sizeof(header),
-        "# ups-hash-stats k=%zu ranks=%d (hash, patch count, rep x, rep y)\n",
-        topk.size(), size);
-    if (header_len <= 0) throw std::runtime_error("ups-stats: header format failed");
+UpsPatternStats::UpsPatternStats(stComm::Comm& comm)
+    : impl_(std::make_unique<Impl>(Impl{comm})) {}
 
-    // This rank's contiguous line range (same split rule as patches-by-rank).
-    const std::uint64_t k = topk.size();
-    const std::uint64_t begin = (k * static_cast<std::uint64_t>(rank))     / size;
-    const std::uint64_t end   = (k * (static_cast<std::uint64_t>(rank)+1)) / size;
+UpsPatternStats::~UpsPatternStats()                                      = default;
+UpsPatternStats::UpsPatternStats(UpsPatternStats&&) noexcept             = default;
+UpsPatternStats& UpsPatternStats::operator=(UpsPatternStats&&) noexcept = default;
 
-    std::string buf;
-    buf.reserve((end - begin) * kLineBytes + (rank == 0 ? header_len : 0));
-    if (rank == 0) buf.append(header, static_cast<std::size_t>(header_len));
-    for (std::uint64_t i = begin; i < end; ++i) {
-        char line[kLineBytes + 1];
-        const int len = std::snprintf(line, sizeof(line), kLineFmt,
-                                      static_cast<unsigned long>(topk[i].hash),
-                                      static_cast<unsigned long>(topk[i].count),
-                                      topk[i].rep.x, topk[i].rep.y);
-        if (len != static_cast<int>(kLineBytes)) {
-            throw std::runtime_error("ups-stats: fixed-width line overflow");
+std::vector<PatternStat> UpsPatternStats::pattern_stats(
+    std::vector<std::vector<Hash>>  patches,
+    std::vector<std::vector<Point>> coords,
+    std::uint64_t k) {
+    if (coords.size() != patches.size()) {
+        throw std::invalid_argument("pattern_stats: coords/patches shape mismatch");
+    }
+    for (std::size_t p = 0; p < patches.size(); ++p) {
+        if (coords[p].size() != patches[p].size()) {
+            throw std::invalid_argument(
+                "pattern_stats: coords/patches shape mismatch at patch " +
+                std::to_string(p));
         }
-        buf.append(line, kLineBytes);
     }
 
-    // Parallel single-file write; assumes a POSIX-coherent shared filesystem
-    // (local disk, Lustre, GPFS — the usual cluster cases).
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0644);
-    if (fd < 0) fail_io(path, "cannot open");
-    const off_t my_off = (rank == 0)
-        ? 0
-        : static_cast<off_t>(header_len) + static_cast<off_t>(begin * kLineBytes);
-    for (std::size_t done = 0; done < buf.size();) {
-        const ssize_t w = ::pwrite(fd, buf.data() + done, buf.size() - done,
-                                   my_off + static_cast<off_t>(done));
-        if (w < 0) { ::close(fd); fail_io(path, "pwrite failed"); }
-        done += static_cast<std::size_t>(w);
-    }
-
-    // A stale, longer file from a previous run would leave garbage past our
-    // records — once everyone has written, rank 0 cuts to the exact size.
-    comm.barrier();
-    if (rank == 0) {
-        const off_t total = static_cast<off_t>(header_len) +
-                            static_cast<off_t>(k * kLineBytes);
-        if (::ftruncate(fd, total) != 0) { ::close(fd); fail_io(path, "ftruncate failed"); }
-    }
-    ::close(fd);
-    comm.barrier();  // no rank returns before the file is complete
+    // Collapse occurrences before the PatchSet consumes the patches.
+    const auto minloc = local_min_locations(patches, coords);
+    PatchSet ps(impl_->comm, std::move(patches));
+    return global_top_k(impl_->comm, ps, minloc, k);
 }
 
 }  // namespace stPS

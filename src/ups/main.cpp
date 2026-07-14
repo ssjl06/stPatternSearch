@@ -1,14 +1,12 @@
-// ups-hash-stats — distributed hash statistics over a PatchSet (UPS milestone
-// 1): for every hash, how many patches contain it and where its representative
+// ups-pattern-stats — distributed pattern statistics over a hashed patch set:
+// for every hash, how many patches contain it and where its representative
 // occurrence sits (lexicographic-min (x,y)); the global top K land in a single
-// text file that all ranks write in parallel.
+// text file that all ranks write in parallel. Drives the public
+// stPS::UpsPatternStats API, same as usc-patch-select drives UscPatchSelector.
 
-#include "core/patch_set.hpp"    // internal: PatchSet (shared §5.1 setup)
-#include "ups/hash_stats.hpp"    // internal: global_top_k / write_stats_file
+#include <stPS/stPS.h>           // public library API (UpsPatternStats, partition, types)
 #include "data/synthetic.hpp"    // internal demo data generator (this exe only)
 #include "io/patch_reader.hpp"   // --input/--dump patch file support
-
-#include <stPS/stPS.h>
 #include <stComm/stComm.h>
 
 #include <cuda_runtime.h>
@@ -162,17 +160,18 @@ int main(int argc, char** argv) {
                   }();
 
             auto t0 = std::chrono::steady_clock::now();
-            // Collapse occurrences before PatchSet consumes the patches.
-            const auto minloc = stPS::local_min_locations(slice.patches, slice.coords);
-            stPS::PatchSet ps(comm, std::move(slice.patches));
-            const auto topk = stPS::global_top_k(comm, ps, minloc, opt.output_limit);
-            stPS::write_stats_file(comm, opt.output, topk);
+            // The whole library API: build a UpsPatternStats on the comm, hand
+            // it this rank's patches + occurrence coords, get the top-K back.
+            stPS::UpsPatternStats ups(comm);
+            const auto topk = ups.pattern_stats(std::move(slice.patches),
+                                                std::move(slice.coords),
+                                                opt.output_limit);
+            stPS::write_pattern_stats_file(comm, opt.output, topk);
             auto t1 = std::chrono::steady_clock::now();
 
             if (comm.getRank() == 0) {
-                std::cout << "UPS hash-stats\n"
+                std::cout << "UPS pattern-stats\n"
                           << "  ranks=" << comm.getSize()
-                          << " unique_hashes=" << ps.N()
                           << " reported=" << topk.size()
                           << " (limit=" << opt.output_limit << ")\n"
                           << "  output: " << opt.output << "\n"
