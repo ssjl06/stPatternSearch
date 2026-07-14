@@ -1,4 +1,4 @@
-# stPatternSearch — Status (as of UPS-1 completion, 2026-07-14)
+# stPatternSearch — Status (as of UPS-2 completion, 2026-07-14)
 
 ## Project
 
@@ -22,6 +22,7 @@ covers every unique hash. Design rationale lives in [`greedy_set_cover.md`](gree
 | M7a | Patch-file io infra (`PatchReader` + `.stps` + `--input`/`--dump`) | ✅ Done | `m7-io-infra` |
 | M7b | Real OPC format reader + 2D partition (§7.4) | ⏳ Blocked on the OPC team's format spec | |
 | UPS-1 | Hash statistics (global top-K counts + representative locations, `.stps` v2 coords) | ✅ Done | `ups-hash-stats` |
+| UPS-2 | Public API (`UpsPatternStats`) + device-direct GPU pipeline (CUB + NCCL alltoallv) | ✅ Done (multi-rank NCCL pending reference-box run) | `ups2-pattern-stats` |
 
 > **Next-work note (2026-05-29):** the per-iteration hot loop is **latency/
 > launch-bound, not compute-bound** (argmax ≈ 20 µs flat across a 5× M range).
@@ -254,6 +255,36 @@ Mechanics worth remembering:
 
 Verified: stats file byte-identical across `-np 1/2/4` on the same data;
 `--dump` → `--input` reproduces the synthetic-path output exactly; 46/46 ctest.
+
+## UPS-2 — public API + device-direct pipeline (2026-07-14)
+
+UPS graduated to a first-class library component and went device-direct:
+
+- **Public API**: `<stPS/ups_pattern_stats.hpp>` — `PatternStat`, pImpl'd
+  `UpsPatternStats::pattern_stats(patches, coords, k)` (collective; identical
+  top-k on every rank), `write_pattern_stats_file` (the parallel single-file
+  writer). Executable renamed `ups-hash-stats` → `ups-pattern-stats`; the
+  driver consumes only the public API, mirroring usc-patch-select.
+- **GPU pipeline** (ups/ups_pattern_stats.cu): occurrence reduction = CUB
+  radix sort + reduce-by-key(lex-min); degrees = adjacent-diff kernel over the
+  PatchSet's `d_inv_offsets`; owner routing = **NCCL alltoallv
+  (Space::Device)** for id/degree/coordinate arrays (coords ship as
+  interleaved doubles, counts ×2); owner reduction = sort + reduce-by-key
+  (sum / lex-min) + scatter; shard top-k = one stable radix sort on `~count`
+  (slots enter hash-ascending → ties come out hash-asc for free). Count
+  metadata and the k-sized global merge stay on host MPI (USC M5 split).
+- Every device step is an integer sum or comparison min → order-independent,
+  so outputs stay **bit-identical across rank counts**. The hash-sorted device
+  reduction pairs positionally with `inv.keys` (global id order == hash
+  order), cross-checked at runtime.
+- The driver now requires `Comm::onDevice` (NCCL bootstrap), like USC.
+
+Verified (1-GPU dev box, `-np 1`): bodies byte-identical to the UPS-1 host
+implementation; gtest host-reference comparisons pass; independent Python
+recomputation over a 200k-occurrence `.stps` dump matches every reported
+entry. **Pending on the reference dual-GPU box**: `-np 1/2` body comparison +
+ctest at NRANKS=2 (`NCCL_P2P_DISABLE=1` on broken-P2P hosts, see Known
+issues).
 
 ## Key design decisions (recorded for future maintainers)
 
