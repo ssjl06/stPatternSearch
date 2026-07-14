@@ -194,13 +194,29 @@ from the M6 table — identical setup, so the delta is pure solve):
 All bit-identical (353 / 5378 / 14889 / 35824), 31/31 ctest. ⚠ Small `-n 2`
 regresses: at a few-hundred-iteration scale the deeply pipelined NCCL enqueue
 costs more than the host round-trips it removes (unprofiled; irrelevant to the
-mode's target regime). ByElement stays comm-bound by the M×8 B allreduce on
-this PCIe/SHM box (20×: 800 KB × 35.8 K iters), so **ByPatch remains the
-faster multi-rank mode on this hardware** — the device-resident win (~15%
-end-to-end, ~30% solve-only at LARGE/4×) compounds where ByElement is actually
-needed: huge N, NVLink-class interconnects. Next comm levers if pursued:
-int32 wire scores (halves the allreduce), CUDA-graph capture of the batch
-(cuts launch overhead), NVLink validation.
+mode's target regime). ByElement stays comm-bound by the per-iteration score
+allreduce on this PCIe/SHM box, so **ByPatch remains the faster multi-rank
+mode on this hardware** — the device-resident win compounds where ByElement is
+actually needed: huge N, NVLink-class interconnects. Remaining levers:
+CUDA-graph capture of the batch (cuts launch overhead), NVLink validation.
+
+### int32 wire scores (2026-07-06, follow-up to M6.5)
+
+ByElement scores count uncovered elements per patch — bounded by patch size,
+comfortably int32 — so the mode now stores/ships scores as `WireScore`
+(int32): the dominant allreduce halves (M×8 B → M×4 B) and the ArgMax scan
+bandwidth with it. Setup **proves** the fit once: initial global scores (the
+solve's maxima — scores only decrease) are validated ≤ INT32_MAX − P via a
+one-time int64 host allreduce; a patch too large for the wire throws at setup
+instead of silently wrapping. Public `Score`/ByPatch unchanged.
+
+| Workload (`-n 2`, total ms) | int64 wire | int32 wire | solve-only Δ |
+|---|---|---|---|
+| LARGE | 1034 | **933** | ~−26% |
+| 4× | 3914 | **3672** | ~−21% |
+| 20× | 43224 | **39795** | ~−27% (12.7 s → 9.3 s) |
+
+Bit-identical at all scales and both sizes; 36/36 ctest.
 
 `-DUSC_PROFILE` stage timers are absent from this loop by design — no
 per-iteration syncs means no host-visible stage boundaries; profile with

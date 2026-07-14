@@ -16,6 +16,17 @@ namespace stComm { class Comm; }
 
 namespace stPS {
 
+// Wire/score type of the ByElement mode. Scores count uncovered elements per
+// patch, bounded by the patch size — comfortably int32 — and the per-iteration
+// AllReduce ships M_global of them, so halving the element width halves the
+// mode's dominant communication (and the ArgMax scan bandwidth with it).
+// Setup PROVES the fit once: initial global scores are the solve's maxima
+// (scores only decrease), so validating them ≤ INT32_MAX − P at setup covers
+// every later value, including the disabled floor of −P − patch_size. The
+// public Score (int64) and the ByPatch mode are unchanged.
+using WireScore = std::int32_t;
+inline constexpr WireScore kDisabledWireScore = -1;
+
 // Internal implementation of the public UscPatchSelector: distributed greedy
 // minimum set-cover. The shared preprocessing — distributed hash→id mapping,
 // PatchCsr, InvertedIndex, and their device mirrors — is delegated to PatchSet;
@@ -129,8 +140,8 @@ private:
     DeviceBuffer<ElementId>     d_inv_keys_;        // shard-local inverted index
     DeviceBuffer<std::uint64_t> d_inv_offsets_;
     DeviceBuffer<PatchId>       d_inv_data_;        // values are global slots
-    DeviceBuffer<Score>         d_scores_partial_;  // M_global; this shard's part
-    DeviceBuffer<Score>         d_scores_sum_;      // M_global; allreduced full
+    DeviceBuffer<WireScore>     d_scores_partial_;  // M_global; this shard's part
+    DeviceBuffer<WireScore>     d_scores_sum_;      // M_global; allreduced full
     DeviceBuffer<std::uint64_t> d_covered_;         // shard_extent_/64 words
 };
 
