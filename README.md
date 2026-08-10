@@ -60,10 +60,10 @@ mpirun -n 4 --oversubscribe ./build/src/usc-patch-select \
 ./build/src/usc-patch-select --N 10000 --M 1000 --K 50 --overlap 0.4 --seed 42 --dump patches.stps
 mpirun -n 2 ./build/src/usc-patch-select --input patches.stps
 
-# UPS hash statistics: top-K hashes by patch count, with each hash's
+# UPS pattern statistics: top-K hashes by patch count, with each hash's
 # representative (lexicographic-min) location, written to one text file by all
 # ranks in parallel. --dump here emits .stps v2 (with per-occurrence coords).
-mpirun -n 2 ./build/src/ups-hash-stats --N 10000 --M 1000 --K 50 \
+mpirun -n 2 ./build/src/ups-pattern-stats --N 10000 --M 1000 --K 50 \
     --output stats.txt --output-limit 100
 ```
 
@@ -104,6 +104,19 @@ stComm::Comm::initialize(&argc, &argv);
     // r.selected (chosen patch IDs), r.covered_count, r.iterations
 }
 stComm::Comm::finalize();
+```
+
+The UPS component follows the same shape — patches plus per-occurrence
+coordinates in, the global top-k pattern statistics out:
+
+```cpp
+stPS::UpsPatternStats ups(comm);
+auto slice = stPS::slice_patches_by_rank(std::move(all_patches),
+                                         std::move(all_coords), rank, size);
+std::vector<stPS::PatternStat> top =            // {hash, count, rep (x,y)},
+    ups.pattern_stats(std::move(slice.patches), // identical on every rank
+                      std::move(slice.coords), /*k=*/100);
+stPS::write_pattern_stats_file(comm, "stats.txt", top);
 ```
 
 All algorithm internals (CSR, inverted index, device buffers, CUDA kernels) are

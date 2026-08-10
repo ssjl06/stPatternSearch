@@ -1,14 +1,12 @@
-// ups-hash-stats — distributed hash statistics over a PatchSet (UPS milestone
-// 1): for every hash, how many patches contain it and where its representative
+// ups-pattern-stats — distributed pattern statistics over a hashed patch set:
+// for every hash, how many patches contain it and where its representative
 // occurrence sits (lexicographic-min (x,y)); the global top K land in a single
-// text file that all ranks write in parallel.
+// text file that all ranks write in parallel. Drives the public
+// stPS::UpsPatternStats API, same as usc-patch-select drives UscPatchSelector.
 
-#include "core/patch_set.hpp"    // internal: PatchSet (shared §5.1 setup)
-#include "ups/hash_stats.hpp"    // internal: global_top_k / write_stats_file
+#include <stPS/stPS.h>           // public library API (UpsPatternStats, partition, types)
 #include "data/synthetic.hpp"    // internal demo data generator (this exe only)
 #include "io/patch_reader.hpp"   // --input/--dump patch file support
-
-#include <stPS/stPS.h>
 #include <stComm/stComm.h>
 
 #include <cuda_runtime.h>
@@ -35,21 +33,22 @@ struct CliOptions {
     std::uint64_t   output_limit = 100;
 };
 
-// Per-process GPU pick: rank-r uses GPU (r % visible_count) — same rule as
-// usc-patch-select. PatchSet setup is GPU-only (device mirrors), but the
-// stats path issues no device collectives, so no NCCL bootstrap: ranks may
-// share a GPU, and the plain host Comm below suffices. Switch to
-// Comm::onDevice once UPS grows device-side kernels that talk NCCL.
-void pick_device_for_rank(int rank) {
+// Per-process GPU pick: rank-r uses GPU (r % visible_count). Sets the active
+// device for this rank's own CUDA allocations and returns the device id to hand
+// to Comm::onDevice (which bootstraps NCCL on it) — same rule as
+// usc-patch-select. The pipeline is device-direct: kernels + NCCL alltoallv.
+int pick_device_for_rank(int rank) {
     int num_gpus = 0;
     cudaError_t err = cudaGetDeviceCount(&num_gpus);
     if (err != cudaSuccess || num_gpus <= 0) {
         std::fprintf(stderr,
-            "rank %d: no CUDA device available (%s). PatchSet setup is GPU-only.\n",
+            "rank %d: no CUDA device available (%s). UPS is GPU-only.\n",
             rank, cudaGetErrorString(err));
         std::exit(2);
     }
-    cudaSetDevice(rank % num_gpus);
+    const int device_id = rank % num_gpus;
+    cudaSetDevice(device_id);
+    return device_id;
 }
 
 void print_usage(const char* prog) {
@@ -149,8 +148,10 @@ int main(int argc, char** argv) {
             }
         }
         else {
-            stComm::Comm comm;                       // host collectives only (see above)
-            pick_device_for_rank(comm.getRank());    // device mirrors still need a GPU
+            const int rank = stComm::Comm{}.getRank();      // host probe for device pick
+            const int device_id = pick_device_for_rank(rank);
+            // onDevice bootstraps NCCL internally (uniqueId handshake + init).
+            stComm::Comm comm = stComm::Comm::onDevice(device_id);
 
             auto slice = !opt.input.empty()
                 ? read_input_slice(opt.input, comm.getRank(), comm.getSize())
@@ -162,17 +163,18 @@ int main(int argc, char** argv) {
                   }();
 
             auto t0 = std::chrono::steady_clock::now();
-            // Collapse occurrences before PatchSet consumes the patches.
-            const auto minloc = stPS::local_min_locations(slice.patches, slice.coords);
-            stPS::PatchSet ps(comm, std::move(slice.patches));
-            const auto topk = stPS::global_top_k(comm, ps, minloc, opt.output_limit);
-            stPS::write_stats_file(comm, opt.output, topk);
+            // The whole library API: build a UpsPatternStats on the comm, hand
+            // it this rank's patches + occurrence coords, get the top-K back.
+            stPS::UpsPatternStats ups(comm);
+            const auto topk = ups.pattern_stats(std::move(slice.patches),
+                                                std::move(slice.coords),
+                                                opt.output_limit);
+            stPS::write_pattern_stats_file(comm, opt.output, topk);
             auto t1 = std::chrono::steady_clock::now();
 
             if (comm.getRank() == 0) {
-                std::cout << "UPS hash-stats\n"
+                std::cout << "UPS pattern-stats\n"
                           << "  ranks=" << comm.getSize()
-                          << " unique_hashes=" << ps.N()
                           << " reported=" << topk.size()
                           << " (limit=" << opt.output_limit << ")\n"
                           << "  output: " << opt.output << "\n"

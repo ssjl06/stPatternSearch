@@ -11,7 +11,8 @@ add_library(stPS STATIC
     usc/usc_patch_selector_impl.cu
     usc/brute_force.cpp
     # ups/ — pattern statistics (hash counts + representative locations)
-    ups/hash_stats.cpp
+    ups/ups_pattern_stats.cu
+    ups/stats_file.cpp
     # io/ — patch file readers/writers (M7)
     io/stps_binary.cpp
     # data/ — demo/test data generation + partitioning
@@ -69,8 +70,9 @@ add_executable(usc-patch-select usc/main.cpp)
 target_include_directories(usc-patch-select PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(usc-patch-select PRIVATE stPS)
 
-# UPS driver: top-K hash statistics (count + representative location) over the
-# shared PatchSet setup, written to a single file by all ranks in parallel.
-add_executable(ups-hash-stats ups/main.cpp)
-target_include_directories(ups-hash-stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(ups-hash-stats PRIVATE stPS)
+# UPS driver: top-K pattern statistics (count + representative location) via
+# the public stPS::UpsPatternStats, written to a single file by all ranks in
+# parallel. The src/ include root is only for the demo-data/io helpers.
+add_executable(ups-pattern-stats ups/main.cpp)
+target_include_directories(ups-pattern-stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ups-pattern-stats PRIVATE stPS)
