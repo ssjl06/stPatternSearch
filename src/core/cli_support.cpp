@@ -83,6 +83,11 @@ bool same_output_path(const std::string& a, const std::string& b) {
         const auto abs = std::filesystem::absolute(p, ec);
         return ec ? abs : std::filesystem::weakly_canonical(abs, ec);
     };
+    // Both already exist: compare device + inode, which also catches hard
+    // links (different names, one file) that no path normalization can.
+    std::error_code eq_ec;
+    if (std::filesystem::equivalent(a, b, eq_ec) && !eq_ec) return true;
+
     std::error_code ea, eb;
     const auto ca = norm(a, ea);
     const auto cb = norm(b, eb);
