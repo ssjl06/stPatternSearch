@@ -88,6 +88,14 @@ public:
         // mid-slice-read.
         if (fseeko(file_.get(), 0, SEEK_END) != 0) fail(path_, "seek failed");
         const std::uint64_t file_bytes = static_cast<std::uint64_t>(ftello(file_.get()));
+        // Bound M and total_K by the file size before multiplying: every
+        // offset and hash takes 8 B, so a header claiming more than fits is
+        // corrupt — and rejecting it here keeps the sum below from wrapping.
+        if (M_ >= file_bytes / 8 || total_K_ > file_bytes / 8) {
+            fail(path_, "corrupt header (M=" + std::to_string(M_) + ", total_K=" +
+                        std::to_string(total_K_) + " exceed file size " +
+                        std::to_string(file_bytes) + ")");
+        }
         const std::uint64_t want =
             kHeaderBytes + (M_ + 1) * 8 + total_K_ * 8 +
             (has_coords_ ? total_K_ * 16 : 0);
@@ -95,9 +103,24 @@ public:
             fail(path_, "size mismatch: header declares " + std::to_string(want) +
                         " bytes, file has " + std::to_string(file_bytes));
         }
+
+        // CSR endpoints: read_slice checks monotonicity per window, but only
+        // these two pin the offsets to the hash section — without them a file
+        // with offsets[0] > 0 or offsets[M] < total_K silently drops hashes.
+        std::uint64_t first = 0, last = 0;
+        seek_to(file_.get(), kHeaderBytes, path_);
+        read_exact(file_.get(), &first, sizeof(first), path_);
+        seek_to(file_.get(), kHeaderBytes + M_ * 8, path_);
+        read_exact(file_.get(), &last, sizeof(last), path_);
+        if (first != 0 || last != total_K_) {
+            fail(path_, "corrupt offsets (offsets[0]=" + std::to_string(first) +
+                        ", offsets[M]=" + std::to_string(last) +
+                        ", want 0 and total_K=" + std::to_string(total_K_) + ")");
+        }
     }
 
     std::uint64_t patch_count() override { return M_; }
+    bool has_coords() override { return has_coords_; }
 
     PatchSlice read_slice(std::uint64_t begin, std::uint64_t end) override {
         if (begin > end || end > M_) {

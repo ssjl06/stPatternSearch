@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <unordered_set>
 
 namespace stPS {
@@ -50,6 +52,14 @@ std::vector<std::vector<Hash>> generate_synthetic(const SyntheticParams& p) {
 
     // K varies ±25% around K_mean for some realism, capped by region_size.
     const std::int64_t k_min = std::max<std::int64_t>(1, p.K_mean - p.K_mean / 4);
+    // Each patch draws k distinct indices from the region, so the region must
+    // hold at least k_min of them — otherwise the sampling loop never ends.
+    if (static_cast<std::uint64_t>(k_min) > region_size) {
+        throw std::invalid_argument(
+            "generate_synthetic: N=" + std::to_string(p.N) + " is too small for K=" +
+            std::to_string(p.K_mean) + " (each patch needs at least " +
+            std::to_string(k_min) + " distinct elements)");
+    }
     const std::int64_t k_max_pre = static_cast<std::int64_t>(p.K_mean) + p.K_mean / 4;
     const std::int64_t k_cap = static_cast<std::int64_t>(region_size);
     const std::int64_t k_max = std::max<std::int64_t>(k_min, std::min<std::int64_t>(k_max_pre, k_cap));

@@ -26,6 +26,12 @@ public:
     // Total patch count M (header only — no bulk I/O).
     virtual std::uint64_t patch_count() = 0;
 
+    // Whether the file carries per-occurrence coordinates (header only).
+    // Rank-independent — unlike checking a slice's coords, which an empty
+    // slice can't answer — so location-consuming callers can reject a
+    // coordinate-less file on every rank at once.
+    virtual bool has_coords() = 0;
+
     // Read patches [begin, end) plus their global IDs. Not collective — each
     // rank calls independently with its own range. Throws std::runtime_error
     // on I/O errors or a corrupt file.
