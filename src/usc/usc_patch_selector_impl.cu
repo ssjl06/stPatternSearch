@@ -901,6 +901,13 @@ UscPatchSelector& UscPatchSelector::operator=(UscPatchSelector&&) noexcept = def
 
 PatchSelection UscPatchSelector::patch_select(std::vector<std::vector<Hash>> patches,
                                               std::vector<PatchId>           global_ids) {
+    // Both modes index global_ids by local patch index (ByElement also
+    // allgathers it as M_local entries) — a short vector reads out of bounds.
+    if (global_ids.size() != patches.size()) {
+        throw std::invalid_argument(
+            "patch_select: global_ids has " + std::to_string(global_ids.size()) +
+            " entries for " + std::to_string(patches.size()) + " patches");
+    }
     return impl_->by_element
         ? impl_->by_element->patch_select(std::move(patches), std::move(global_ids))
         : impl_->by_patch->patch_select(std::move(patches), std::move(global_ids));

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -175,4 +176,26 @@ TEST(PatternStats, StatsFileRoundTrip) {
 
     comm.barrier();  // no rank may still be reading when rank 0 unlinks
     if (comm.getRank() == 0) std::remove(path.c_str());
+}
+
+TEST(PatternStats, RejectsNonFiniteCoords) {
+    // A NaN wins every lexicographic-min comparison, so it used to become the
+    // representative silently. Every rank passes one so all throw together.
+    auto& comm = test_helpers::comm();
+    std::vector<std::vector<Hash>>  patches = {{5, 6}};
+    std::vector<std::vector<Point>> coords  =
+        {{{0.5, 0.0}, {std::numeric_limits<double>::quiet_NaN(), 0.0}}};
+    UpsPatternStats ups(comm);
+    EXPECT_THROW(ups.pattern_stats(std::move(patches), std::move(coords), 5),
+                 std::invalid_argument);
+}
+
+TEST(PatternStats, StatsFileIoErrorThrowsOnEveryRank) {
+    // open() fails on every rank here; the point is that each rank throws
+    // after the collective agreement instead of one rank throwing alone and
+    // leaving its peers blocked in the next barrier.
+    auto& comm = test_helpers::comm();
+    const auto topk = distributed_stats(comm, small_synthetic(53), 5);
+    const std::string path = ::testing::TempDir() + "no_such_dir/stats.txt";
+    EXPECT_THROW(write_pattern_stats_file(comm, path, topk), std::runtime_error);
 }

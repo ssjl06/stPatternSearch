@@ -43,7 +43,10 @@ public:
     // patches shape: coords[p][i] is where occurrence patches[p][i] sits).
     // **Collective** — every rank must call together; all ranks return the
     // identical top-k list (count desc, hash asc; size = min(k, global unique
-    // hash count)). Throws std::invalid_argument on a coords shape mismatch.
+    // hash count)). Throws std::invalid_argument on a coords shape mismatch
+    // or a non-finite (NaN/Inf) coordinate — on the offending rank only, so a
+    // caller must treat it as fatal for the job — and on every rank when k is
+    // so large the gathered candidate set would overflow the host collective.
     std::vector<PatternStat> pattern_stats(std::vector<std::vector<Hash>>  patches,
                                            std::vector<std::vector<Point>> coords,
                                            std::uint64_t k);
@@ -56,8 +59,14 @@ private:
 // Collective: write `stats` (identical on every rank, from pattern_stats) to a
 // single text file, every rank writing its own contiguous line range in
 // parallel (fixed-width records → offsets are pure functions of the line
-// index; assumes a POSIX-coherent shared filesystem). Overwrites `path`; all
-// ranks have completed — and the file has its final size — when this returns.
+// index). Overwrites `path`; all ranks have completed — and the file has its
+// final size — when this returns. If any rank's open/write/truncate/close
+// fails, every rank throws std::runtime_error (no rank is left blocked).
+//
+// `path` must be on a filesystem every rank sees as the same file (local disk
+// for a single node; Lustre/GPFS/NFS across nodes). A node-local path such as
+// /tmp in a multi-node run gives each node its own partial copy — rank 0's
+// file then holds NUL bytes in the other nodes' line ranges, undetected.
 void write_pattern_stats_file(stComm::Comm& comm, const std::string& path,
                               const std::vector<PatternStat>& stats);
 

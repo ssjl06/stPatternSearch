@@ -98,3 +98,15 @@ TEST(SolverEquivalenceElem, MediumHighOverlap) {
 TEST(SolverEquivalenceElem, LargerMidOverlap) {
     run_case(10000, 500, 50, 0.5, 1, PartitionMode::ByElement);
 }
+
+TEST(UscPatchSelectorApi, RejectsGlobalIdCountMismatch) {
+    // Every rank passes one ID short, so all throw before any collective.
+    stComm::Comm& comm = test_helpers::comm();
+    for (PartitionMode mode : {PartitionMode::ByPatch, PartitionMode::ByElement}) {
+        UscPatchSelector selector(comm, mode);
+        std::vector<std::vector<Hash>> patches = {{1, 2}, {2, 3}};
+        std::vector<PatchId>           ids     = {0};
+        EXPECT_THROW(selector.patch_select(std::move(patches), std::move(ids)),
+                     std::invalid_argument);
+    }
+}
