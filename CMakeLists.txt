@@ -30,7 +30,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STPS_BUILD_TESTS "Build unit tests (GoogleTest via FetchContent)" ON)
-option(STPS_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+# On by default: the tree builds warning-free (Release, Debug, USC_PROFILE).
+# Directory-scoped add_compile_options, so find_package consumers are not
+# affected; turn off locally with -DSTPS_WARNINGS_AS_ERRORS=OFF if a newer
+# compiler adds a warning before it is fixed.
+option(STPS_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 # Per-stage profiling in the USC solve loop (CUDA-event + host timers). Off by
 # default so the production hot path carries no synchronization; enable with
 # -DUSC_PROFILE=ON to get a per-iteration stage breakdown on stderr.
@@ -39,13 +43,22 @@ option(USC_PROFILE "Enable USC per-stage profiling instrumentation" OFF)
 if(MSVC)
     add_compile_options(/W4 /permissive-)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter)
+    # Per language: nvcc doesn't take GCC warning flags directly (its -Werror
+    # even expects a <kind> argument), so CUDA TUs get them via -Xcompiler for
+    # the host-compiler pass. No -Wpedantic there: nvcc's generated host code
+    # carries GNU line markers ("# 1 file") that -Wpedantic flags in every .cu
+    # TU — not fixable from source.
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Wshadow;-Wno-unused-parameter>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wshadow,-Wno-unused-parameter>")
 endif()
 if(STPS_WARNINGS_AS_ERRORS)
     if(MSVC)
         add_compile_options(/WX)
     else()
-        add_compile_options(-Werror)
+        add_compile_options(
+            "$<$<COMPILE_LANGUAGE:CXX>:-Werror>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:-Werror=all-warnings;-Xcompiler=-Werror>")
     endif()
 endif()
 
