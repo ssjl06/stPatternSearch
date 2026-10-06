@@ -9,7 +9,9 @@ add_executable(stps_tests
     test_solver_equivalence.cpp
     test_patch_io.cpp
     test_pattern_stats.cpp
+    test_cli_support.cpp
     helpers/local_setup.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/cli_support.cpp   # app-level, not in libstPS
 )
 # test_main.cpp uses cuda_runtime + NCCL via test_nccl_env.hpp.
 find_package(CUDAToolkit REQUIRED)

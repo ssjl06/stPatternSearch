@@ -65,6 +65,12 @@ mpirun -n 2 ./build/src/usc-patch-select --input patches.stps
 # ranks in parallel. --dump here emits .stps v2 (with per-occurrence coords).
 mpirun -n 2 ./build/src/ups-pattern-stats --N 10000 --M 1000 --K 50 \
     --output stats.txt --output-limit 100
+
+# Every distinct hash, ascending, as a binary file (16 B header "STPSUHS1" +
+# uint64 count, then uint64 hashes). Alone it is host-only (no GPU) and takes
+# v1 or v2 .stps; add --output to get it alongside the top-K stats in one run.
+mpirun -n 4 ./build/src/ups-pattern-stats --input patches.stps --unique-hashes hashes.bin
+python3 -c "import numpy as np; print(np.fromfile('hashes.bin', np.uint64, offset=16)[:5])"
 ```
 
 `build.sh` configures + builds against stComm and prints the artifact paths;

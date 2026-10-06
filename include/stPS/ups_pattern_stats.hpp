@@ -47,9 +47,15 @@ public:
     // or a non-finite (NaN/Inf) coordinate — on the offending rank only, so a
     // caller must treat it as fatal for the job — and on every rank when k is
     // so large the gathered candidate set would overflow the host collective.
+    //
+    // If `unique_hashes_path` is non-empty, also writes the full unique-hash
+    // file there (format and filesystem requirements: <stPS/unique_hashes.hpp>)
+    // from the same distributed hash sort — cheaper than a separate
+    // write_unique_hashes_file call.
     std::vector<PatternStat> pattern_stats(std::vector<std::vector<Hash>>  patches,
                                            std::vector<std::vector<Point>> coords,
-                                           std::uint64_t k);
+                                           std::uint64_t k,
+                                           const std::string& unique_hashes_path = {});
 
 private:
     struct Impl;

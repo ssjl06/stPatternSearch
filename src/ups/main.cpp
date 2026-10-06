@@ -1,8 +1,11 @@
 // ups-pattern-stats — distributed pattern statistics over a hashed patch set:
 // for every hash, how many patches contain it and where its representative
 // occurrence sits (lexicographic-min (x,y)); the global top K land in a single
-// text file that all ranks write in parallel. Drives the public
-// stPS::UpsPatternStats API, same as usc-patch-select drives UscPatchSelector.
+// text file that all ranks write in parallel. Optionally (--unique-hashes)
+// also writes every distinct hash, sorted, to a binary file — alone that mode
+// is host-only. Drives the public stPS::UpsPatternStats /
+// stPS::write_unique_hashes_file API, same as usc-patch-select drives
+// UscPatchSelector.
 
 #include <stPS/stPS.h>           // public library API (UpsPatternStats, partition, types)
 #include "data/synthetic.hpp"    // internal demo data generator (this exe only)
@@ -26,22 +29,29 @@ struct CliOptions {
     SyntheticParams params;
     std::string     input;   // read patches+coords from a .stps v2 file
     std::string     dump;    // write synthetic patches+coords to a .stps v2 file and exit
-    std::string     output;  // stats file path (required unless --dump)
+    std::string     output;  // top-K stats file path
+    std::string     unique_hashes;  // full unique-hash binary file path
     std::uint64_t   output_limit = 100;
 };
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s --output <path> [options]\n"
-        "  --output <path>       stats file to write (required)\n"
+        "Usage: %s (--output <path> | --unique-hashes <path>) [options]\n"
+        "  --output <path>       top-K stats text file to write\n"
+        "  --unique-hashes <path>\n"
+        "                        write every distinct hash, ascending, as a binary\n"
+        "                        file (16 B header + uint64 array; see\n"
+        "                        <stPS/unique_hashes.hpp>). Without --output this\n"
+        "                        mode is host-only (no GPU) and accepts v1 .stps\n"
         "  --output-limit <int>  top-K hashes to report (default %lu)\n"
         "  --N <int>             universe size hint (default %lu)\n"
         "  --M <int>             number of patches (default %lu)\n"
         "  --K <int>             average elements per patch (default %u)\n"
         "  --overlap <float>     patch overlap, 0..1 (default %.2f)\n"
         "  --seed <int>          RNG seed (default %lu)\n"
-        "  --input <path>        read patches from a .stps v2 file (synthetic params\n"
-        "                        ignored; needs coordinates — dump one with --dump)\n"
+        "  --input <path>        read patches from a .stps file (synthetic params\n"
+        "                        ignored; --output needs a v2 file with coordinates\n"
+        "                        — dump one with --dump)\n"
         "  --dump <path>         write the synthetic patches+coords to a .stps v2 file\n"
         "                        and exit (data-prep tool mode; no GPU needed)\n"
         "  -h, --help            show this help\n",
@@ -70,6 +80,7 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
         else if (a == "--input")  { const char* v = next_val(); if (!v) return false; opt.input  = v; }
         else if (a == "--dump")   { const char* v = next_val(); if (!v) return false; opt.dump   = v; }
         else if (a == "--output") { const char* v = next_val(); if (!v) return false; opt.output = v; }
+        else if (a == "--unique-hashes") { const char* v = next_val(); if (!v) return false; opt.unique_hashes = v; }
         else if (a == "--output-limit") { const char* v = next_val(); if (!v) return false; opt.output_limit = std::strtoull(v, nullptr, 10); }
         else {
             std::fprintf(stderr, "Unknown argument: %s\n", a.c_str());
@@ -81,8 +92,19 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
         std::fprintf(stderr, "--input and --dump are mutually exclusive\n");
         return false;
     }
-    if (opt.dump.empty() && opt.output.empty()) {
-        std::fprintf(stderr, "--output is required\n");
+    if (!opt.dump.empty() && !opt.unique_hashes.empty()) {
+        std::fprintf(stderr, "--dump and --unique-hashes are mutually exclusive\n");
+        return false;
+    }
+    // Both writers would succeed, the stats file silently replacing the
+    // unique-hash export written just before it.
+    if (!opt.output.empty() && !opt.unique_hashes.empty() &&
+        stPS::cli::same_output_path(opt.output, opt.unique_hashes)) {
+        std::fprintf(stderr, "--output and --unique-hashes must be different files\n");
+        return false;
+    }
+    if (opt.dump.empty() && opt.output.empty() && opt.unique_hashes.empty()) {
+        std::fprintf(stderr, "--output or --unique-hashes is required\n");
         print_usage(argv[0]);
         return false;
     }
@@ -90,14 +112,16 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
 }
 
 // This rank's contiguous patch range in file order — same split rule as
-// slice_patches_by_rank. UPS needs locations, so a coordinate-less (v1) file
-// is a usage error, not a silent (0,0) run.
-stPS::PatchSlice read_input_slice(const std::string& path, int rank, int size) {
+// slice_patches_by_rank. Stats need locations, so with `need_coords` a
+// coordinate-less (v1) file is a usage error, not a silent (0,0) run; the
+// unique-hash-only mode reads hashes alone and takes either version.
+stPS::PatchSlice read_input_slice(const std::string& path, int rank, int size,
+                                  bool need_coords) {
     auto reader = stPS::open_patch_file(path);
     // Header check, not a slice check: every rank gets the same answer, so all
     // exit together — a rank with an empty slice can't tell v1 from v2 and
     // would otherwise wait forever in PatchSet's collectives.
-    if (!reader->has_coords()) {
+    if (need_coords && !reader->has_coords()) {
         if (rank == 0) {
             std::fprintf(stderr,
                 "%s: no coordinates (v1 .stps?) — ups needs a v2 file; "
@@ -134,13 +158,40 @@ int main(int argc, char** argv) {
                           << " patches (+coords) to " << opt.dump << "\n";
             }
         }
+        else if (opt.output.empty()) {
+            // Unique-hash-only mode: the distributed hash sort plus a parallel
+            // write. Host-only — no GPU, no NCCL bootstrap, no coordinates.
+            stComm::Comm comm;
+            auto slice = !opt.input.empty()
+                ? read_input_slice(opt.input, comm.getRank(), comm.getSize(),
+                                   /*need_coords=*/false)
+                : stPS::slice_patches_by_rank(generate_synthetic(opt.params),
+                                              comm.getRank(), comm.getSize());
+
+            auto t0 = std::chrono::steady_clock::now();
+            const std::uint64_t n_unique =
+                stPS::write_unique_hashes_file(comm, opt.unique_hashes,
+                                               std::move(slice.patches));
+            auto t1 = std::chrono::steady_clock::now();
+
+            if (comm.getRank() == 0) {
+                std::cout << "UPS unique-hashes\n"
+                          << "  ranks=" << comm.getSize()
+                          << " unique=" << n_unique << "\n"
+                          << "  output: " << opt.unique_hashes << "\n"
+                          << "  timing (ms): unique-hashes="
+                          << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                          << "\n";
+            }
+        }
         else {
             const int device_id = stPS::cli::pick_device_for_local_rank("UPS");
             // onDevice bootstraps NCCL internally (uniqueId handshake + init).
             stComm::Comm comm = stComm::Comm::onDevice(device_id);
 
             auto slice = !opt.input.empty()
-                ? read_input_slice(opt.input, comm.getRank(), comm.getSize())
+                ? read_input_slice(opt.input, comm.getRank(), comm.getSize(),
+                                   /*need_coords=*/true)
                 : [&] {
                       auto patches = generate_synthetic(opt.params);
                       auto coords  = generate_synthetic_coords(opt.params, patches);
@@ -154,7 +205,8 @@ int main(int argc, char** argv) {
             stPS::UpsPatternStats ups(comm);
             const auto topk = ups.pattern_stats(std::move(slice.patches),
                                                 std::move(slice.coords),
-                                                opt.output_limit);
+                                                opt.output_limit,
+                                                opt.unique_hashes);
             stPS::write_pattern_stats_file(comm, opt.output, topk);
             auto t1 = std::chrono::steady_clock::now();
 
@@ -163,8 +215,11 @@ int main(int argc, char** argv) {
                           << "  ranks=" << comm.getSize()
                           << " reported=" << topk.size()
                           << " (limit=" << opt.output_limit << ")\n"
-                          << "  output: " << opt.output << "\n"
-                          << "  timing (ms): stats="
+                          << "  output: " << opt.output << "\n";
+                if (!opt.unique_hashes.empty()) {
+                    std::cout << "  unique hashes: " << opt.unique_hashes << "\n";
+                }
+                std::cout << "  timing (ms): stats="
                           << std::chrono::duration<double, std::milli>(t1 - t0).count()
                           << "\n";
             }

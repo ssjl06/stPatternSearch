@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <system_error>
 
 namespace stPS::cli {
 
@@ -72,6 +74,20 @@ int pick_device_for_local_rank(const char* app_name) {
         abort_job(2);
     }
     return device_id;
+}
+
+bool same_output_path(const std::string& a, const std::string& b) {
+    // absolute() first: weakly_canonical leaves a relative path whose first
+    // component doesn't exist untouched, so "x" and "./x" would differ.
+    const auto norm = [](const std::string& p, std::error_code& ec) {
+        const auto abs = std::filesystem::absolute(p, ec);
+        return ec ? abs : std::filesystem::weakly_canonical(abs, ec);
+    };
+    std::error_code ea, eb;
+    const auto ca = norm(a, ea);
+    const auto cb = norm(b, eb);
+    if (ea || eb) return a == b;  // can't normalize: fall back to the literal paths
+    return ca == cb;
 }
 
 }  // namespace stPS::cli

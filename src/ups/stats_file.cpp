@@ -1,51 +1,18 @@
 #include <stPS/ups_pattern_stats.hpp>
 
+#include "io/parallel_file.hpp"
+
 #include <stComm/stComm.h>
 
-#include <fcntl.h>
-#include <unistd.h>
+#include <sys/types.h>
 
-#include <cerrno>
 #include <cstdio>
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace stPS {
-
-namespace {
-
-// Message for a failed POSIX call — read errno right away, before anything
-// else can clobber it.
-std::string io_error(const char* what) {
-    return std::string(what) + ": " + std::strerror(errno);
-}
-
-// Collective success check: every rank learns whether any rank's I/O failed,
-// so all throw together instead of one rank throwing and stranding its peers
-// in the next collective. Doubles as the barrier between write phases.
-void agree_or_throw(stComm::Comm& comm, const std::string& path,
-                    const std::string& local_err) {
-    const std::int32_t ok = local_err.empty() ? 1 : 0;
-    std::int32_t all_ok = 0;
-    comm.allreduce<stComm::Space::Host, std::int32_t>(
-        &ok, &all_ok, 1, stComm::ReduceOp::Min)->wait();
-    if (!all_ok) {
-        throw std::runtime_error("ups-stats: " + path + ": " +
-            (local_err.empty() ? std::string("I/O failed on another rank") : local_err));
-    }
-}
-
-// Closes on scope exit, so a throw from agree_or_throw never leaks the fd.
-struct FdGuard {
-    int fd = -1;
-    ~FdGuard() { if (fd >= 0) ::close(fd); }
-    int release() { const int f = fd; fd = -1; return f; }
-};
-
-}  // namespace
 
 void write_pattern_stats_file(stComm::Comm& comm, const std::string& path,
                               const std::vector<PatternStat>& stats) {
@@ -87,34 +54,12 @@ void write_pattern_stats_file(stComm::Comm& comm, const std::string& path,
         buf.append(line, kLineBytes);
     }
 
-    // Parallel single-file write; assumes a POSIX-coherent shared filesystem
-    // (local disk, Lustre, GPFS — the usual cluster cases). Errors are
-    // collected, not thrown, until every rank has agreed on the outcome.
-    std::string err;
-    FdGuard file;
-    file.fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0644);
-    if (file.fd < 0) err = io_error("cannot open");
+    // Parallel single-file write: rank 0's buffer starts with the header.
     const off_t my_off = (rank == 0)
         ? 0
         : static_cast<off_t>(header_len) + static_cast<off_t>(begin * kLineBytes);
-    for (std::size_t done = 0; err.empty() && done < buf.size();) {
-        const ssize_t w = ::pwrite(file.fd, buf.data() + done, buf.size() - done,
-                                   my_off + static_cast<off_t>(done));
-        if (w < 0) { err = io_error("pwrite failed"); break; }
-        done += static_cast<std::size_t>(w);
-    }
-    agree_or_throw(comm, path, err);  // everyone has written
-
-    // A stale, longer file from a previous run would leave garbage past our
-    // records — once everyone has written, rank 0 cuts to the exact size.
-    if (rank == 0) {
-        const off_t total = static_cast<off_t>(header_len) +
-                            static_cast<off_t>(k * kLineBytes);
-        if (::ftruncate(file.fd, total) != 0) err = io_error("ftruncate failed");
-    }
-    // close() can be the first to report a deferred write error (NFS, quota).
-    if (::close(file.release()) != 0 && err.empty()) err = io_error("close failed");
-    agree_or_throw(comm, path, err);  // no rank returns before the file is complete
+    const off_t total = static_cast<off_t>(header_len) + static_cast<off_t>(k * kLineBytes);
+    io::write_shared_file(comm, path, "ups-stats", buf.data(), buf.size(), my_off, total);
 }
 
 }  // namespace stPS
