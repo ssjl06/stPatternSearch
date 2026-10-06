@@ -850,14 +850,15 @@ PatchSelection UscElemPatchSelectorImpl::select() {
                 d_scores_partial_.data());
         }
         cuda_launch_check("device-resident batch (elem)");
-        cudaMemcpyAsync(&h_state, d_state.data(), sizeof(h_state),
-                        cudaMemcpyDeviceToHost, stream);
-        const cudaError_t err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("CUDA error in device-resident batch (elem): ") +
-                cudaGetErrorString(err));
-        }
+        cuda_check(cudaMemcpyAsync(&h_state, d_state.data(), sizeof(h_state),
+                                   cudaMemcpyDeviceToHost, stream),
+                   "device-resident batch (elem) state copy");
+        // Drain the stream through stComm, not cudaStreamSynchronize: the
+        // batch has allreduces in flight, and stComm's polled sync also
+        // watches the communicator for async failures (dead peer, network
+        // fault) — a plain synchronize would hang on those until walltime.
+        // Throws on a CUDA or NCCL error.
+        comm_.nccl().barrier();
         if (h_state.done) break;
     }
 
