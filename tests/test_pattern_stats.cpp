@@ -199,3 +199,91 @@ TEST(PatternStats, StatsFileIoErrorThrowsOnEveryRank) {
     const std::string path = ::testing::TempDir() + "no_such_dir/stats.txt";
     EXPECT_THROW(write_pattern_stats_file(comm, path, topk), std::runtime_error);
 }
+
+// ---- Unique-hash file ------------------------------------------------------
+
+namespace {
+
+// Parse a unique-hash file: checks the magic, returns {N field, hash array}.
+std::pair<std::uint64_t, std::vector<Hash>> read_unique_hash_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    EXPECT_TRUE(in.good()) << path;
+    char magic[8] = {};
+    std::uint64_t n = 0;
+    in.read(magic, sizeof(magic));
+    in.read(reinterpret_cast<char*>(&n), sizeof(n));
+    EXPECT_EQ(std::string(magic, 8), std::string(kUniqueHashMagic, 8));
+    std::vector<Hash> hashes;
+    Hash h = 0;
+    while (in.read(reinterpret_cast<char*>(&h), sizeof(h))) hashes.push_back(h);
+    return {n, hashes};
+}
+
+std::vector<Hash> all_unique(const SyntheticData& d) {
+    std::set<Hash> s;
+    for (const auto& p : d.patches) s.insert(p.begin(), p.end());
+    return {s.begin(), s.end()};
+}
+
+}  // namespace
+
+TEST(UniqueHashes, FileHoldsEverySortedDistinctHash) {
+    auto& comm = test_helpers::comm();
+    const auto data = small_synthetic(59);
+    const auto want = all_unique(data);
+    const std::string path = ::testing::TempDir() + "unique_hashes_shared.bin";
+
+    auto slice = slice_patches_by_rank(data.patches, comm.getRank(), comm.getSize());
+    const std::uint64_t n = write_unique_hashes_file(comm, path, std::move(slice.patches));
+    EXPECT_EQ(n, want.size());
+
+    const auto [n_field, hashes] = read_unique_hash_file(path);  // every rank reads it
+    EXPECT_EQ(n_field, want.size());
+    EXPECT_EQ(hashes, want);
+
+    comm.barrier();
+    if (comm.getRank() == 0) std::remove(path.c_str());
+}
+
+TEST(UniqueHashes, PatternStatsWritesTheSameFile) {
+    // The pattern_stats side output reuses its PatchSet's shards; it must be
+    // byte-identical to the standalone writer's.
+    auto& comm = test_helpers::comm();
+    const auto data = small_synthetic(61);
+    const std::string standalone = ::testing::TempDir() + "unique_hashes_a.bin";
+    const std::string side       = ::testing::TempDir() + "unique_hashes_b.bin";
+
+    auto s1 = slice_patches_by_rank(data.patches, comm.getRank(), comm.getSize());
+    write_unique_hashes_file(comm, standalone, std::move(s1.patches));
+    auto s2 = slice_patches_by_rank(data.patches, data.coords, comm.getRank(), comm.getSize());
+    UpsPatternStats ups(comm);
+    ups.pattern_stats(std::move(s2.patches), std::move(s2.coords), 5, side);
+
+    const auto a = read_unique_hash_file(standalone);
+    const auto b = read_unique_hash_file(side);
+    EXPECT_EQ(a.first, b.first);
+    EXPECT_EQ(a.second, b.second);
+
+    comm.barrier();
+    if (comm.getRank() == 0) { std::remove(standalone.c_str()); std::remove(side.c_str()); }
+}
+
+TEST(UniqueHashes, EmptyInputWritesHeaderOnly) {
+    auto& comm = test_helpers::comm();
+    const std::string path = ::testing::TempDir() + "unique_hashes_empty.bin";
+    EXPECT_EQ(write_unique_hashes_file(comm, path, {}), 0u);
+    const auto [n_field, hashes] = read_unique_hash_file(path);
+    EXPECT_EQ(n_field, 0u);
+    EXPECT_TRUE(hashes.empty());
+    comm.barrier();
+    if (comm.getRank() == 0) std::remove(path.c_str());
+}
+
+TEST(UniqueHashes, IoErrorThrowsOnEveryRank) {
+    auto& comm = test_helpers::comm();
+    auto slice = slice_patches_by_rank(small_synthetic(67).patches,
+                                       comm.getRank(), comm.getSize());
+    EXPECT_THROW(write_unique_hashes_file(comm, ::testing::TempDir() + "no_such_dir/u.bin",
+                                          std::move(slice.patches)),
+                 std::runtime_error);
+}

@@ -13,8 +13,10 @@ add_library(stPS STATIC
     # ups/ — pattern statistics (hash counts + representative locations)
     ups/ups_pattern_stats.cu
     ups/stats_file.cpp
+    ups/unique_hashes.cpp
     # io/ — patch file readers/writers (M7)
     io/stps_binary.cpp
+    io/parallel_file.cpp
     # data/ — demo/test data generation + partitioning
     data/synthetic.cpp
     data/partition.cpp

@@ -2,6 +2,7 @@
 
 #include "core/device_buffer.hpp"
 #include "core/patch_set.hpp"
+#include "ups/unique_hash_file.hpp"
 
 #include <stComm/stComm.h>
 
@@ -157,13 +158,15 @@ struct UpsPatternStats::Impl {
 
     std::vector<PatternStat> run(std::vector<std::vector<Hash>>  patches,
                                  std::vector<std::vector<Point>> coords,
-                                 std::uint64_t k);
+                                 std::uint64_t k,
+                                 const std::string& unique_hashes_path);
 };
 
 std::vector<PatternStat> UpsPatternStats::Impl::run(
     std::vector<std::vector<Hash>>  patches,
     std::vector<std::vector<Point>> coords,
-    std::uint64_t k) {
+    std::uint64_t k,
+    const std::string& unique_hashes_path) {
     const int size = comm.getSize();
     const int rank = comm.getRank();
     DeviceBuffer<unsigned char> d_temp;
@@ -218,6 +221,12 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     // hash order, so the hash-sorted reduction above pairs positionally with
     // the PatchSet's sorted inverted-index keys.
     PatchSet ps(comm, std::move(patches));
+    // Optional full unique-hash dump straight from the PatchSet's §5.1 shards,
+    // so the hash sort runs once for both outputs.
+    if (!unique_hashes_path.empty()) {
+        write_unique_hash_shards(comm, unique_hashes_path,
+                                 ps.shard_hashes(), ps.shard_start(), ps.N());
+    }
     const InvertedIndex& inv = ps.inverted_index();
     const std::uint64_t n_local = inv.keys.size();
     if (n_uniq != n_local) {
@@ -445,7 +454,8 @@ UpsPatternStats& UpsPatternStats::operator=(UpsPatternStats&&) noexcept = defaul
 std::vector<PatternStat> UpsPatternStats::pattern_stats(
     std::vector<std::vector<Hash>>  patches,
     std::vector<std::vector<Point>> coords,
-    std::uint64_t k) {
+    std::uint64_t k,
+    const std::string& unique_hashes_path) {
     if (coords.size() != patches.size()) {
         throw std::invalid_argument("pattern_stats: coords/patches shape mismatch");
     }
@@ -464,7 +474,7 @@ std::vector<PatternStat> UpsPatternStats::pattern_stats(
             }
         }
     }
-    return impl_->run(std::move(patches), std::move(coords), k);
+    return impl_->run(std::move(patches), std::move(coords), k, unique_hashes_path);
 }
 
 }  // namespace stPS

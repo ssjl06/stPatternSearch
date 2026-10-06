@@ -19,3 +19,4 @@
 #include <stPS/partition.hpp>
 #include <stPS/usc_patch_selector.hpp>
 #include <stPS/ups_pattern_stats.hpp>
+#include <stPS/unique_hashes.hpp>
