@@ -25,9 +25,10 @@ void install_mpi_abort_on_uncaught();
 // GPU is visible or the device can't be set.
 int pick_device_for_local_rank(const char* app_name);
 
-// Whether two output paths name the same file, compared after lexical +
-// symlink normalization (std::filesystem::weakly_canonical — the files need
-// not exist yet), so "out.bin", "./out.bin" and "dir/../out.bin" all match.
+// Whether two output paths name the same file: device + inode when both
+// already exist (catches hard links), otherwise lexical + symlink
+// normalization (the files need not exist yet), so "out.bin", "./out.bin"
+// and "dir/../out.bin" all match.
 // Lets a driver reject two outputs aimed at one file, where the second writer
 // would silently overwrite the first.
 bool same_output_path(const std::string& a, const std::string& b);
