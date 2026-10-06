@@ -1,17 +1,14 @@
 #include <stPS/stPS.h>          // public library API (UscPatchSelector, partition, types)
 #include "data/synthetic.hpp"   // internal demo data generator (this exe only)
+#include "core/cli_support.hpp"  // node-local GPU pick + abort-on-uncaught
 #include "io/patch_reader.hpp"  // --input/--dump patch file support (M7)
 
 #include <stComm/stComm.h>
-
-#include <cuda_runtime.h>
-#include <mpi.h>          // top-level error path only: MPI_Abort / rank for logging
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <exception>
 #include <iostream>
 #include <string>
 
@@ -26,23 +23,6 @@ struct CliOptions {
     std::string     dump;    // write synthetic patches to a .stps file and exit
     bool print_solution = false;
 };
-
-// Per-process GPU pick: rank-r uses GPU (r % visible_count). Sets the active
-// device for this rank's own CUDA allocations and returns the device id to hand
-// to Comm::onDevice (which bootstraps NCCL on it). Exits if no GPU is visible.
-int pick_device_for_rank(int rank) {
-    int num_gpus = 0;
-    cudaError_t err = cudaGetDeviceCount(&num_gpus);
-    if (err != cudaSuccess || num_gpus <= 0) {
-        std::fprintf(stderr,
-            "rank %d: no CUDA device available (%s). USC is GPU-only.\n",
-            rank, cudaGetErrorString(err));
-        std::exit(2);
-    }
-    const int device_id = rank % num_gpus;
-    cudaSetDevice(device_id);
-    return device_id;
-}
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
@@ -119,8 +99,12 @@ stPS::PatchSlice read_input_slice(const std::string& path, int rank, int size) {
 
 int main(int argc, char** argv) {
     stComm::Comm::initialize(&argc, &argv);
+    // Fatal errors abort the whole job from the terminate handler, before any
+    // CUDA/NCCL destructor can block on a collective a failed peer never
+    // finishes — so no catch-all here (catching would unwind first).
+    stPS::cli::install_mpi_abort_on_uncaught();
     int exit_code = 0;
-    try {
+    {
         CliOptions opt;
         if (!parse_args(argc, argv, opt)) { exit_code = 1; }
         else if (!opt.dump.empty()) {
@@ -134,8 +118,7 @@ int main(int argc, char** argv) {
             }
         }
         else {
-            const int rank = stComm::Comm{}.getRank();      // host probe for device pick
-            const int device_id = pick_device_for_rank(rank);
+            const int device_id = stPS::cli::pick_device_for_local_rank("USC");
             // onDevice bootstraps NCCL internally (uniqueId handshake + init).
             stComm::Comm comm = stComm::Comm::onDevice(device_id);
 
@@ -177,17 +160,6 @@ int main(int argc, char** argv) {
                 }
             }
         }
-    }
-    catch (const std::exception& e) {
-        // stComm now throws on a backend (CUDA/NCCL/MPI) failure. Such a fault
-        // typically hits one rank mid-collective, leaving the others blocked, so
-        // falling through to finalize() would deadlock the job. Log with the
-        // rank for context and MPI_Abort to tear every rank down at once.
-        int rank = 0;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        std::fprintf(stderr, "rank %d: fatal error: %s\n", rank, e.what());
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return 1;  // unreachable: MPI_Abort does not return
     }
     stComm::Comm::finalize();
     return exit_code;

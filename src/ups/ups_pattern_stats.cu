@@ -10,8 +10,10 @@
 #include <cub/device/device_reduce.cuh>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -120,13 +122,23 @@ inline void cuda_sync_check(const char* what) {
     }
 }
 
-// Two-phase CUB call: query temp bytes, (re)alloc, run.
+inline void cuda_check(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA error in ") + what +
+                                 ": " + cudaGetErrorString(err));
+    }
+}
+
+// Two-phase CUB call: query temp bytes, (re)alloc, run. `f` returns CUB's
+// status — a failed size query would otherwise leave bytes == 0 and turn the
+// second call into another no-op query, so the pipeline would read unsorted,
+// uninitialized output.
 template <typename F>
 void cub_run(DeviceBuffer<unsigned char>& temp, const char* what, F&& f) {
     std::size_t bytes = 0;
-    f(nullptr, bytes);
+    cuda_check(f(nullptr, bytes), what);
     if (bytes > temp.bytes()) temp.resize(bytes);
-    f(temp.data(), bytes);
+    cuda_check(f(temp.data(), bytes), what);
     cuda_launch_check(what);
 }
 
@@ -182,7 +194,7 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         h_occ_pts.clear();  h_occ_pts.shrink_to_fit();
 
         cub_run(d_temp, "radix-sort occurrences", [&](void* t, std::size_t& b) {
-            cub::DeviceRadixSort::SortPairs(t, b,
+            return cub::DeviceRadixSort::SortPairs(t, b,
                 d_occ_hash.data(), d_sorted_hash.data(),
                 d_occ_pts.data(),  d_sorted_pts.data(),
                 static_cast<int>(total_occ));
@@ -192,7 +204,7 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         d_min_pts.resize(total_occ);
         DeviceBuffer<int> d_num_runs(1);
         cub_run(d_temp, "reduce-by-key min-location", [&](void* t, std::size_t& b) {
-            cub::DeviceReduce::ReduceByKey(t, b,
+            return cub::DeviceReduce::ReduceByKey(t, b,
                 d_sorted_hash.data(), d_uniq_hash.data(),
                 d_sorted_pts.data(),  d_min_pts.data(),
                 d_num_runs.data(), LexMinPoint{}, static_cast<int>(total_occ));
@@ -292,7 +304,7 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
 
         DeviceBuffer<std::uint64_t> d_s_ids(total_recv);
         cub_run(d_temp, "radix-sort arrivals", [&](void* t, std::size_t& b) {
-            cub::DeviceRadixSort::SortPairs(t, b,
+            return cub::DeviceRadixSort::SortPairs(t, b,
                 d_r_ids.data(), d_s_ids.data(),
                 d_idx.data(),   d_perm.data(),
                 static_cast<int>(total_recv));
@@ -311,13 +323,13 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         DeviceBuffer<std::uint64_t> d_o_ids2(total_recv);
         DeviceBuffer<int>           d_num_runs(1);
         cub_run(d_temp, "reduce-by-key count-sum", [&](void* t, std::size_t& b) {
-            cub::DeviceReduce::ReduceByKey(t, b,
+            return cub::DeviceReduce::ReduceByKey(t, b,
                 d_s_ids.data(), d_o_ids.data(),
                 d_g_deg.data(), d_o_cnt.data(),
                 d_num_runs.data(), SumU64{}, static_cast<int>(total_recv));
         });
         cub_run(d_temp, "reduce-by-key location-min", [&](void* t, std::size_t& b) {
-            cub::DeviceReduce::ReduceByKey(t, b,
+            return cub::DeviceReduce::ReduceByKey(t, b,
                 d_s_ids.data(), d_o_ids2.data(),
                 d_g_pts.data(), d_o_pts.data(),
                 d_num_runs.data(), LexMinPoint{}, static_cast<int>(total_recv));
@@ -347,7 +359,7 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         cuda_launch_check("top-k key kernels");
 
         cub_run(d_temp, "radix-sort top-k", [&](void* t, std::size_t& b) {
-            cub::DeviceRadixSort::SortPairs(t, b,
+            return cub::DeviceRadixSort::SortPairs(t, b,
                 d_key.data(),   d_key_out.data(),
                 d_slots.data(), d_sorted_slots.data(),
                 static_cast<int>(shard_n));
@@ -377,15 +389,29 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     // counts, tiny) and reduce identically everywhere. Any global top-k entry
     // is in its owner's local top-k, so this is exact. All ranks hold size×k
     // candidates — fine for a stats tool; revisit if k ever gets huge.
-    const int n_cand = static_cast<int>(k_local);
-    std::vector<int> cand_counts(static_cast<std::size_t>(size));
+    // Counts travel as int64 so the size guard below sees true values; stComm's
+    // host allgatherv takes int counts and int *byte* displacements, so the
+    // whole candidate set (8 B per value) must stay under INT_MAX bytes. The
+    // guard runs on the gathered counts — identical everywhere — so every rank
+    // throws together. Only a huge --output-limit over a huge hash set hits it.
+    const std::int64_t k_local64 = static_cast<std::int64_t>(k_local);
+    std::vector<std::int64_t> cand_counts64(static_cast<std::size_t>(size));
     {
         std::vector<int> ones(static_cast<std::size_t>(size), 1);
-        comm.allgatherv<stComm::Space::Host, int>(&n_cand, 1,
-                                       cand_counts.data(), ones.data())->wait();
+        comm.allgatherv<stComm::Space::Host, std::int64_t>(&k_local64, 1,
+                                       cand_counts64.data(), ones.data())->wait();
     }
-    const std::size_t total_cand = static_cast<std::size_t>(
-        std::accumulate(cand_counts.begin(), cand_counts.end(), 0));
+    const std::uint64_t total_cand_u = static_cast<std::uint64_t>(
+        std::accumulate(cand_counts64.begin(), cand_counts64.end(), std::int64_t{0}));
+    if (total_cand_u > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) / 8) {
+        throw std::invalid_argument(
+            "pattern_stats: k=" + std::to_string(k) + " gathers " +
+            std::to_string(total_cand_u) + " candidates across ranks, past the int "
+            "byte-count limit of the host allgatherv — lower k");
+    }
+    const int n_cand = static_cast<int>(k_local);
+    const std::vector<int> cand_counts(cand_counts64.begin(), cand_counts64.end());
+    const std::size_t total_cand = static_cast<std::size_t>(total_cand_u);
 
     std::vector<Hash>          all_hash(total_cand);
     std::vector<std::uint64_t> all_cnt(total_cand);
@@ -428,6 +454,14 @@ std::vector<PatternStat> UpsPatternStats::pattern_stats(
             throw std::invalid_argument(
                 "pattern_stats: coords/patches shape mismatch at patch " +
                 std::to_string(p));
+        }
+        // A NaN wins every LexMinPoint comparison (and breaks its
+        // associativity), so it would silently become the representative.
+        for (const Point& pt : coords[p]) {
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y)) {
+                throw std::invalid_argument(
+                    "pattern_stats: non-finite coordinate in patch " + std::to_string(p));
+            }
         }
     }
     return impl_->run(std::move(patches), std::move(coords), k);

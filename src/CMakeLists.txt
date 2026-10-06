@@ -66,13 +66,15 @@ install(TARGETS stPS
 # Demo / CLI driver. usc/main.cpp quote-includes the internal "data/synthetic.hpp",
 # resolved via the src/ include root added below; it drives the selection through
 # the public stPS::UscPatchSelector from <stPS/...> (carried by the link below).
-add_executable(usc-patch-select usc/main.cpp)
+# core/cli_support.cpp (GPU pick, fatal-error policy) is app-level — compiled
+# into the drivers only, not into libstPS.
+add_executable(usc-patch-select usc/main.cpp core/cli_support.cpp)
 target_include_directories(usc-patch-select PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(usc-patch-select PRIVATE stPS)
 
 # UPS driver: top-K pattern statistics (count + representative location) via
 # the public stPS::UpsPatternStats, written to a single file by all ranks in
 # parallel. The src/ include root is only for the demo-data/io helpers.
-add_executable(ups-pattern-stats ups/main.cpp)
+add_executable(ups-pattern-stats ups/main.cpp core/cli_support.cpp)
 target_include_directories(ups-pattern-stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ups-pattern-stats PRIVATE stPS)

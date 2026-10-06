@@ -60,7 +60,9 @@ public:
 
     // Run the full pipeline (load → distributed setup → greedy select) on this
     // rank's `patches` and their `global_ids`. **Collective** — every rank must
-    // call together; all ranks return the same PatchSelection.
+    // call together; all ranks return the same PatchSelection. Throws
+    // std::invalid_argument if global_ids.size() != patches.size() — on the
+    // offending rank only, so a caller must treat it as fatal for the job.
     PatchSelection patch_select(std::vector<std::vector<Hash>> patches,
                                 std::vector<PatchId>           global_ids);
 
