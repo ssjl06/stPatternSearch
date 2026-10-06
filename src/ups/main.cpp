@@ -115,17 +115,21 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
 // is a usage error, not a silent (0,0) run.
 stPS::PatchSlice read_input_slice(const std::string& path, int rank, int size) {
     auto reader = stPS::open_patch_file(path);
+    // Header check, not a slice check: every rank gets the same answer, so all
+    // exit together — a rank with an empty slice can't tell v1 from v2 and
+    // would otherwise wait forever in PatchSet's collectives.
+    if (!reader->has_coords()) {
+        if (rank == 0) {
+            std::fprintf(stderr,
+                "%s: no coordinates (v1 .stps?) — ups needs a v2 file; "
+                "regenerate with ups-pattern-stats --dump\n", path.c_str());
+        }
+        std::exit(1);
+    }
     const std::uint64_t M     = reader->patch_count();
     const std::uint64_t begin = (M * static_cast<std::uint64_t>(rank))     / size;
     const std::uint64_t end   = (M * (static_cast<std::uint64_t>(rank)+1)) / size;
-    stPS::PatchSlice slice = reader->read_slice(begin, end);
-    if (slice.coords.empty() && !slice.patches.empty()) {
-        std::fprintf(stderr,
-            "%s: no coordinates (v1 .stps?) — ups needs a v2 file; "
-            "regenerate with ups-hash-stats --dump\n", path.c_str());
-        std::exit(1);
-    }
-    return slice;
+    return reader->read_slice(begin, end);
 }
 
 }  // namespace

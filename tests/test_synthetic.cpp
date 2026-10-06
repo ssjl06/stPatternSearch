@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
+
 using namespace stPS;
 
 TEST(Synthetic, DeterministicForSameSeed) {
@@ -52,4 +54,12 @@ TEST(Synthetic, HighOverlapShrinksUniverse) {
     const auto u_high = test_helpers::run_local_setup(generate_synthetic(p_high)).N;
     // High overlap → patches cluster → fewer distinct elements seen.
     EXPECT_LT(u_high, u_low);
+}
+
+TEST(Synthetic, RejectsUniverseSmallerThanPatch) {
+    // N=10 can't supply the >= 23 distinct elements a K=30 patch needs; the
+    // sampling loop used to spin forever instead of failing.
+    SyntheticParams p;
+    p.N = 10; p.M = 5; p.K_mean = 30; p.overlap = 0.0; p.seed = 1;
+    EXPECT_THROW(generate_synthetic(p), std::invalid_argument);
 }

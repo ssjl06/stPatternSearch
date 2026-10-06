@@ -40,6 +40,18 @@ struct FileGuard {  // unlink on scope exit
     ~FileGuard() { std::remove(path.c_str()); }
 };
 
+// Hand-rolled v1 file for corrupt-header cases: magic + {M, total_K, 0}
+// header, then `body` (offsets followed by hashes) verbatim.
+void write_raw_v1(const std::string& path, std::uint64_t M, std::uint64_t total_K,
+                  const std::vector<std::uint64_t>& body) {
+    const std::uint64_t header[3] = {M, total_K, 0};
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write("STPSPAT1", 8);
+    f.write(reinterpret_cast<const char*>(header), sizeof(header));
+    f.write(reinterpret_cast<const char*>(body.data()),
+            static_cast<std::streamsize>(body.size() * sizeof(std::uint64_t)));
+}
+
 }  // namespace
 
 TEST(PatchIo, RoundTrip) {
@@ -64,6 +76,7 @@ TEST(PatchIo, RoundTripV1HasNoCoords) {
     write_patch_file(g.path, patches);
 
     auto reader = open_patch_file(g.path);
+    EXPECT_FALSE(reader->has_coords());
     const PatchSlice all = reader->read_slice(0, patches.size());
     EXPECT_TRUE(all.coords.empty());
 }
@@ -77,6 +90,7 @@ TEST(PatchIo, RoundTripV2WithCoords) {
     write_patch_file(g.path, patches, coords);
 
     auto reader = open_patch_file(g.path);
+    EXPECT_TRUE(reader->has_coords());
     ASSERT_EQ(reader->patch_count(), patches.size());
 
     const PatchSlice all = reader->read_slice(0, patches.size());
@@ -185,6 +199,18 @@ TEST(PatchIo, RejectsCorruptFiles) {
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     }
     EXPECT_THROW(open_patch_file(cut.path), std::runtime_error);
+
+    // Header whose size arithmetic wraps: M = UINT64_MAX makes (M+1)*8 == 0,
+    // so a bare 32-byte header used to "match" its own size and open.
+    FileGuard wrap{rank_path("wrap")};
+    write_raw_v1(wrap.path, ~std::uint64_t{0}, 0, {});
+    EXPECT_THROW(open_patch_file(wrap.path), std::runtime_error);
+
+    // Sizes consistent, but offsets don't span the hash section: offsets[0]
+    // != 0 (and offsets[M] != total_K) would silently drop hashes.
+    FileGuard ends{rank_path("endpoints")};
+    write_raw_v1(ends.path, 1, 2, {1, 2, 0xAA, 0xBB});
+    EXPECT_THROW(open_patch_file(ends.path), std::runtime_error);
 }
 
 // End-to-end: a solve fed from the file must match the synthetic-path solve

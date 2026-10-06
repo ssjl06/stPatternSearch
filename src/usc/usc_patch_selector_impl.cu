@@ -275,10 +275,11 @@ inline void cuda_launch_check(const char* what) {
     }
 }
 
-inline void cuda_sync_check(const char* what) {
-    cudaError_t err = cudaDeviceSynchronize();
+// For blocking calls (cudaMemcpy): an earlier kernel's fault surfaces as their
+// return code, so dropping it would let the loop run on garbage host values.
+inline void cuda_check(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA sync error in ") + what +
+        throw std::runtime_error(std::string("CUDA error in ") + what +
                                  ": " + cudaGetErrorString(err));
     }
 }
@@ -404,8 +405,9 @@ PatchSelection UscPatchSelectorImpl::select() {
                                       static_cast<int>(M_loc));
             cuda_launch_check("cub::DeviceReduce::ArgMax");
             ArgmaxPair host_result{};
-            cudaMemcpy(&host_result, d_argmax_result.data(),
-                       sizeof(host_result), cudaMemcpyDeviceToHost);
+            cuda_check(cudaMemcpy(&host_result, d_argmax_result.data(),
+                                  sizeof(host_result), cudaMemcpyDeviceToHost),
+                       "argmax result copy");
             local_best_score = host_result.value;
             local_best_patch = static_cast<PatchId>(host_result.key);
         }
@@ -512,8 +514,9 @@ PatchSelection UscPatchSelectorImpl::select() {
             // Disable winner on device so next iteration's kernel + ArgMax skip
             // it (kernel early-outs on score <= 0; ArgMax picks the next-best).
             const Score neg = kDisabledScore;
-            cudaMemcpy(&d_scores_.data()[local_best_patch], &neg, sizeof(Score),
-                       cudaMemcpyHostToDevice);
+            cuda_check(cudaMemcpy(&d_scores_.data()[local_best_patch], &neg, sizeof(Score),
+                                  cudaMemcpyHostToDevice),
+                       "winner disable");
         }
         gpu_prof.end(kWinnerDisable);
 
@@ -863,8 +866,9 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     result.iterations    = h_state.num_selected;
     if (h_state.num_selected) {
         std::vector<PatchId> slots(h_state.num_selected);
-        cudaMemcpy(slots.data(), d_selected.data(),
-                   h_state.num_selected * sizeof(PatchId), cudaMemcpyDeviceToHost);
+        cuda_check(cudaMemcpy(slots.data(), d_selected.data(),
+                              h_state.num_selected * sizeof(PatchId), cudaMemcpyDeviceToHost),
+                   "selected slots copy");
         result.selected.reserve(slots.size());
         for (PatchId s : slots) result.selected.push_back(slot_to_gid_[s]);
     }
