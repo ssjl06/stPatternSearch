@@ -14,13 +14,14 @@ HostProfiler::HostProfiler(std::vector<std::string> stage_names, bool enabled)
 
 void HostProfiler::begin(int stage) {
     if (!enabled_) return;
-    starts_[stage] = Clock::now();
+    starts_[static_cast<std::size_t>(stage)] = Clock::now();
 }
 
 void HostProfiler::end(int stage) {
     if (!enabled_) return;
-    accum_ns_[stage] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-        Clock::now() - starts_[stage]).count();
+    const auto s = static_cast<std::size_t>(stage);
+    accum_ns_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now() - starts_[s]).count();
 }
 
 void HostProfiler::report(std::FILE* out, const char* title,

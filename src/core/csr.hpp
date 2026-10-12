@@ -24,7 +24,7 @@ struct PatchCsr {
     }
 
     std::span<const ElementId> patch(PatchId p) const noexcept {
-        return { data.data() + offsets[p], static_cast<std::size_t>(patch_size(p)) };
+        return { data.data() + offsets[p], patch_size(p) };
     }
 };
 

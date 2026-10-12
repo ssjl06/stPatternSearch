@@ -62,11 +62,11 @@ std::uint64_t DenseBitset::popcount_intersect_with_ids(std::span<const ElementId
 
 void DenseBitset::collect_set_ids(std::vector<ElementId>& out) const {
     out.clear();
-    out.reserve(static_cast<std::size_t>(popcount()));
+    out.reserve(popcount());
     const std::uint64_t nw = words_.size();
     for (std::uint64_t wi = 0; wi < nw; ++wi) {
         std::uint64_t w = words_[wi];
-        const ElementId base = static_cast<ElementId>(wi) * 64;
+        const ElementId base = wi * 64;
         while (w != 0) {
             const int bit = std::countr_zero(w);
             out.push_back(base + static_cast<ElementId>(bit));

@@ -66,7 +66,7 @@ TEST(PatchIo, RoundTrip) {
     ASSERT_EQ(all.patches.size(), patches.size());
     for (std::size_t p = 0; p < patches.size(); ++p) {
         EXPECT_EQ(all.patches[p], patches[p]) << "patch " << p;
-        EXPECT_EQ(all.global_ids[p], static_cast<PatchId>(p));
+        EXPECT_EQ(all.global_ids[p], p);
     }
 }
 
@@ -132,8 +132,8 @@ TEST(PatchIo, SliceMatchesRankSlicer) {
     // synthetic solves.
     for (int size : {1, 2, 3, 7}) {
         for (int rank = 0; rank < size; ++rank) {
-            const std::uint64_t b = (M * static_cast<std::uint64_t>(rank))     / size;
-            const std::uint64_t e = (M * (static_cast<std::uint64_t>(rank)+1)) / size;
+            const std::uint64_t b = (M * static_cast<std::uint64_t>(rank))     / static_cast<std::uint64_t>(size);
+            const std::uint64_t e = (M * (static_cast<std::uint64_t>(rank)+1)) / static_cast<std::uint64_t>(size);
             const PatchSlice got = reader->read_slice(b, e);
             const PatchSlice ref = slice_patches_by_rank(patches, rank, size);
             EXPECT_EQ(got.patches,    ref.patches)    << "size=" << size << " rank=" << rank;
@@ -154,8 +154,8 @@ TEST(PatchIo, CoordSliceMatchesRankSlicer) {
 
     for (int size : {1, 2, 3, 7}) {
         for (int rank = 0; rank < size; ++rank) {
-            const std::uint64_t b = (M * static_cast<std::uint64_t>(rank))     / size;
-            const std::uint64_t e = (M * (static_cast<std::uint64_t>(rank)+1)) / size;
+            const std::uint64_t b = (M * static_cast<std::uint64_t>(rank))     / static_cast<std::uint64_t>(size);
+            const std::uint64_t e = (M * (static_cast<std::uint64_t>(rank)+1)) / static_cast<std::uint64_t>(size);
             const PatchSlice got = reader->read_slice(b, e);
             const PatchSlice ref = slice_patches_by_rank(patches, coords, rank, size);
             EXPECT_EQ(got.patches, ref.patches) << "size=" << size << " rank=" << rank;
@@ -231,8 +231,8 @@ TEST(PatchIo, DistributedFileSolveMatchesSynthetic) {
 
     auto reader = open_patch_file(path);
     const std::uint64_t M = reader->patch_count();
-    const std::uint64_t b = (M * static_cast<std::uint64_t>(rank))     / size;
-    const std::uint64_t e = (M * (static_cast<std::uint64_t>(rank)+1)) / size;
+    const std::uint64_t b = (M * static_cast<std::uint64_t>(rank))     / static_cast<std::uint64_t>(size);
+    const std::uint64_t e = (M * (static_cast<std::uint64_t>(rank)+1)) / static_cast<std::uint64_t>(size);
     PatchSlice from_file = reader->read_slice(b, e);
 
     UscPatchSelector file_sel(comm);

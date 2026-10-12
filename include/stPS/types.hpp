@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <tuple>
 
 namespace stPS {
 
@@ -16,12 +17,13 @@ struct Point {
     double x = 0.0;
     double y = 0.0;
 
+    // std::tie compares with operator< only, and the defaulted == is
+    // memberwise — exact equality is intended here, without tripping
+    // -Wfloat-equal in our own code.
     friend bool operator<(const Point& a, const Point& b) noexcept {
-        return a.x != b.x ? a.x < b.x : a.y < b.y;
+        return std::tie(a.x, a.y) < std::tie(b.x, b.y);
     }
-    friend bool operator==(const Point& a, const Point& b) noexcept {
-        return a.x == b.x && a.y == b.y;
-    }
+    friend bool operator==(const Point&, const Point&) noexcept = default;
 };
 
 inline constexpr Score kDisabledScore = -1;

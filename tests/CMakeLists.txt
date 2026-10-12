@@ -24,6 +24,7 @@ target_link_libraries(stps_tests PRIVATE
     stPS
     GTest::gtest
 )
+enable_compiler_warnings(stps_tests)
 
 # Tests run with one MPI rank per visible GPU (NCCL requires 1:1 process:device
 # mapping). Override via -DSTPS_TEST_NRANKS=<n> at configure time when

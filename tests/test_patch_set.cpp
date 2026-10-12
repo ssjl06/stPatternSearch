@@ -42,7 +42,7 @@ std::vector<Hash> gather_shards(stComm::Comm& comm, const std::vector<Hash>& sha
 
     std::vector<int> counts(static_cast<std::size_t>(size));
     std::uint64_t total = 0;
-    for (int r = 0; r < size; ++r) { counts[r] = static_cast<int>(sizes[r]); total += sizes[r]; }
+    for (std::size_t r = 0; r < counts.size(); ++r) { counts[r] = static_cast<int>(sizes[r]); total += sizes[r]; }
 
     std::vector<Hash> all(total);
     comm.allgatherv<stComm::Space::Host, Hash>(shard.data(), static_cast<int>(local_n),
@@ -104,7 +104,7 @@ TEST(PatchSetShard, ReverseMapTranslatesCsrBackToInputHashes) {
         std::sort(expect.begin(), expect.end());
         expect.erase(std::unique(expect.begin(), expect.end()), expect.end());
 
-        const auto row = ps.patches().patch(static_cast<PatchId>(p));
+        const auto row = ps.patches().patch(p);
         ASSERT_EQ(row.size(), expect.size()) << "patch " << p;
         for (std::size_t i = 0; i < row.size(); ++i) {
             ASSERT_LT(row[i], all.size());

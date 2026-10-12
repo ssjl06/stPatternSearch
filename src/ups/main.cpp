@@ -56,12 +56,12 @@ void print_usage(const char* prog) {
         "                        and exit (data-prep tool mode; no GPU needed)\n"
         "  -h, --help            show this help\n",
         prog,
-        (unsigned long)CliOptions{}.output_limit,
-        (unsigned long)CliOptions{}.params.N,
-        (unsigned long)CliOptions{}.params.M,
-        (unsigned)     CliOptions{}.params.K_mean,
-                       CliOptions{}.params.overlap,
-        (unsigned long)CliOptions{}.params.seed);
+        CliOptions{}.output_limit,
+        CliOptions{}.params.N,
+        CliOptions{}.params.M,
+        CliOptions{}.params.K_mean,
+        CliOptions{}.params.overlap,
+        CliOptions{}.params.seed);
 }
 
 bool parse_args(int argc, char** argv, CliOptions& opt) {
@@ -130,8 +130,8 @@ stPS::PatchSlice read_input_slice(const std::string& path, int rank, int size,
         std::exit(1);
     }
     const std::uint64_t M     = reader->patch_count();
-    const std::uint64_t begin = (M * static_cast<std::uint64_t>(rank))     / size;
-    const std::uint64_t end   = (M * (static_cast<std::uint64_t>(rank)+1)) / size;
+    const std::uint64_t begin = (M * static_cast<std::uint64_t>(rank))     / static_cast<std::uint64_t>(size);
+    const std::uint64_t end   = (M * (static_cast<std::uint64_t>(rank)+1)) / static_cast<std::uint64_t>(size);
     return reader->read_slice(begin, end);
 }
 
