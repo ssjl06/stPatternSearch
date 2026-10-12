@@ -51,8 +51,8 @@ void run_case(std::uint64_t N, std::uint64_t M, std::uint32_t K,
     char tag[128];
     std::snprintf(tag, sizeof(tag),
                   "N=%lu M=%lu K=%u overlap=%.2f seed=%lu ranks=%d mode=%s",
-                  (unsigned long)N, (unsigned long)M, (unsigned)K, overlap,
-                  (unsigned long)seed, comm.getSize(),
+                  N, M, K, overlap,
+                  seed, comm.getSize(),
                   mode == PartitionMode::ByElement ? "element" : "patch");
     expect_match(multi, bf, tag);
 

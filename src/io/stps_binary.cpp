@@ -158,10 +158,10 @@ public:
         slice.global_ids.reserve(n);
         if (has_coords_) slice.coords.reserve(n);
         for (std::uint64_t p = 0; p < n; ++p) {
-            const std::uint64_t b = offs[p] - offs[0];
-            const std::uint64_t e = offs[p + 1] - offs[0];
+            const auto b = static_cast<std::ptrdiff_t>(offs[p] - offs[0]);
+            const auto e = static_cast<std::ptrdiff_t>(offs[p + 1] - offs[0]);
             slice.patches.emplace_back(flat.begin() + b, flat.begin() + e);
-            slice.global_ids.push_back(static_cast<PatchId>(begin + p));
+            slice.global_ids.push_back(begin + p);
             if (has_coords_) {
                 slice.coords.emplace_back(flat_coords.begin() + b, flat_coords.begin() + e);
             }

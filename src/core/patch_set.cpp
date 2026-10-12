@@ -40,13 +40,12 @@ std::vector<Hash> compute_splitters(const std::vector<Hash>& local_uniq_sorted,
         // contribute meaningful samples.
         std::fill(local_sample.begin(), local_sample.end(), Hash{0});
     } else if (n <= static_cast<std::size_t>(kSamplesPerRank)) {
-        for (int i = 0; i < kSamplesPerRank; ++i) {
-            local_sample[i] = local_uniq_sorted[std::min<std::size_t>(i, n - 1)];
+        for (std::size_t i = 0; i < local_sample.size(); ++i) {
+            local_sample[i] = local_uniq_sorted[std::min(i, n - 1)];
         }
     } else {
-        for (int i = 0; i < kSamplesPerRank; ++i) {
-            const std::size_t idx =
-                (static_cast<std::size_t>(i) * (n - 1)) / (kSamplesPerRank - 1);
+        for (std::size_t i = 0; i < local_sample.size(); ++i) {
+            const std::size_t idx = (i * (n - 1)) / (local_sample.size() - 1);
             local_sample[i] = local_uniq_sorted[idx];
         }
     }
@@ -74,8 +73,8 @@ std::vector<Hash> compute_splitters(const std::vector<Hash>& local_uniq_sorted,
 
 // Map a hash to its target rank via splitter binary search.
 // For size=1 returns 0 unconditionally.
-inline int target_rank_for_hash(Hash h, const std::vector<Hash>& splitters) {
-    return static_cast<int>(
+inline std::size_t target_rank_for_hash(Hash h, const std::vector<Hash>& splitters) {
+    return static_cast<std::size_t>(
         std::upper_bound(splitters.begin(), splitters.end(), h) - splitters.begin());
 }
 
@@ -85,6 +84,8 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
                                           std::vector<std::vector<Hash>> raw_patches) {
     const int size = comm.getSize();
     const int rank = comm.getRank();
+    const auto usize = static_cast<std::size_t>(size);
+    const auto urank = static_cast<std::size_t>(rank);
 
     // Design doc §5.1 distributed setup. Patches are already partitioned across
     // ranks (permanent). Within setup we perform a *temporary* hash partition:
@@ -111,32 +112,32 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     // target rank via splitter binary search. local_uniq is already sorted.
     const std::vector<Hash> splitters = compute_splitters(local_uniq, comm);
 
-    std::vector<int>  sendcounts(static_cast<std::size_t>(size), 0);
+    std::vector<int>  sendcounts(usize, 0);
     for (Hash h : local_uniq) ++sendcounts[target_rank_for_hash(h, splitters)];
 
-    std::vector<int>  send_offsets(static_cast<std::size_t>(size), 0);
-    for (int r = 1; r < size; ++r) send_offsets[r] = send_offsets[r - 1] + sendcounts[r - 1];
+    std::vector<int>  send_offsets(usize, 0);
+    for (std::size_t r = 1; r < usize; ++r) send_offsets[r] = send_offsets[r - 1] + sendcounts[r - 1];
 
     std::vector<Hash> sendbuf(local_uniq.size());
     {
         std::vector<int> cursor = send_offsets;  // per-target write head
         for (Hash h : local_uniq) {
-            const int target = target_rank_for_hash(h, splitters);
-            sendbuf[cursor[target]++] = h;
+            const std::size_t target = target_rank_for_hash(h, splitters);
+            sendbuf[static_cast<std::size_t>(cursor[target]++)] = h;
         }
     }
 
     // Step 3: exchange sendcounts so every rank learns its own recv counts.
     // stComm has no plain allgather; emulate via allgatherv with uniform
     // recv length = size (each rank contributes its full sendcounts row).
-    std::vector<int> all_sendcounts(static_cast<std::size_t>(size) * size);
+    std::vector<int> all_sendcounts(usize * usize);
     {
-        std::vector<int> uniform(static_cast<std::size_t>(size), size);
+        std::vector<int> uniform(usize, size);
         comm.allgatherv<stComm::Space::Host, int>(sendcounts.data(), size,
                                        all_sendcounts.data(), uniform.data())->wait();
     }
-    std::vector<int> recvcounts(static_cast<std::size_t>(size), 0);
-    for (int s = 0; s < size; ++s) recvcounts[s] = all_sendcounts[s * size + rank];
+    std::vector<int> recvcounts(usize, 0);
+    for (std::size_t s = 0; s < usize; ++s) recvcounts[s] = all_sendcounts[s * usize + urank];
 
     // Step 4: alltoallv — every hash flies to its owner rank.
     const int total_recv = std::accumulate(recvcounts.begin(), recvcounts.end(), 0);
@@ -180,7 +181,7 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     std::unordered_map<Hash, ElementId> hash_to_id;
     hash_to_id.reserve(sendbuf.size() * 2);
     for (std::size_t i = 0; i < sendbuf.size(); ++i) {
-        hash_to_id.emplace(sendbuf[i], static_cast<ElementId>(id_back[i]));
+        hash_to_id.emplace(sendbuf[i], id_back[i]);
     }
 
     // Step 11: translate raw_patches into ID-space, sort + dedupe per patch. The

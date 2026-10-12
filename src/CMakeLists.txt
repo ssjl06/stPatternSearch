@@ -22,6 +22,7 @@ add_library(stPS STATIC
     data/partition.cpp
 )
 add_library(stPS::stPS ALIAS stPS)
+enable_compiler_warnings(stPS)
 
 # -DUSC_PROFILE=ON compiles in the per-stage profiler calls (usc/usc_patch_selector_impl.cu
 # guards them behind #ifdef USC_PROFILE); off by default = zero-overhead hot path.
@@ -73,6 +74,7 @@ install(TARGETS stPS
 add_executable(usc-patch-select usc/main.cpp core/cli_support.cpp)
 target_include_directories(usc-patch-select PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(usc-patch-select PRIVATE stPS)
+enable_compiler_warnings(usc-patch-select)
 
 # UPS driver: top-K pattern statistics (count + representative location) via
 # the public stPS::UpsPatternStats, written to a single file by all ranks in
@@ -80,3 +82,4 @@ target_link_libraries(usc-patch-select PRIVATE stPS)
 add_executable(ups-pattern-stats ups/main.cpp core/cli_support.cpp)
 target_include_directories(ups-pattern-stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ups-pattern-stats PRIVATE stPS)
+enable_compiler_warnings(ups-pattern-stats)

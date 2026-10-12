@@ -116,7 +116,7 @@ TEST(PatternStats, TopKMatchesHostReference) {
     const std::uint64_t k = 17;
     const auto topk = distributed_stats(comm, data, k);
     ASSERT_EQ(topk.size(), std::min<std::size_t>(k, ref.size()));
-    expect_stats_eq(topk, {ref.begin(), ref.begin() + topk.size()});
+    expect_stats_eq(topk, {ref.begin(), ref.begin() + static_cast<std::ptrdiff_t>(topk.size())});
 }
 
 TEST(PatternStats, KPastUniqueCountReturnsAll) {

@@ -19,7 +19,7 @@ PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
     slice.global_ids.reserve(my_end - my_begin);
     for (std::uint64_t p = my_begin; p < my_end; ++p) {
         slice.patches.push_back(std::move(all_patches[p]));
-        slice.global_ids.push_back(static_cast<PatchId>(p));
+        slice.global_ids.push_back(p);
     }
     return slice;
 }

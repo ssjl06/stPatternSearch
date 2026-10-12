@@ -36,11 +36,11 @@ void write_pattern_stats_file(stComm::Comm& comm, const std::string& path,
 
     // This rank's contiguous line range (same split rule as patches-by-rank).
     const std::uint64_t k = stats.size();
-    const std::uint64_t begin = (k * static_cast<std::uint64_t>(rank))     / size;
-    const std::uint64_t end   = (k * (static_cast<std::uint64_t>(rank)+1)) / size;
+    const std::uint64_t begin = (k * static_cast<std::uint64_t>(rank))     / static_cast<std::uint64_t>(size);
+    const std::uint64_t end   = (k * (static_cast<std::uint64_t>(rank)+1)) / static_cast<std::uint64_t>(size);
 
     std::string buf;
-    buf.reserve((end - begin) * kLineBytes + (rank == 0 ? header_len : 0));
+    buf.reserve((end - begin) * kLineBytes + (rank == 0 ? static_cast<std::size_t>(header_len) : 0));
     if (rank == 0) buf.append(header, static_cast<std::size_t>(header_len));
     for (std::uint64_t i = begin; i < end; ++i) {
         char line[kLineBytes + 1];

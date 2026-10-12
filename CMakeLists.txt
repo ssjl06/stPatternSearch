@@ -30,24 +30,14 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STPS_BUILD_TESTS "Build unit tests (GoogleTest via FetchContent)" ON)
-option(STPS_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 # Per-stage profiling in the USC solve loop (CUDA-event + host timers). Off by
 # default so the production hot path carries no synchronization; enable with
 # -DUSC_PROFILE=ON to get a per-iteration stage breakdown on stderr.
 option(USC_PROFILE "Enable USC per-stage profiling instrumentation" OFF)
 
-if(MSVC)
-    add_compile_options(/W4 /permissive-)
-else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter)
-endif()
-if(STPS_WARNINGS_AS_ERRORS)
-    if(MSVC)
-        add_compile_options(/WX)
-    else()
-        add_compile_options(-Werror)
-    endif()
-endif()
+# Warning set + -O3, attached per target (PRIVATE) by enable_compiler_warnings().
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(enable_compiler_warnings)
 
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(stComm REQUIRED)
