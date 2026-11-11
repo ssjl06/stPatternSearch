@@ -115,15 +115,15 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     // local_uniq is sorted and the splitters are sorted, so target ranks are
     // non-decreasing along it: local_uniq already IS the send buffer, laid out
     // in target-rank order. Only the per-target counts are needed.
-    std::vector<std::uint64_t> send64(usize, 0);
-    for (Hash h : local_uniq) ++send64[target_rank_for_hash(h, splitters)];
+    std::vector<std::size_t> sendcounts(usize, 0);
+    for (Hash h : local_uniq) ++sendcounts[target_rank_for_hash(h, splitters)];
 
-    // Step 3: exchange the counts so every rank learns its recv counts — and
-    // all ranks agree the exchange fits stComm's int counts before sizing
-    // anything (throws everywhere together otherwise).
-    const ExchangeCounts counts = agree_exchange_counts(comm, send64, "hash → id mapping");
+    // Step 3: exchange the counts so every rank learns its recv counts.
+    const ExchangeCounts counts = exchange_counts(comm, std::move(sendcounts));
 
-    // Step 4: alltoallv — every hash flies to its owner rank.
+    // Step 4: alltoallv — every hash flies to its owner rank. size_t counts:
+    // stComm's unlimited-size exchange, so a rank's unique-hash set may be any
+    // size (the int-count collectives stop at INT_MAX elements).
     const std::size_t total_recv =
         std::accumulate(counts.recv.begin(), counts.recv.end(), std::size_t{0});
     std::vector<Hash> recvbuf(total_recv);

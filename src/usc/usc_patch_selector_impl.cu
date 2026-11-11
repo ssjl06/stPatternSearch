@@ -570,16 +570,15 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     }
 
     // Replicated slot → caller PatchId map (used only to report the result).
-    std::vector<int> mcounts(static_cast<std::size_t>(size), 0);
+    std::vector<std::size_t> mcounts(static_cast<std::size_t>(size), 0);
     {
         std::vector<int> ones(static_cast<std::size_t>(size), 1);
-        const int m_local_int = static_cast<int>(M_local);
-        comm_.allgatherv<stComm::Space::Host, int>(&m_local_int, 1,
-                                                   mcounts.data(), ones.data())->wait();
+        const std::size_t m_local = M_local;
+        comm_.allgatherv<stComm::Space::Host, std::size_t>(&m_local, 1,
+                                                           mcounts.data(), ones.data())->wait();
     }
     slot_to_gid_.resize(M_global_);
-    comm_.allgatherv<stComm::Space::Host, PatchId>(global_ids.data(),
-                                                   static_cast<int>(M_local),
+    comm_.allgatherv<stComm::Space::Host, PatchId>(global_ids.data(), mcounts[static_cast<std::size_t>(rank)],
                                                    slot_to_gid_.data(), mcounts.data())->wait();
 
     // ---- Shard geometry ------------------------------------------------------
@@ -602,24 +601,20 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     const auto owner_of = [shard_size](ElementId e) {
         return shard_size ? static_cast<std::size_t>(e / shard_size) : std::size_t{0};
     };
-    // Counted in 64 bits: a rank's incidences can pass INT_MAX on a full-chip
-    // input, and an int tally would overflow before anything could check it.
-    std::vector<std::uint64_t> send64(usize, 0);
+    // Counted in 64 bits and shipped with stComm's size_t-count exchange: a
+    // rank's incidences pass INT_MAX on a full-chip input, and nothing here
+    // caps them.
+    std::vector<std::size_t> sendcounts(usize, 0);
     for (const auto& p : mapped.id_patches)
-        for (ElementId e : p) ++send64[owner_of(e)];
+        for (ElementId e : p) ++sendcounts[owner_of(e)];
 
-    // Exchange the counts; every rank learns its recv counts and all agree the
-    // exchange fits stComm's int counts (throws on every rank together
-    // otherwise) — before the send buffers are sized.
-    const ExchangeCounts counts =
-        agree_exchange_counts(comm_, send64, "ByElement incidence redistribution");
+    // Exchange the counts so every rank learns its recv counts.
+    const ExchangeCounts counts = exchange_counts(comm_, std::move(sendcounts));
 
     std::vector<std::size_t> cursor(usize, 0);  // per-target write head
-    for (std::size_t r = 1; r < usize; ++r) {
-        cursor[r] = cursor[r - 1] + static_cast<std::size_t>(send64[r - 1]);
-    }
+    for (std::size_t r = 1; r < usize; ++r) cursor[r] = cursor[r - 1] + counts.send[r - 1];
     const std::size_t total_send =
-        static_cast<std::size_t>(std::accumulate(send64.begin(), send64.end(), std::uint64_t{0}));
+        std::accumulate(counts.send.begin(), counts.send.end(), std::size_t{0});
     std::vector<PatchId>   send_slots(total_send);
     std::vector<ElementId> send_elems(total_send);
     for (std::uint64_t p = 0; p < M_local; ++p) {

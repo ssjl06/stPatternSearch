@@ -263,29 +263,35 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
 
     // inv.keys is sorted → each owner's entries form one contiguous run; the
     // host copy of the keys yields sendcounts without a D2H transfer.
-    std::vector<std::uint64_t> send64(static_cast<std::size_t>(size), 0);
+    std::vector<std::size_t> owner_counts(static_cast<std::size_t>(size), 0);
     for (std::size_t i = 0; i < n_local; ++i) {
         const auto owner = static_cast<std::size_t>(
             std::upper_bound(starts.begin() + 1, starts.begin() + size, inv.keys[i]) -
             (starts.begin() + 1));
-        ++send64[owner];
+        ++owner_counts[owner];
     }
-    // Points travel with doubled counts (below), so each side's total must fit
-    // int after doubling; agreed on every rank before any buffer is sized.
-    const ExchangeCounts counts = agree_exchange_counts(
-        comm, send64, "pattern_stats candidate exchange",
-        static_cast<std::uint64_t>(std::numeric_limits<int>::max()) / 2);
-    const std::vector<int>& sendcounts = counts.send;
-    const std::vector<int>& recvcounts = counts.recv;
+    const ExchangeCounts counts = exchange_counts(comm, std::move(owner_counts));
+    const std::vector<std::size_t>& sendcounts = counts.send;
+    const std::vector<std::size_t>& recvcounts = counts.recv;
     const std::size_t total_recv =
         std::accumulate(recvcounts.begin(), recvcounts.end(), std::size_t{0});
+    // The exchange itself is unlimited (size_t counts); what arrives is then
+    // sorted and reduced on this rank's GPU by CUB, whose DeviceReduce takes an
+    // int item count. Arrivals past that would need > 100 GB of device memory
+    // for the stage, so this is a device-capacity bound, agreed on every rank.
+    if (!all_ranks_ok(comm, total_recv <=
+                                static_cast<std::size_t>(std::numeric_limits<int>::max()))) {
+        throw std::length_error(
+            "pattern_stats: a rank would receive more than INT_MAX candidates for its "
+            "device-side reduction — use more ranks");
+    }
 
     // Points travel as interleaved doubles (Point is two packed doubles) with
     // doubled counts — no split kernel, pairing preserved.
     static_assert(sizeof(Point) == 2 * sizeof(double),
                   "Point must be two packed doubles for the coordinate exchange");
-    std::vector<int> sendcounts2(sendcounts), recvcounts2(recvcounts);
-    for (int r = 0; r < size; ++r) { sendcounts2[r] *= 2; recvcounts2[r] *= 2; }
+    std::vector<std::size_t> sendcounts2(sendcounts), recvcounts2(recvcounts);
+    for (std::size_t r = 0; r < sendcounts2.size(); ++r) { sendcounts2[r] *= 2; recvcounts2[r] *= 2; }
 
     DeviceBuffer<std::uint64_t> d_r_ids(total_recv), d_r_deg(total_recv);
     DeviceBuffer<Point>         d_r_pts(total_recv);
@@ -402,29 +408,17 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     // counts, tiny) and reduce identically everywhere. Any global top-k entry
     // is in its owner's local top-k, so this is exact. All ranks hold size×k
     // candidates — fine for a stats tool; revisit if k ever gets huge.
-    // Counts travel as int64 so the size guard below sees true values; stComm's
-    // host allgatherv takes int element counts and int element displacements,
-    // so the whole candidate set must stay under INT_MAX entries. The guard
-    // runs on the gathered counts — identical everywhere — so every rank
-    // throws together. Only a huge --output-limit over a huge hash set hits it.
-    const std::int64_t k_local64 = static_cast<std::int64_t>(k_local);
-    std::vector<std::int64_t> cand_counts64(static_cast<std::size_t>(size));
+    // size_t counts on stComm's unlimited-size allgatherv: size × k
+    // candidates may be any number.
+    const std::size_t n_cand = k_local;
+    std::vector<std::size_t> cand_counts(static_cast<std::size_t>(size));
     {
         std::vector<int> ones(static_cast<std::size_t>(size), 1);
-        comm.allgatherv<stComm::Space::Host, std::int64_t>(&k_local64, 1,
-                                       cand_counts64.data(), ones.data())->wait();
+        comm.allgatherv<stComm::Space::Host, std::size_t>(&n_cand, 1,
+                                       cand_counts.data(), ones.data())->wait();
     }
-    const std::uint64_t total_cand_u = static_cast<std::uint64_t>(
-        std::accumulate(cand_counts64.begin(), cand_counts64.end(), std::int64_t{0}));
-    if (total_cand_u > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-        throw std::invalid_argument(
-            "pattern_stats: k=" + std::to_string(k) + " gathers " +
-            std::to_string(total_cand_u) + " candidates across ranks, past the int "
-            "count limit of the host allgatherv — lower k");
-    }
-    const int n_cand = static_cast<int>(k_local);
-    const std::vector<int> cand_counts(cand_counts64.begin(), cand_counts64.end());
-    const std::size_t total_cand = static_cast<std::size_t>(total_cand_u);
+    const std::size_t total_cand =
+        std::accumulate(cand_counts.begin(), cand_counts.end(), std::size_t{0});
 
     std::vector<Hash>          all_hash(total_cand);
     std::vector<std::uint64_t> all_cnt(total_cand);

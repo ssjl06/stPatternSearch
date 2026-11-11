@@ -1,7 +1,6 @@
 #pragma once
 
-#include <climits>
-#include <cstdint>
+#include <cstddef>
 #include <vector>
 
 namespace stComm { class Comm; }
@@ -15,23 +14,17 @@ namespace stPS {
 // this with its own verdict and all of them throw (or carry on) together.
 bool all_ranks_ok(stComm::Comm& comm, bool local_ok);
 
-// Per-rank element counts for an alltoallv, in the int form stComm takes.
+// Per-rank element counts for an alltoallv, in the size_t form stComm's
+// unlimited-size collectives take. 64-bit throughout: a full-chip input puts
+// far more than INT_MAX elements on one rank, and nothing here may cap that.
 struct ExchangeCounts {
-    std::vector<int> send;   // send[r] = elements this rank sends to rank r
-    std::vector<int> recv;   // recv[s] = elements this rank receives from rank s
+    std::vector<std::size_t> send;   // send[r] = elements this rank sends to rank r
+    std::vector<std::size_t> recv;   // recv[s] = elements this rank receives from rank s
 };
 
-// Collective: turn this rank's 64-bit send counts (send[r] = elements bound for
-// rank r, size == comm size) into the matching int send/recv counts for an
-// alltoallv. The full rank × rank matrix is gathered, so every rank evaluates
-// the same limit check and — if ANY rank would send or receive more than
-// `max_total` elements in total — all throw std::length_error together,
-// before any buffer is sized. (An int count or displacement past INT_MAX is
-// otherwise undefined behaviour on the counting rank, or an exception on that
-// rank alone.) `what` names the exchange in the message.
-ExchangeCounts agree_exchange_counts(stComm::Comm& comm,
-                                     const std::vector<std::uint64_t>& send,
-                                     const char* what,
-                                     std::uint64_t max_total = INT_MAX);
+// Collective: given this rank's send counts (send[r] = elements bound for rank
+// r, size == comm size), learn the matching receive counts — recv[s] is what
+// rank s reported for this rank.
+ExchangeCounts exchange_counts(stComm::Comm& comm, std::vector<std::size_t> send);
 
 }  // namespace stPS

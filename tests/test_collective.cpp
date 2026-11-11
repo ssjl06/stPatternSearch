@@ -9,7 +9,6 @@
 
 #include <gtest/gtest.h>
 
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -27,41 +26,25 @@ TEST(Collective, AllRanksOkNeedsEveryRank) {
 TEST(Collective, ExchangeCountsMirrorSendAndRecv) {
     stComm::Comm& comm = test_helpers::comm();
     const auto size = static_cast<std::size_t>(comm.getSize());
-    const auto rank = static_cast<std::uint64_t>(comm.getRank());
+    const auto rank = static_cast<std::size_t>(comm.getRank());
 
-    // Rank s sends (s + 1) * (r + 2) elements to rank r.
-    std::vector<std::uint64_t> send(size);
+    // Rank s sends (s + 1) * (r + 2) elements to rank r — plus a count far
+    // past INT_MAX on the diagonal: counts are 64-bit end to end, never capped.
+    const std::size_t huge = (std::size_t{1} << 40) + rank;
+    std::vector<std::size_t> send(size);
     for (std::size_t r = 0; r < size; ++r) send[r] = (rank + 1) * (r + 2);
+    send[rank] = huge;
 
-    const ExchangeCounts counts = agree_exchange_counts(comm, send, "test exchange");
+    const ExchangeCounts counts = exchange_counts(comm, send);
     ASSERT_EQ(counts.send.size(), size);
     ASSERT_EQ(counts.recv.size(), size);
     for (std::size_t r = 0; r < size; ++r) {
-        EXPECT_EQ(counts.send[r], static_cast<int>((rank + 1) * (r + 2)));
-        EXPECT_EQ(counts.recv[r], static_cast<int>((r + 1) * (rank + 2)));
+        if (r == rank) continue;
+        EXPECT_EQ(counts.send[r], (rank + 1) * (r + 2));
+        EXPECT_EQ(counts.recv[r], (r + 1) * (rank + 2));
     }
-}
-
-TEST(Collective, ExchangeCountsRejectOversizeOnEveryRank) {
-    stComm::Comm& comm = test_helpers::comm();
-    const auto size = static_cast<std::size_t>(comm.getSize());
-
-    // Only rank 0 is over the limit; the verdict comes from the gathered
-    // matrix, so every rank must throw — none may be left to enter the
-    // exchange alone.
-    std::vector<std::uint64_t> send(size, 1);
-    if (comm.getRank() == 0) send[0] = static_cast<std::uint64_t>(INT_MAX) + 1;
-    EXPECT_THROW(agree_exchange_counts(comm, send, "test exchange"), std::length_error);
-
-    // A custom (smaller) limit applies to the per-rank totals, both ways.
-    std::vector<std::uint64_t> small(size, 4);
-    EXPECT_THROW(agree_exchange_counts(comm, small, "test exchange", 4 * size - 1),
-                 std::length_error);
-    EXPECT_NO_THROW(agree_exchange_counts(comm, small, "test exchange", 4 * size));
-
-    // A count that would wrap a 64-bit running sum is still caught.
-    std::vector<std::uint64_t> wrap(size, UINT64_MAX);
-    EXPECT_THROW(agree_exchange_counts(comm, wrap, "test exchange"), std::length_error);
+    EXPECT_EQ(counts.send[rank], huge);
+    EXPECT_EQ(counts.recv[rank], huge);
 }
 
 TEST(Partition, RankRangeTilesTheList) {
