@@ -10,6 +10,7 @@ add_executable(stps_tests
     test_patch_io.cpp
     test_pattern_stats.cpp
     test_cli_support.cpp
+    test_collective.cpp
     helpers/local_setup.cpp
     ${CMAKE_SOURCE_DIR}/src/core/cli_support.cpp   # app-level, not in libstPS
 )

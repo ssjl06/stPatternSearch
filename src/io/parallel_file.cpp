@@ -1,5 +1,7 @@
 #include "io/parallel_file.hpp"
 
+#include "core/collective.hpp"
+
 #include <stComm/stComm.h>
 
 #include <fcntl.h>
@@ -24,23 +26,26 @@ std::string io_error(const char* what) {
 // so all throw together. Doubles as the barrier between write phases.
 void agree_or_throw(stComm::Comm& comm, const std::string& prefix,
                     const std::string& local_err) {
-    const std::int32_t ok = local_err.empty() ? 1 : 0;
-    std::int32_t all_ok = 0;
-    comm.allreduce<stComm::Space::Host, std::int32_t>(
-        &ok, &all_ok, 1, stComm::ReduceOp::Min)->wait();
-    if (!all_ok) {
+    if (!all_ranks_ok(comm, local_err.empty())) {
         throw std::runtime_error(prefix +
             (local_err.empty() ? std::string("I/O failed on another rank") : local_err));
     }
 }
 
-// Write all `bytes` at `offset`, retrying short writes. "" on success.
+// Write all `bytes` at `offset`, retrying short writes and interrupted calls.
+// "" on success.
 std::string pwrite_all(int fd, const void* data, std::size_t bytes, off_t offset) {
     const char* p = static_cast<const char*>(data);
     for (std::size_t done = 0; done < bytes;) {
         const ssize_t w = ::pwrite(fd, p + done, bytes - done,
                                    offset + static_cast<off_t>(done));
-        if (w < 0) return io_error("pwrite failed");
+        if (w < 0) {
+            if (errno == EINTR) continue;  // a signal, not a failure
+            return io_error("pwrite failed");
+        }
+        // No progress and no error: retrying would spin forever while the
+        // other ranks wait in agree_or_throw.
+        if (w == 0) return "pwrite wrote 0 bytes (no space left or file size limit?)";
         done += static_cast<std::size_t>(w);
     }
     return {};

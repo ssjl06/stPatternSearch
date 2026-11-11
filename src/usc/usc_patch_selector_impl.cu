@@ -1,5 +1,7 @@
 #include "usc/usc_patch_selector_impl.hpp"
 
+#include "core/collective.hpp"
+#include "core/cuda_check.hpp"
 #include "core/gpu_profiler.hpp"
 #include "core/host_profiler.hpp"
 
@@ -65,6 +67,30 @@ __global__ void build_newly_covered_kernel(const ElementId*     patch_data,
     }
 }
 
+// Resolve element `id`'s patch-list range [start, end) in a sorted-key inverted
+// index (lower_bound over `inv_keys`). An element that does not occur on this
+// rank / shard is not in the index and gets the empty range.
+__device__ inline void inv_index_range(ElementId            id,
+                                       const ElementId*     inv_keys,
+                                       std::uint64_t        inv_keys_n,
+                                       const std::uint64_t* inv_offsets,
+                                       std::uint64_t&       start,
+                                       std::uint64_t&       end) {
+    std::uint64_t lo = 0, hi = inv_keys_n;
+    while (lo < hi) {
+        const std::uint64_t mid = lo + ((hi - lo) >> 1);
+        if (inv_keys[mid] < id) lo = mid + 1;
+        else                    hi = mid;
+    }
+    if (lo < inv_keys_n && inv_keys[lo] == id) {
+        start = inv_offsets[lo];
+        end   = inv_offsets[lo + 1];
+    } else {
+        start = 0;
+        end   = 0;
+    }
+}
+
 // Design doc §6.3 strategy A — inverted-index, affected-only score update.
 //
 // One block per *newly covered* element (grid = winner_score). The block looks
@@ -96,20 +122,7 @@ __global__ void score_update_invidx_kernel(const ElementId*     newly_ids,
     __shared__ std::uint64_t s_start;
     __shared__ std::uint64_t s_end;
     if (threadIdx.x == 0) {
-        const ElementId id = newly_ids[e];
-        std::uint64_t lo = 0, hi = inv_keys_n;
-        while (lo < hi) {                       // lower_bound over sorted keys
-            const std::uint64_t mid = lo + ((hi - lo) >> 1);
-            if (inv_keys[mid] < id) lo = mid + 1;
-            else                    hi = mid;
-        }
-        if (lo < inv_keys_n && inv_keys[lo] == id) {
-            s_start = inv_offsets[lo];
-            s_end   = inv_offsets[lo + 1];
-        } else {
-            s_start = 0;        // element not on this rank → empty range
-            s_end   = 0;
-        }
+        inv_index_range(newly_ids[e], inv_keys, inv_keys_n, inv_offsets, s_start, s_end);
     }
     __syncthreads();
 
@@ -142,7 +155,7 @@ struct ElemLoopState {
     std::uint64_t covered_count;
     std::uint64_t num_selected;   // == iterations executed
     std::uint32_t done;
-    std::uint32_t pad_;
+    std::uint32_t last_score;     // most recent winner's score (batch sizing)
 };
 
 // Per-iteration winner scratch: written by the commit kernel, consumed by the
@@ -178,6 +191,7 @@ __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore
     const int slot = argmax->key;
     selected_slots[st->num_selected] = static_cast<PatchId>(slot);
     st->num_selected  += 1;
+    st->last_score     = static_cast<std::uint32_t>(score);
     st->covered_count += static_cast<std::uint64_t>(score);
     if (st->covered_count >= N) st->done = 1;
     w->start = sub_offsets[slot];
@@ -241,20 +255,7 @@ __global__ void elem_score_update_kernel(const ElementId*      newly_ids,
     __shared__ std::uint64_t s_end;
     for (std::uint64_t e = blockIdx.x; e < n; e += gridDim.x) {
         if (threadIdx.x == 0) {
-            const ElementId id = newly_ids[e];
-            std::uint64_t lo = 0, hi = inv_keys_n;
-            while (lo < hi) {                       // lower_bound over sorted keys
-                const std::uint64_t mid = lo + ((hi - lo) >> 1);
-                if (inv_keys[mid] < id) lo = mid + 1;
-                else                    hi = mid;
-            }
-            if (lo < inv_keys_n && inv_keys[lo] == id) {
-                s_start = inv_offsets[lo];
-                s_end   = inv_offsets[lo + 1];
-            } else {
-                s_start = 0;        // element not on this shard → empty range
-                s_end   = 0;
-            }
+            inv_index_range(newly_ids[e], inv_keys, inv_keys_n, inv_offsets, s_start, s_end);
         }
         __syncthreads();
         for (std::uint64_t i = s_start + threadIdx.x; i < s_end; i += blockDim.x) {
@@ -262,25 +263,6 @@ __global__ void elem_score_update_kernel(const ElementId*      newly_ids,
             atomicSub(reinterpret_cast<int*>(&scores[inv_data[i]]), 1);
         }
         __syncthreads();  // all readers done before thread 0 overwrites s_start/s_end
-    }
-}
-
-// Small helper: launch + sync-check. Aborts on any kernel error so a bug
-// surfaces at the responsible kernel rather than later as an opaque memcpy fail.
-inline void cuda_launch_check(const char* what) {
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA launch error in ") + what +
-                                 ": " + cudaGetErrorString(err));
-    }
-}
-
-// For blocking calls (cudaMemcpy): an earlier kernel's fault surfaces as their
-// return code, so dropping it would let the loop run on garbage host values.
-inline void cuda_check(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA error in ") + what +
-                                 ": " + cudaGetErrorString(err));
     }
 }
 
@@ -588,16 +570,15 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     }
 
     // Replicated slot → caller PatchId map (used only to report the result).
-    std::vector<int> mcounts(static_cast<std::size_t>(size), 0);
+    std::vector<std::size_t> mcounts(static_cast<std::size_t>(size), 0);
     {
         std::vector<int> ones(static_cast<std::size_t>(size), 1);
-        const int m_local_int = static_cast<int>(M_local);
-        comm_.allgatherv<stComm::Space::Host, int>(&m_local_int, 1,
-                                                   mcounts.data(), ones.data())->wait();
+        const std::size_t m_local = M_local;
+        comm_.allgatherv<stComm::Space::Host, std::size_t>(&m_local, 1,
+                                                           mcounts.data(), ones.data())->wait();
     }
     slot_to_gid_.resize(M_global_);
-    comm_.allgatherv<stComm::Space::Host, PatchId>(global_ids.data(),
-                                                   static_cast<int>(M_local),
+    comm_.allgatherv<stComm::Space::Host, PatchId>(global_ids.data(), mcounts[static_cast<std::size_t>(rank)],
                                                    slot_to_gid_.data(), mcounts.data())->wait();
 
     // ---- Shard geometry ------------------------------------------------------
@@ -616,52 +597,47 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     // rank then holds, for ALL M_global patches, the sub-list inside its shard —
     // every incidence stored on exactly one rank (M·K/P per rank), tighter than
     // §7.5's conservative full patch replication.
-    std::vector<int> sendcounts(static_cast<std::size_t>(size), 0);
+    const auto usize = static_cast<std::size_t>(size);
+    const auto owner_of = [shard_size](ElementId e) {
+        return shard_size ? static_cast<std::size_t>(e / shard_size) : std::size_t{0};
+    };
+    // Counted in 64 bits and shipped with stComm's size_t-count exchange: a
+    // rank's incidences pass INT_MAX on a full-chip input, and nothing here
+    // caps them.
+    std::vector<std::size_t> sendcounts(usize, 0);
     for (const auto& p : mapped.id_patches)
-        for (ElementId e : p)
-            ++sendcounts[shard_size ? static_cast<int>(e / shard_size) : 0];
+        for (ElementId e : p) ++sendcounts[owner_of(e)];
 
-    std::vector<int> send_offsets(static_cast<std::size_t>(size), 0);
-    for (int r = 1; r < size; ++r) send_offsets[r] = send_offsets[r - 1] + sendcounts[r - 1];
+    // Exchange the counts so every rank learns its recv counts.
+    const ExchangeCounts counts = exchange_counts(comm_, std::move(sendcounts));
 
+    std::vector<std::size_t> cursor(usize, 0);  // per-target write head
+    for (std::size_t r = 1; r < usize; ++r) cursor[r] = cursor[r - 1] + counts.send[r - 1];
     const std::size_t total_send =
-        std::accumulate(sendcounts.begin(), sendcounts.end(), std::size_t{0});
+        std::accumulate(counts.send.begin(), counts.send.end(), std::size_t{0});
     std::vector<PatchId>   send_slots(total_send);
     std::vector<ElementId> send_elems(total_send);
-    {
-        std::vector<int> cursor = send_offsets;  // per-target write head
-        for (std::uint64_t p = 0; p < M_local; ++p) {
-            const PatchId slot = slot_start + p;
-            for (ElementId e : mapped.id_patches[p]) {
-                const int target = shard_size ? static_cast<int>(e / shard_size) : 0;
-                send_slots[cursor[target]] = slot;
-                send_elems[cursor[target]] = e;
-                ++cursor[target];
-            }
+    for (std::uint64_t p = 0; p < M_local; ++p) {
+        const PatchId slot = slot_start + p;
+        for (ElementId e : mapped.id_patches[p]) {
+            const std::size_t at = cursor[owner_of(e)]++;
+            send_slots[at] = slot;
+            send_elems[at] = e;
         }
     }
     mapped.id_patches.clear();
     mapped.id_patches.shrink_to_fit();
 
-    // Exchange counts (same allgatherv trick as §5.1 step 3), then ship the
-    // incidences as two parallel alltoallv's sharing one count layout.
-    std::vector<int> all_sendcounts(static_cast<std::size_t>(size) * size);
-    {
-        std::vector<int> uniform(static_cast<std::size_t>(size), size);
-        comm_.allgatherv<stComm::Space::Host, int>(sendcounts.data(), size,
-                                                   all_sendcounts.data(), uniform.data())->wait();
-    }
-    std::vector<int> recvcounts(static_cast<std::size_t>(size), 0);
-    for (int s = 0; s < size; ++s) recvcounts[s] = all_sendcounts[s * size + rank];
+    // Ship the incidences as two parallel alltoallv's sharing one count layout.
     const std::size_t total_recv =
-        std::accumulate(recvcounts.begin(), recvcounts.end(), std::size_t{0});
+        std::accumulate(counts.recv.begin(), counts.recv.end(), std::size_t{0});
 
     std::vector<PatchId>   recv_slots(total_recv);
     std::vector<ElementId> recv_elems(total_recv);
-    comm_.alltoallv<stComm::Space::Host, PatchId>(send_slots.data(), sendcounts.data(),
-                                                  recv_slots.data(), recvcounts.data())->wait();
-    comm_.alltoallv<stComm::Space::Host, ElementId>(send_elems.data(), sendcounts.data(),
-                                                    recv_elems.data(), recvcounts.data())->wait();
+    comm_.alltoallv<stComm::Space::Host, PatchId>(send_slots.data(), counts.send.data(),
+                                                  recv_slots.data(), counts.recv.data())->wait();
+    comm_.alltoallv<stComm::Space::Host, ElementId>(send_elems.data(), counts.send.data(),
+                                                    recv_elems.data(), counts.recv.data())->wait();
     send_slots.clear(); send_slots.shrink_to_fit();
     send_elems.clear(); send_elems.shrink_to_fit();
 
@@ -739,6 +715,10 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
             init64.data(), sum64.data(), M_global_, stComm::ReduceOp::Sum)->wait();
         const std::int64_t wire_max =
             static_cast<std::int64_t>(std::numeric_limits<WireScore>::max()) - size - 1;
+        // The largest initial score bounds every later winner (scores only
+        // decrease) — select() sizes its first batch from it.
+        max_initial_score_ = static_cast<std::uint64_t>(
+            std::max<std::int64_t>(*std::max_element(sum64.begin(), sum64.end()), 0));
         for (std::uint64_t s = 0; s < M_global_; ++s) {
             if (sum64[s] > wire_max) {
                 throw std::invalid_argument(
@@ -767,8 +747,11 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 //   [device] elem_build_newly / elem_set_bits / elem_score_update
 //            (fixed grids; range/count read from device memory)
 //
-// The host enqueues kBatch iterations at a time and then syncs ONCE to read
-// the 24 B loop state — there are no per-iteration D2H/H2D round-trips. This
+// The host enqueues a batch of iterations at a time and then syncs ONCE to
+// read the 24 B loop state — there are no per-iteration D2H/H2D round-trips.
+// The batch is sized so it cannot run past the end of the solve (see the
+// loop): every enqueued iteration costs an M_global-wide allreduce, the
+// mode's dominant cost, whether or not it still has work to do. This
 // is only possible in ByElement: its collective has a fixed count and no
 // root, so it needs no host scalars (the exact blockers that keep the
 // ByPatch multi-rank loop host-driven; see ROADMAP "Full-GPU iteration
@@ -816,10 +799,22 @@ PatchSelection UscElemPatchSelectorImpl::select() {
         d_argmax_temp.resize(temp_bytes);
     }
 
-    constexpr int kBatch = 128;
+    // Batch sizing. Winner scores never increase over a greedy solve (covering
+    // elements only lowers every patch's score), so each remaining iteration
+    // covers at most `score_bound` elements and at least
+    // ceil(remaining / score_bound) more iterations must run. Enqueueing
+    // exactly that many — capped at kMaxBatch — never overshoots the end of
+    // the solve, where a fixed-size batch would burn up to kMaxBatch − 1 idle
+    // allreduce + argmax passes. Both inputs come from allreduced state, so
+    // every rank picks the same batch and the collectives stay matched.
+    constexpr std::uint64_t kMaxBatch = 128;
+    std::uint64_t score_bound = std::max<std::uint64_t>(max_initial_score_, 1);
     ElemLoopState h_state{};
     while (true) {
-        for (int b = 0; b < kBatch; ++b) {
+        const std::uint64_t remaining = N_ - h_state.covered_count;
+        const std::uint64_t batch = std::clamp<std::uint64_t>(
+            remaining / score_bound + (remaining % score_bound != 0), 1, kMaxBatch);
+        for (std::uint64_t b = 0; b < batch; ++b) {
             if (size > 1) {
                 // Enqueue-only — no wait. Stream order makes iteration k's
                 // updated partials the input of iteration k+1's allreduce.
@@ -850,16 +845,19 @@ PatchSelection UscElemPatchSelectorImpl::select() {
                 d_scores_partial_.data());
         }
         cuda_launch_check("device-resident batch (elem)");
-        cuda_check(cudaMemcpyAsync(&h_state, d_state.data(), sizeof(h_state),
-                                   cudaMemcpyDeviceToHost, stream),
-                   "device-resident batch (elem) state copy");
         // Drain the stream through stComm, not cudaStreamSynchronize: the
         // batch has allreduces in flight, and stComm's polled sync also
         // watches the communicator for async failures (dead peer, network
         // fault) — a plain synchronize would hang on those until walltime.
-        // Throws on a CUDA or NCCL error.
+        // Throws on a CUDA or NCCL error. Only then read the state: a copy
+        // into pageable host memory enqueued behind the batch would itself
+        // block until the batch finished, before the polled drain ever ran.
         comm_.nccl().barrier();
+        cuda_check(cudaMemcpy(&h_state, d_state.data(), sizeof(h_state),
+                              cudaMemcpyDeviceToHost),
+                   "device-resident batch (elem) state copy");
         if (h_state.done) break;
+        score_bound = std::max<std::uint64_t>(h_state.last_score, 1);
     }
 
     // Drain the device-side result: selected slots → caller PatchIds.
@@ -885,7 +883,8 @@ struct UscPatchSelector::Impl {
     // Exactly one is engaged, per the ctor's PartitionMode.
     std::unique_ptr<UscPatchSelectorImpl>     by_patch;
     std::unique_ptr<UscElemPatchSelectorImpl> by_element;
-    Impl(stComm::Comm& comm, PartitionMode mode) {
+    stComm::Comm& comm;
+    Impl(stComm::Comm& c, PartitionMode mode) : comm(c) {
         if (mode == PartitionMode::ByElement) {
             by_element = std::make_unique<UscElemPatchSelectorImpl>(comm);
         } else {
@@ -902,12 +901,32 @@ UscPatchSelector& UscPatchSelector::operator=(UscPatchSelector&&) noexcept = def
 
 PatchSelection UscPatchSelector::patch_select(std::vector<std::vector<Hash>> patches,
                                               std::vector<PatchId>           global_ids) {
-    // Both modes index global_ids by local patch index (ByElement also
-    // allgathers it as M_local entries) — a short vector reads out of bounds.
+    // Validate this rank's slice, then agree on the verdict: a rank throwing
+    // on its own would leave its peers waiting in the setup collectives.
+    const auto int_max = static_cast<std::size_t>(std::numeric_limits<int>::max());
+    std::string err;
     if (global_ids.size() != patches.size()) {
+        // Both modes index global_ids by local patch index (ByElement also
+        // allgathers it as M_local entries) — a short vector reads out of bounds.
+        err = "patch_select: global_ids has " + std::to_string(global_ids.size()) +
+              " entries for " + std::to_string(patches.size()) + " patches";
+    } else if (patches.size() > int_max) {
+        // CUB ArgMax takes an int item count; a truncated one would scan a
+        // prefix and silently pick the wrong winner.
+        err = "patch_select: " + std::to_string(patches.size()) +
+              " patches on one rank exceeds the int index range — use more ranks";
+    } else {
+        for (std::size_t p = 0; p < patches.size(); ++p) {
+            if (patches[p].size() > int_max) {  // kernel grid sizes derive from it
+                err = "patch_select: patch " + std::to_string(global_ids[p]) +
+                      " has more than INT_MAX elements";
+                break;
+            }
+        }
+    }
+    if (!all_ranks_ok(impl_->comm, err.empty())) {
         throw std::invalid_argument(
-            "patch_select: global_ids has " + std::to_string(global_ids.size()) +
-            " entries for " + std::to_string(patches.size()) + " patches");
+            err.empty() ? std::string("patch_select: invalid input on another rank") : err);
     }
     return impl_->by_element
         ? impl_->by_element->patch_select(std::move(patches), std::move(global_ids))

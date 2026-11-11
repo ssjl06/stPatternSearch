@@ -24,9 +24,7 @@ Design rationale lives in [`greedy_set_cover.md`](./greedy_set_cover.md).
 | M6 | Element-partitioned covered bitset (§7.3) — `PartitionMode::ByElement` | ✅ opt-in |
 | M7 | Real OPC input parser + 2D partition (§7.4) | ⏳ Planned |
 
-Branches:
-- `main` — CPU-only baseline (through M3). Stable regression reference.
-- `gpu` — GPU work (M4+). M5+ continues here.
+All of the above lives on `main` (GPU-only: CUDA + NCCL are required).
 
 ## Documentation
 
