@@ -99,7 +99,7 @@ private:
 // the NCCL stream — without knowing any iteration's outcome. A single-thread
 // commit kernel consumes the argmax result on device (append selected slot,
 // advance covered_count, winner disable, set a done flag); the host syncs once
-// per kBatch iterations to read the 24 B loop state. There are no per-iteration
+// per batch of iterations to read the 24 B loop state. There are no per-iteration
 // D2H/H2D round-trips at all.
 class UscElemPatchSelectorImpl {
 public:
@@ -129,6 +129,9 @@ private:
     std::vector<PatchId> slot_to_gid_;
     InvertedIndex        inv_;   // shard-local: keys are shard-local IDs
     std::uint64_t        max_sub_len_ = 0;
+    // Largest initial global score — an upper bound on every winner's score,
+    // used to size the first device-resident batch.
+    std::uint64_t        max_initial_score_ = 0;
 
     // Device state. d_patch_data_ stores SHARD-LOCAL element IDs (global ID −
     // shard_base_), so the covered bitset and the kernels index the local shard

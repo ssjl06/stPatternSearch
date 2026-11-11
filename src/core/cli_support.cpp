@@ -3,10 +3,12 @@
 #include <cuda_runtime.h>
 #include <mpi.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <string>
 #include <system_error>
 
 namespace stPS::cli {
@@ -46,6 +48,21 @@ int world_rank_or_minus_one() {
 }
 
 }  // namespace
+
+OptionParse parse_synthetic_option(int argc, char** argv, int& i, SyntheticParams& params) {
+    const std::string a = argv[i];
+    const bool mine = a == "--N" || a == "--M" || a == "--K" ||
+                      a == "--overlap" || a == "--seed";
+    if (!mine) return OptionParse::NotMine;
+    if (i + 1 >= argc) return OptionParse::MissingValue;
+    const char* v = argv[++i];
+    if      (a == "--N")       params.N       = std::strtoull(v, nullptr, 10);
+    else if (a == "--M")       params.M       = std::strtoull(v, nullptr, 10);
+    else if (a == "--K")       params.K_mean  = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+    else if (a == "--overlap") params.overlap = std::strtod(v, nullptr);
+    else                       params.seed    = std::strtoull(v, nullptr, 10);
+    return OptionParse::Consumed;
+}
 
 void install_mpi_abort_on_uncaught() {
     std::set_terminate(abort_on_terminate);

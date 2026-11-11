@@ -5,9 +5,21 @@
 // device placement and fatal-error policy belong to the application, not the
 // library.
 
+#include "data/synthetic.hpp"
+
 #include <string>
 
 namespace stPS::cli {
+
+// The synthetic-data options every driver accepts: --N --M --K --overlap
+// --seed. Looks at argv[i]; if it is one of them, stores the value into
+// `params` and advances `i` past it.
+enum class OptionParse {
+    NotMine,       // argv[i] is some other option — the caller handles it
+    Consumed,      // parsed; i now points at the option's value
+    MissingValue,  // the option is the last argument, with no value after it
+};
+OptionParse parse_synthetic_option(int argc, char** argv, int& i, SyntheticParams& params);
 
 // Route every uncaught exception straight to MPI_Abort. With no matching
 // handler, the C++ runtime calls std::terminate *without* unwinding the stack,

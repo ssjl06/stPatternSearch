@@ -91,8 +91,8 @@ latency/overhead-bound, not compute-bound — optimize launches/syncs, not FLOPs
 
 ## Full-GPU iteration track — ✅ SHIPPED for ByElement (M6.5, 2026-07-06)
 
-> The ByElement loop is now device-resident in production: batches of 128
-> iterations enqueued blind on the NCCL stream (fixed-count root-less
+> The ByElement loop is now device-resident in production: batches of up to
+> 128 iterations enqueued blind on the NCCL stream (fixed-count root-less
 > allreduce + on-device commit kernel + fixed-grid updates), one 24 B state
 > read per batch, zero per-iteration host round-trips. size == 1 skips the
 > allreduce — subsuming the single-rank prototype below. Bit-identical at all

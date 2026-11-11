@@ -42,6 +42,11 @@ public:
 // std::runtime_error if the file is missing, unreadable, or not a known format.
 std::unique_ptr<PatchReader> open_patch_file(const std::string& path);
 
+// This rank's contiguous patch range of the file (rank_range over the patch
+// count — the same split slice_patches_by_rank applies in memory, so file
+// input and in-memory input give identical rank slices). Not collective.
+PatchSlice read_rank_slice(PatchReader& reader, int rank, int size);
+
 // Write the v1 .stps binary CSR file (format documented in stps_binary.cpp).
 // Overwrites `path`. Throws std::runtime_error on I/O failure.
 void write_patch_file(const std::string& path,

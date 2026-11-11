@@ -179,6 +179,11 @@ private:
 
 }  // namespace
 
+PatchSlice read_rank_slice(PatchReader& reader, int rank, int size) {
+    const RankRange mine = rank_range(reader.patch_count(), rank, size);
+    return reader.read_slice(mine.begin, mine.end);
+}
+
 std::unique_ptr<PatchReader> open_patch_file(const std::string& path) {
     FilePtr f(std::fopen(path.c_str(), "rb"));
     if (!f) fail(path, "cannot open: " + std::string(std::strerror(errno)));

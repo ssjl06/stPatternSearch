@@ -53,10 +53,20 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
 //
 // GPU-only, move-only. `comm` is used only during construction (the collective
 // setup) and is not retained.
+
+// Which host structures get a device mirror. Every incidence costs 16 B of GPU
+// memory in the full set (patch CSR data + inverted-index values), so an
+// algorithm whose kernels never read those asks for the layout only.
+enum class PatchSetMirrors {
+    All,                  // patch data + inverted-index keys/offsets/values (USC)
+    InvertedIndexLayout,  // inverted-index keys + offsets only (UPS)
+};
+
 class PatchSet {
 public:
     // Collective: every rank must construct together with its own local patches.
-    PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches);
+    PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches,
+             PatchSetMirrors mirrors = PatchSetMirrors::All);
 
     // Host-side views.
     std::uint64_t        N() const noexcept { return N_; }
@@ -70,9 +80,9 @@ public:
     const std::vector<Hash>& shard_hashes() const noexcept { return shard_hashes_; }
     std::uint64_t            shard_start()  const noexcept { return shard_start_; }
 
-    // Device mirrors (populated at construction) — raw const pointers for kernels.
+    // Device mirrors (populated at construction) — raw const pointers for
+    // kernels. d_patch_data / d_inv_data are null unless PatchSetMirrors::All.
     const ElementId*     d_patch_data()    const noexcept { return d_patch_data_.data(); }
-    const std::uint64_t* d_patch_offsets() const noexcept { return d_patch_offsets_.data(); }
     const ElementId*     d_inv_keys()      const noexcept { return d_inv_keys_.data(); }
     const std::uint64_t* d_inv_offsets()   const noexcept { return d_inv_offsets_.data(); }
     const PatchId*       d_inv_data()      const noexcept { return d_inv_data_.data(); }
@@ -86,7 +96,6 @@ private:
     std::uint64_t     shard_start_ = 0;
 
     DeviceBuffer<ElementId>     d_patch_data_;
-    DeviceBuffer<std::uint64_t> d_patch_offsets_;
     DeviceBuffer<ElementId>     d_inv_keys_;
     DeviceBuffer<std::uint64_t> d_inv_offsets_;
     DeviceBuffer<PatchId>       d_inv_data_;

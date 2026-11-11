@@ -1,5 +1,7 @@
 #include <stPS/ups_pattern_stats.hpp>
 
+#include "core/collective.hpp"
+#include "core/cuda_check.hpp"
 #include "core/device_buffer.hpp"
 #include "core/patch_set.hpp"
 #include "ups/unique_hash_file.hpp"
@@ -107,29 +109,6 @@ inline unsigned blocks_for(std::uint64_t n, unsigned threads = 256) {
     return static_cast<unsigned>((n + threads - 1) / threads);
 }
 
-inline void cuda_launch_check(const char* what) {
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA launch error in ") + what +
-                                 ": " + cudaGetErrorString(err));
-    }
-}
-
-inline void cuda_sync_check(const char* what) {
-    cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA sync error in ") + what +
-                                 ": " + cudaGetErrorString(err));
-    }
-}
-
-inline void cuda_check(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA error in ") + what +
-                                 ": " + cudaGetErrorString(err));
-    }
-}
-
 // Two-phase CUB call: query temp bytes, (re)alloc, run. `f` returns CUB's
 // status — a failed size query would otherwise leave bytes == 0 and turn the
 // second call into another no-op query, so the pipeline would read unsorted,
@@ -185,8 +164,10 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     }
     coords.clear(); coords.shrink_to_fit();
 
-    DeviceBuffer<Hash>  d_uniq_hash;   // ReduceByKey needs the buffer; only the
-    DeviceBuffer<Point> d_min_pts;     // run count feeds the alignment check.
+    // One representative per local unique hash, right-sized: everything else
+    // from this stage (24 B per raw occurrence) is released before the PatchSet
+    // and the exchange buffers are built.
+    DeviceBuffer<Point> d_min_pts;
     std::uint64_t n_uniq = 0;
     if (total_occ > 0) {
         DeviceBuffer<Hash>  d_occ_hash(total_occ), d_sorted_hash(total_occ);
@@ -203,24 +184,34 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
                 static_cast<int>(total_occ));
         });
 
-        d_uniq_hash.resize(total_occ);
-        d_min_pts.resize(total_occ);
-        DeviceBuffer<int> d_num_runs(1);
+        // ReduceByKey needs a key output buffer; only the run count is used
+        // (it feeds the alignment check below).
+        DeviceBuffer<Hash>  d_uniq_hash(total_occ);
+        DeviceBuffer<Point> d_run_pts(total_occ);
+        DeviceBuffer<int>   d_num_runs(1);
         cub_run(d_temp, "reduce-by-key min-location", [&](void* t, std::size_t& b) {
             return cub::DeviceReduce::ReduceByKey(t, b,
                 d_sorted_hash.data(), d_uniq_hash.data(),
-                d_sorted_pts.data(),  d_min_pts.data(),
+                d_sorted_pts.data(),  d_run_pts.data(),
                 d_num_runs.data(), LexMinPoint{}, static_cast<int>(total_occ));
         });
         int n_runs = 0;
         d_num_runs.copy_to_host(&n_runs, 1);
         n_uniq = static_cast<std::uint64_t>(n_runs);
+
+        d_min_pts.resize(n_uniq);
+        if (n_uniq > 0) {
+            cuda_check(cudaMemcpy(d_min_pts.data(), d_run_pts.data(),
+                                  n_uniq * sizeof(Point), cudaMemcpyDeviceToDevice),
+                       "compact min-location runs");
+        }
     }
 
     // ---- Shared distributed setup. The §5.1 mapping assigns IDs in global
     // hash order, so the hash-sorted reduction above pairs positionally with
     // the PatchSet's sorted inverted-index keys.
-    PatchSet ps(comm, std::move(patches));
+    // UPS kernels read only the inverted-index layout (keys + offsets).
+    PatchSet ps(comm, std::move(patches), PatchSetMirrors::InvertedIndexLayout);
     // Optional full unique-hash dump straight from the PatchSet's §5.1 shards,
     // so the hash sort runs once for both outputs.
     if (!unique_hashes_path.empty()) {
@@ -229,10 +220,24 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     }
     const InvertedIndex& inv = ps.inverted_index();
     const std::uint64_t n_local = inv.keys.size();
-    if (n_uniq != n_local) {
-        throw std::runtime_error(
-            "pattern_stats: occurrence reduction / inverted-index disagree (" +
-            std::to_string(n_uniq) + " vs " + std::to_string(n_local) + ")");
+    // Per-rank conditions, agreed collectively so no rank throws alone and
+    // strands the others in the exchange below.
+    {
+        std::string err;
+        if (n_uniq != n_local) {
+            err = "pattern_stats: occurrence reduction / inverted-index disagree (" +
+                  std::to_string(n_uniq) + " vs " + std::to_string(n_local) + ")";
+        } else if (ps.shard_hashes().size() >
+                   static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            // The shard top-k radix sort takes an int item count.
+            err = "pattern_stats: this rank's shard holds " +
+                  std::to_string(ps.shard_hashes().size()) +
+                  " unique hashes, past the int range of the device sort — use more ranks";
+        }
+        if (!all_ranks_ok(comm, err.empty())) {
+            throw std::runtime_error(
+                err.empty() ? std::string("pattern_stats: setup failed on another rank") : err);
+        }
     }
 
     // ---- B. Local degrees (device): adjacent difference over the PatchSet's
@@ -258,23 +263,22 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
 
     // inv.keys is sorted → each owner's entries form one contiguous run; the
     // host copy of the keys yields sendcounts without a D2H transfer.
-    std::vector<int> sendcounts(static_cast<std::size_t>(size), 0);
+    std::vector<std::uint64_t> send64(static_cast<std::size_t>(size), 0);
     for (std::size_t i = 0; i < n_local; ++i) {
-        const int owner = static_cast<int>(
+        const auto owner = static_cast<std::size_t>(
             std::upper_bound(starts.begin() + 1, starts.begin() + size, inv.keys[i]) -
             (starts.begin() + 1));
-        ++sendcounts[owner];
+        ++send64[owner];
     }
-    std::vector<int> recvcounts(static_cast<std::size_t>(size), 0);
-    {
-        std::vector<int> all(static_cast<std::size_t>(size) * size);
-        std::vector<int> uniform(static_cast<std::size_t>(size), size);
-        comm.allgatherv<stComm::Space::Host, int>(sendcounts.data(), size,
-                                       all.data(), uniform.data())->wait();
-        for (int s = 0; s < size; ++s) recvcounts[s] = all[s * size + rank];
-    }
-    const std::size_t total_recv = static_cast<std::size_t>(
-        std::accumulate(recvcounts.begin(), recvcounts.end(), 0));
+    // Points travel with doubled counts (below), so each side's total must fit
+    // int after doubling; agreed on every rank before any buffer is sized.
+    const ExchangeCounts counts = agree_exchange_counts(
+        comm, send64, "pattern_stats candidate exchange",
+        static_cast<std::uint64_t>(std::numeric_limits<int>::max()) / 2);
+    const std::vector<int>& sendcounts = counts.send;
+    const std::vector<int>& recvcounts = counts.recv;
+    const std::size_t total_recv =
+        std::accumulate(recvcounts.begin(), recvcounts.end(), std::size_t{0});
 
     // Points travel as interleaved doubles (Point is two packed doubles) with
     // doubled counts — no split kernel, pairing preserved.
@@ -399,9 +403,9 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     // is in its owner's local top-k, so this is exact. All ranks hold size×k
     // candidates — fine for a stats tool; revisit if k ever gets huge.
     // Counts travel as int64 so the size guard below sees true values; stComm's
-    // host allgatherv takes int counts and int *byte* displacements, so the
-    // whole candidate set (8 B per value) must stay under INT_MAX bytes. The
-    // guard runs on the gathered counts — identical everywhere — so every rank
+    // host allgatherv takes int element counts and int element displacements,
+    // so the whole candidate set must stay under INT_MAX entries. The guard
+    // runs on the gathered counts — identical everywhere — so every rank
     // throws together. Only a huge --output-limit over a huge hash set hits it.
     const std::int64_t k_local64 = static_cast<std::int64_t>(k_local);
     std::vector<std::int64_t> cand_counts64(static_cast<std::size_t>(size));
@@ -412,11 +416,11 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     }
     const std::uint64_t total_cand_u = static_cast<std::uint64_t>(
         std::accumulate(cand_counts64.begin(), cand_counts64.end(), std::int64_t{0}));
-    if (total_cand_u > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) / 8) {
+    if (total_cand_u > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
         throw std::invalid_argument(
             "pattern_stats: k=" + std::to_string(k) + " gathers " +
             std::to_string(total_cand_u) + " candidates across ranks, past the int "
-            "byte-count limit of the host allgatherv — lower k");
+            "count limit of the host allgatherv — lower k");
     }
     const int n_cand = static_cast<int>(k_local);
     const std::vector<int> cand_counts(cand_counts64.begin(), cand_counts64.end());
@@ -456,23 +460,37 @@ std::vector<PatternStat> UpsPatternStats::pattern_stats(
     std::vector<std::vector<Point>> coords,
     std::uint64_t k,
     const std::string& unique_hashes_path) {
+    // Validate this rank's slice, then agree on the verdict: a rank throwing
+    // on its own would leave its peers waiting in the setup collectives.
+    std::string err;
+    std::size_t total_occ = 0;
     if (coords.size() != patches.size()) {
-        throw std::invalid_argument("pattern_stats: coords/patches shape mismatch");
+        err = "pattern_stats: coords/patches shape mismatch";
     }
-    for (std::size_t p = 0; p < patches.size(); ++p) {
+    for (std::size_t p = 0; err.empty() && p < patches.size(); ++p) {
+        total_occ += patches[p].size();
         if (coords[p].size() != patches[p].size()) {
-            throw std::invalid_argument(
-                "pattern_stats: coords/patches shape mismatch at patch " +
-                std::to_string(p));
+            err = "pattern_stats: coords/patches shape mismatch at patch " + std::to_string(p);
+            break;
         }
         // A NaN wins every LexMinPoint comparison (and breaks its
         // associativity), so it would silently become the representative.
         for (const Point& pt : coords[p]) {
             if (!std::isfinite(pt.x) || !std::isfinite(pt.y)) {
-                throw std::invalid_argument(
-                    "pattern_stats: non-finite coordinate in patch " + std::to_string(p));
+                err = "pattern_stats: non-finite coordinate in patch " + std::to_string(p);
+                break;
             }
         }
+    }
+    if (err.empty() &&
+        total_occ > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        // The occurrence radix sort / reduce-by-key take an int item count.
+        err = "pattern_stats: " + std::to_string(total_occ) + " occurrences on one "
+              "rank exceeds the int range of the device sort — use more ranks";
+    }
+    if (!all_ranks_ok(impl_->comm, err.empty())) {
+        throw std::invalid_argument(
+            err.empty() ? std::string("pattern_stats: invalid input on another rank") : err);
     }
     return impl_->run(std::move(patches), std::move(coords), k, unique_hashes_path);
 }

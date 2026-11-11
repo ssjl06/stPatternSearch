@@ -2,6 +2,7 @@
 
 #include <stPS/types.hpp>
 
+#include <cstdint>
 #include <vector>
 
 namespace stPS {
@@ -16,14 +17,24 @@ struct PatchSlice {
     std::vector<std::vector<Point>> coords;
 };
 
+// The contiguous split rule used everywhere a list is divided across ranks
+// (patches, file slices, output lines): rank r of `size` owns items
+// [r*count/size, (r+1)*count/size). Throws std::invalid_argument unless
+// 0 <= rank < size.
+struct RankRange {
+    std::uint64_t begin = 0;
+    std::uint64_t end   = 0;
+};
+RankRange rank_range(std::uint64_t count, int rank, int size);
+
 // Partition an M-patch list contiguously across `size` ranks and return rank
 // `rank`'s slice with its global patch IDs. Independent of where the patches
 // came from. Rank r owns global IDs [r*M/size, (r+1)*M/size).
 PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
                                  int rank, int size);
 
-// Same split, carrying per-occurrence coordinates alongside (coords must match
-// all_patches shape).
+// Same split, carrying per-occurrence coordinates alongside. Throws
+// std::invalid_argument if coords does not have one entry per patch.
 PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
                                  std::vector<std::vector<Point>> coords,
                                  int rank, int size);

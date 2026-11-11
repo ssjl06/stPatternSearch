@@ -173,7 +173,7 @@ All three scales bit-identical between modes and sizes 1/2 (`selected` =
 
 Because ByElement's one collective has a fixed count and no root (the exact
 blockers that killed the earlier multi-rank device-resident attempt), the host
-now enqueues **batches of 128 whole iterations blind** on the NCCL stream —
+now enqueues **batches of up to 128 whole iterations blind** on the NCCL stream —
 ncclAllReduce + CUB ArgMax + a single-thread `elem_commit_winner` kernel
 (winner append, covered_count, winner disable, done flag, all on device) +
 three fixed-grid grid-stride update kernels — and syncs once per batch to read
@@ -181,7 +181,11 @@ a 24 B loop state. **Zero per-iteration D2H/H2D round-trips.** At size == 1
 the allreduce is skipped (partials are the full scores) — this is the
 single-rank device-resident loop the ROADMAP prototype validated at 2.7×.
 Iterations enqueued past termination no-op on device; `done` derives only from
-allreduced values, so all ranks leave after the same batch.
+allreduced values, so all ranks leave after the same batch. Batches are sized
+so that does not normally happen: winner scores never increase, so at least
+⌈remaining / last winner score⌉ more iterations must run, and the host enqueues
+exactly that many (capped at 128) instead of a fixed 128 — no idle
+allreduce + argmax passes after the solve ends.
 
 Measured (patch-select total = setup + solve, ms; same-mode host-loop "before"
 from the M6 table — identical setup, so the delta is pure solve):

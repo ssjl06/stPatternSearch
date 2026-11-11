@@ -22,6 +22,7 @@ struct CliOptions {
     std::string     input;   // read patches from a .stps file instead of synthetic
     std::string     dump;    // write synthetic patches to a .stps file and exit
     bool print_solution = false;
+    bool help           = false;
 };
 
 void print_usage(const char* prog) {
@@ -55,13 +56,15 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
             if (i + 1 >= argc) return nullptr;
             return argv[++i];
         };
-        if      (a == "-h" || a == "--help") { print_usage(argv[0]); std::exit(0); }
-        else if (a == "--N")        { const char* v = next_val(); if (!v) return false; opt.params.N      = std::strtoull(v, nullptr, 10); }
-        else if (a == "--M")        { const char* v = next_val(); if (!v) return false; opt.params.M      = std::strtoull(v, nullptr, 10); }
-        else if (a == "--K")        { const char* v = next_val(); if (!v) return false; opt.params.K_mean = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10)); }
-        else if (a == "--overlap")  { const char* v = next_val(); if (!v) return false; opt.params.overlap = std::strtod(v, nullptr); }
-        else if (a == "--seed")     { const char* v = next_val(); if (!v) return false; opt.params.seed   = std::strtoull(v, nullptr, 10); }
-        else if (a == "--partition") {
+        // Not std::exit: MPI is already up, and leaving without finalize makes
+        // mpirun report a failed job for a successful --help.
+        if (a == "-h" || a == "--help") { opt.help = true; return true; }
+        switch (stPS::cli::parse_synthetic_option(argc, argv, i, opt.params)) {
+            case stPS::cli::OptionParse::Consumed:     continue;
+            case stPS::cli::OptionParse::MissingValue: return false;
+            case stPS::cli::OptionParse::NotMine:      break;
+        }
+        if (a == "--partition") {
             const char* v = next_val(); if (!v) return false;
             const std::string m = v;
             if      (m == "patch")   opt.mode = PartitionMode::ByPatch;
@@ -84,17 +87,6 @@ bool parse_args(int argc, char** argv, CliOptions& opt) {
     return true;
 }
 
-// This rank's contiguous patch range in file order — the same split rule as
-// slice_patches_by_rank, so file input and synthetic input produce identical
-// rank slices (and therefore identical solves) for the same data.
-stPS::PatchSlice read_input_slice(const std::string& path, int rank, int size) {
-    auto reader = stPS::open_patch_file(path);
-    const std::uint64_t M     = reader->patch_count();
-    const std::uint64_t begin = (M * static_cast<std::uint64_t>(rank))     / static_cast<std::uint64_t>(size);
-    const std::uint64_t end   = (M * (static_cast<std::uint64_t>(rank)+1)) / static_cast<std::uint64_t>(size);
-    return reader->read_slice(begin, end);
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -107,6 +99,9 @@ int main(int argc, char** argv) {
     {
         CliOptions opt;
         if (!parse_args(argc, argv, opt)) { exit_code = 1; }
+        else if (opt.help) {
+            if (stComm::Comm{}.getRank() == 0) print_usage(argv[0]);
+        }
         else if (!opt.dump.empty()) {
             // Data-prep tool mode: write the synthetic set to a .stps file and
             // exit. Host-only — no GPU, no NCCL bootstrap.
@@ -129,7 +124,8 @@ int main(int argc, char** argv) {
             // otherwise every rank generates the (deterministic) synthetic set
             // and keeps its slice.
             auto slice = !opt.input.empty()
-                ? read_input_slice(opt.input, comm.getRank(), comm.getSize())
+                ? stPS::read_rank_slice(*stPS::open_patch_file(opt.input),
+                                        comm.getRank(), comm.getSize())
                 : stPS::slice_patches_by_rank(
                       generate_synthetic(opt.params), comm.getRank(), comm.getSize());
             const std::size_t m_local = slice.patches.size();  // capture before move

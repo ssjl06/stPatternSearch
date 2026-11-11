@@ -1,6 +1,7 @@
 add_library(stPS STATIC
     # core/ — shared, algorithm-neutral primitives + the hashed patch set
     core/bitset.cpp
+    core/collective.cpp
     core/csr.cpp
     core/inverted_index.cpp
     core/device_buffer.cu

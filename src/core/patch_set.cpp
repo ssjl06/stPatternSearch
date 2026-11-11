@@ -1,5 +1,6 @@
 #include "core/patch_set.hpp"
 
+#include "core/collective.hpp"
 #include "core/csr.hpp"
 #include "core/inverted_index.hpp"
 
@@ -85,7 +86,6 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     const int size = comm.getSize();
     const int rank = comm.getRank();
     const auto usize = static_cast<std::size_t>(size);
-    const auto urank = static_cast<std::size_t>(rank);
 
     // Design doc §5.1 distributed setup. Patches are already partitioned across
     // ranks (permanent). Within setup we perform a *temporary* hash partition:
@@ -112,38 +112,23 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     // target rank via splitter binary search. local_uniq is already sorted.
     const std::vector<Hash> splitters = compute_splitters(local_uniq, comm);
 
-    std::vector<int>  sendcounts(usize, 0);
-    for (Hash h : local_uniq) ++sendcounts[target_rank_for_hash(h, splitters)];
+    // local_uniq is sorted and the splitters are sorted, so target ranks are
+    // non-decreasing along it: local_uniq already IS the send buffer, laid out
+    // in target-rank order. Only the per-target counts are needed.
+    std::vector<std::uint64_t> send64(usize, 0);
+    for (Hash h : local_uniq) ++send64[target_rank_for_hash(h, splitters)];
 
-    std::vector<int>  send_offsets(usize, 0);
-    for (std::size_t r = 1; r < usize; ++r) send_offsets[r] = send_offsets[r - 1] + sendcounts[r - 1];
-
-    std::vector<Hash> sendbuf(local_uniq.size());
-    {
-        std::vector<int> cursor = send_offsets;  // per-target write head
-        for (Hash h : local_uniq) {
-            const std::size_t target = target_rank_for_hash(h, splitters);
-            sendbuf[static_cast<std::size_t>(cursor[target]++)] = h;
-        }
-    }
-
-    // Step 3: exchange sendcounts so every rank learns its own recv counts.
-    // stComm has no plain allgather; emulate via allgatherv with uniform
-    // recv length = size (each rank contributes its full sendcounts row).
-    std::vector<int> all_sendcounts(usize * usize);
-    {
-        std::vector<int> uniform(usize, size);
-        comm.allgatherv<stComm::Space::Host, int>(sendcounts.data(), size,
-                                       all_sendcounts.data(), uniform.data())->wait();
-    }
-    std::vector<int> recvcounts(usize, 0);
-    for (std::size_t s = 0; s < usize; ++s) recvcounts[s] = all_sendcounts[s * usize + urank];
+    // Step 3: exchange the counts so every rank learns its recv counts — and
+    // all ranks agree the exchange fits stComm's int counts before sizing
+    // anything (throws everywhere together otherwise).
+    const ExchangeCounts counts = agree_exchange_counts(comm, send64, "hash → id mapping");
 
     // Step 4: alltoallv — every hash flies to its owner rank.
-    const int total_recv = std::accumulate(recvcounts.begin(), recvcounts.end(), 0);
-    std::vector<Hash> recvbuf(static_cast<std::size_t>(total_recv));
-    comm.alltoallv<stComm::Space::Host, Hash>(sendbuf.data(), sendcounts.data(),
-                                   recvbuf.data(), recvcounts.data())->wait();
+    const std::size_t total_recv =
+        std::accumulate(counts.recv.begin(), counts.recv.end(), std::size_t{0});
+    std::vector<Hash> recvbuf(total_recv);
+    comm.alltoallv<stComm::Space::Host, Hash>(local_uniq.data(), counts.send.data(),
+                                   recvbuf.data(), counts.recv.data())->wait();
 
     // Step 5: form this rank's bucket universe — sorted unique view of recvbuf.
     // Keep recvbuf intact for the per-arrival-slot lookup in Step 8.
@@ -164,25 +149,32 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     // Step 8: for every slot in recvbuf (arrival order, possibly with dupes),
     // produce the corresponding global ID. The reverse alltoallv expects responses
     // in the same slot order as recvbuf — that's how it routes back to senders.
-    std::vector<std::uint64_t> id_response(static_cast<std::size_t>(total_recv));
+    std::vector<std::uint64_t> id_response(total_recv);
     for (std::size_t i = 0; i < recvbuf.size(); ++i) {
         const auto it = std::lower_bound(bucket.begin(), bucket.end(), recvbuf[i]);
         id_response[i] = global_id_start + static_cast<std::uint64_t>(it - bucket.begin());
     }
+    recvbuf.clear(); recvbuf.shrink_to_fit();
 
     // Step 9: reverse alltoallv — IDs travel back to original senders. The
-    // sendcounts and recvcounts arrays swap roles relative to Step 4.
-    std::vector<std::uint64_t> id_back(sendbuf.size());
-    comm.alltoallv<stComm::Space::Host, std::uint64_t>(id_response.data(), recvcounts.data(),
-                                            id_back.data(),     sendcounts.data())->wait();
+    // send and recv counts swap roles relative to Step 4, so id_back[i] is the
+    // global ID of local_uniq[i].
+    std::vector<std::uint64_t> id_back(local_uniq.size());
+    comm.alltoallv<stComm::Space::Host, std::uint64_t>(id_response.data(), counts.recv.data(),
+                                            id_back.data(),     counts.send.data())->wait();
+    id_response.clear(); id_response.shrink_to_fit();
 
-    // Step 10: sendbuf[i] ↔ id_back[i] are paired by construction. Build this
-    // rank's hash → id map.
+    // Step 10: local_uniq[i] ↔ id_back[i] are paired by construction. Build
+    // this rank's hash → id map. A hash table on purpose: a binary search over
+    // local_uniq needs no extra memory but measured ~2.5× slower for the whole
+    // setup (one cache-missing probe chain per occurrence).
     std::unordered_map<Hash, ElementId> hash_to_id;
-    hash_to_id.reserve(sendbuf.size() * 2);
-    for (std::size_t i = 0; i < sendbuf.size(); ++i) {
-        hash_to_id.emplace(sendbuf[i], id_back[i]);
+    hash_to_id.reserve(local_uniq.size() * 2);
+    for (std::size_t i = 0; i < local_uniq.size(); ++i) {
+        hash_to_id.emplace(local_uniq[i], id_back[i]);
     }
+    local_uniq.clear(); local_uniq.shrink_to_fit();
+    id_back.clear();    id_back.shrink_to_fit();
 
     // Step 11: translate raw_patches into ID-space, sort + dedupe per patch. The
     // local patch index [0, M_local) is preserved in input order. The bucket
@@ -194,7 +186,7 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     out.shard_start  = global_id_start;
     out.id_patches.resize(raw_patches.size());
     for (std::size_t p = 0; p < raw_patches.size(); ++p) {
-        const auto& src = raw_patches[p];
+        std::vector<Hash>& src = raw_patches[p];
         auto& dst = out.id_patches[p];
         dst.resize(src.size());
         for (std::size_t i = 0; i < src.size(); ++i) {
@@ -202,11 +194,13 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
         }
         std::sort(dst.begin(), dst.end());
         dst.erase(std::unique(dst.begin(), dst.end()), dst.end());
+        std::vector<Hash>().swap(src);  // release the hashes as we go
     }
     return out;
 }
 
-PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches) {
+PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches,
+                   PatchSetMirrors mirrors) {
     // Shared §5.1 hash → ID mapping, then the patch-partitioned structures:
     // patch CSR + inverted index stay partitioned by patch ID.
     IdMappedPatches mapped = map_hashes_to_element_ids(comm, std::move(raw_patches));
@@ -217,23 +211,18 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     inv_          = build_inverted_index(patches_, N_);
 
     // Mirror host state to device — consumed by the algorithm layers' kernels.
-    const std::size_t patch_data_n = patches_.data.size();
-    const std::size_t patch_offs_n = patches_.offsets.size();
-    const std::size_t inv_keys_n   = inv_.keys.size();
-    const std::size_t inv_offs_n   = inv_.offsets.size();
-    const std::size_t inv_data_n   = inv_.data.size();
-
-    d_patch_data_.resize(patch_data_n);
-    d_patch_offsets_.resize(patch_offs_n);
-    d_inv_keys_.resize(inv_keys_n);
-    d_inv_offsets_.resize(inv_offs_n);
-    d_inv_data_.resize(inv_data_n);
-
-    if (patch_data_n) d_patch_data_.copy_from_host(patches_.data.data(),      patch_data_n);
-    if (patch_offs_n) d_patch_offsets_.copy_from_host(patches_.offsets.data(), patch_offs_n);
-    if (inv_keys_n)   d_inv_keys_.copy_from_host(inv_.keys.data(),            inv_keys_n);
-    if (inv_offs_n)   d_inv_offsets_.copy_from_host(inv_.offsets.data(),      inv_offs_n);
-    if (inv_data_n)   d_inv_data_.copy_from_host(inv_.data.data(),            inv_data_n);
+    // The inverted-index layout (keys + offsets) is always mirrored; the patch
+    // CSR data and the index values only when the algorithm's kernels read them.
+    const auto upload = [](auto& dev, const auto& host) {
+        dev.resize(host.size());
+        if (!host.empty()) dev.copy_from_host(host.data(), host.size());
+    };
+    upload(d_inv_keys_,    inv_.keys);
+    upload(d_inv_offsets_, inv_.offsets);
+    if (mirrors == PatchSetMirrors::All) {
+        upload(d_patch_data_, patches_.data);
+        upload(d_inv_data_,   inv_.data);
+    }
 }
 
 }  // namespace stPS
