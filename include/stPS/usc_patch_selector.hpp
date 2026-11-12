@@ -60,7 +60,16 @@ public:
 
     // Run the full pipeline (load → distributed setup → greedy select) on this
     // rank's `patches` and their `global_ids`. **Collective** — every rank must
-    // call together; all ranks return the same PatchSelection. Throws
+    // call together; all ranks return the same PatchSelection.
+    //
+    // Equal scores are broken by where the patch was passed in, not by its
+    // global ID: the lowest rank wins, then the earliest patch on that rank.
+    // That is the smallest global ID only when IDs ascend in that same
+    // rank-major order (as slice_patches_by_rank produces); with any other
+    // assignment the cover is still a valid greedy one, but which of several
+    // tied patches is picked depends on how the patches are spread over ranks.
+    //
+    // Throws
     // std::invalid_argument if global_ids.size() != patches.size() — on the
     // offending rank only, so a caller must treat it as fatal for the job.
     PatchSelection patch_select(std::vector<std::vector<Hash>> patches,

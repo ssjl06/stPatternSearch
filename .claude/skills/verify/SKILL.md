@@ -24,8 +24,9 @@ If the build errors on missing `stComm::Comm` members, the installed stComm
   (usc-patch-select, ups-pattern-stats since UPS-2, stps_tests via test_main)
   is single-rank only here. Multi-rank NCCL verification needs the dual-GPU
   reference machine (`NCCL_P2P_DISABLE=1` on broken-P2P hosts).
-- ctest runs the whole gtest suite as ONE mpiexec-wrapped entry
-  (`-DSTPS_TEST_NRANKS=1` on this box; default 2 = the reference box).
+- ctest runs each gtest binary as one mpiexec-wrapped entry per rank count:
+  `stps_tests_np{1,2}` (GPU suite; np2 shows as Skipped on this 1-GPU box) and
+  `stps_host_tests_np{1,2,4,8}` (host-only subset, really multi-rank here).
 
 ## Drive
 

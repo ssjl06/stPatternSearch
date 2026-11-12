@@ -442,8 +442,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=80
 # Build
 cmake --build build -j
 
-# Run tests — needs num_gpus >= mpirun -n. Default ctest uses -n 2.
-# Override with -DSTPS_TEST_NRANKS=<n> at configure time if you have n GPUs.
+# Run tests. The GPU suite runs at 1 and 2 ranks by default (one rank per GPU;
+# counts above the visible GPUs are skipped) — set -DSTPS_TEST_NRANKS="1;2;4;8"
+# at configure time if you have more. The host-only suite runs at 1/2/4/8.
+# STPS_TEST_SCALE_M=<patches> enlarges the *Scale* tests (default 20000).
 export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 # On hosts where GPU-to-GPU PCIe P2P is broken (see "Known issues" below) the
 # NCCL bcast deadlocks — export NCCL_P2P_DISABLE=1 first. Harmless on NVLink

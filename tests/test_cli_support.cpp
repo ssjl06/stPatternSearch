@@ -2,6 +2,7 @@
 
 #include "core/cli_support.hpp"
 
+#include <unistd.h>
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -25,10 +26,12 @@ TEST(CliSupport, SameOutputPathNormalizes) {
 
 TEST(CliSupport, SameOutputPathCatchesHardLinks) {
     // Different names, one inode: writing both would still overwrite.
-    const std::string dir  = ::testing::TempDir();
-    const std::string a    = dir + "cli_hardlink_a.bin";
-    const std::string b    = dir + "cli_hardlink_b.bin";
-    const std::string other = dir + "cli_hardlink_other.bin";
+    // Every MPI rank runs this test at once: per-process names, or one rank
+    // removes the files another is still checking.
+    const std::string dir  = ::testing::TempDir() + "cli_hardlink_" + std::to_string(::getpid());
+    const std::string a    = dir + "_a.bin";
+    const std::string b    = dir + "_b.bin";
+    const std::string other = dir + "_other.bin";
     std::remove(b.c_str());
     { std::ofstream(a) << "x"; std::ofstream(other) << "y"; }
     std::error_code ec;

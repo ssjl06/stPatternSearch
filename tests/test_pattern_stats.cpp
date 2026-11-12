@@ -7,6 +7,10 @@
 // same reference, so every rank can assert the collective result in full.
 
 #include "data/synthetic.hpp"
+#include "helpers/chunk_guard.hpp"
+#include "helpers/distribute.hpp"
+#include "helpers/test_scale.hpp"
+#include "helpers/unique_hash_file.hpp"
 #include "test_nccl_env.hpp"
 
 #include <stPS/stPS.h>
@@ -25,6 +29,7 @@
 #include <vector>
 
 using namespace stPS;
+using test_helpers::read_unique_hash_file;
 
 namespace {
 
@@ -69,15 +74,23 @@ std::vector<PatternStat> host_reference(const SyntheticData& d) {
     return out;
 }
 
-// Run the public collective on this rank's slice of the shared synthetic set.
+// Run the public collective on this rank's share of the input.
+std::vector<PatternStat> distributed_stats(stComm::Comm& comm, PatchSlice mine,
+                                           std::uint64_t k) {
+    UpsPatternStats ups(comm);
+    return ups.pattern_stats(std::move(mine.patches), std::move(mine.coords), k);
+}
+
+// Same, on the contiguous per-rank slice of the shared synthetic set.
 std::vector<PatternStat> distributed_stats(stComm::Comm& comm,
                                            const SyntheticData& d,
                                            std::uint64_t k) {
-    auto slice = slice_patches_by_rank(d.patches, d.coords,
-                                       comm.getRank(), comm.getSize());
-    UpsPatternStats ups(comm);
-    return ups.pattern_stats(std::move(slice.patches), std::move(slice.coords), k);
+    return distributed_stats(comm,
+        slice_patches_by_rank(d.patches, d.coords, comm.getRank(), comm.getSize()), k);
 }
+
+// Larger than any unique count in these tests: "report everything".
+constexpr std::uint64_t kAll = std::uint64_t{1} << 40;
 
 void expect_stats_eq(const std::vector<PatternStat>& got,
                      const std::vector<PatternStat>& want) {
@@ -86,6 +99,7 @@ void expect_stats_eq(const std::vector<PatternStat>& got,
         EXPECT_EQ(got[i].hash,  want[i].hash)  << "entry " << i;
         EXPECT_EQ(got[i].count, want[i].count) << "entry " << i;
         EXPECT_EQ(got[i].rep,   want[i].rep)   << "entry " << i;
+        if (::testing::Test::HasFailure()) return;  // first bad entry is enough
     }
 }
 
@@ -200,51 +214,6 @@ TEST(PatternStats, StatsFileIoErrorThrowsOnEveryRank) {
     EXPECT_THROW(write_pattern_stats_file(comm, path, topk), std::runtime_error);
 }
 
-// ---- Unique-hash file ------------------------------------------------------
-
-namespace {
-
-// Parse a unique-hash file: checks the magic, returns {N field, hash array}.
-std::pair<std::uint64_t, std::vector<Hash>> read_unique_hash_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    EXPECT_TRUE(in.good()) << path;
-    char magic[8] = {};
-    std::uint64_t n = 0;
-    in.read(magic, sizeof(magic));
-    in.read(reinterpret_cast<char*>(&n), sizeof(n));
-    EXPECT_EQ(std::string(magic, 8), std::string(kUniqueHashMagic, 8));
-    std::vector<Hash> hashes;
-    Hash h = 0;
-    while (in.read(reinterpret_cast<char*>(&h), sizeof(h))) hashes.push_back(h);
-    return {n, hashes};
-}
-
-std::vector<Hash> all_unique(const SyntheticData& d) {
-    std::set<Hash> s;
-    for (const auto& p : d.patches) s.insert(p.begin(), p.end());
-    return {s.begin(), s.end()};
-}
-
-}  // namespace
-
-TEST(UniqueHashes, FileHoldsEverySortedDistinctHash) {
-    auto& comm = test_helpers::comm();
-    const auto data = small_synthetic(59);
-    const auto want = all_unique(data);
-    const std::string path = ::testing::TempDir() + "unique_hashes_shared.bin";
-
-    auto slice = slice_patches_by_rank(data.patches, comm.getRank(), comm.getSize());
-    const std::uint64_t n = write_unique_hashes_file(comm, path, std::move(slice.patches));
-    EXPECT_EQ(n, want.size());
-
-    const auto [n_field, hashes] = read_unique_hash_file(path);  // every rank reads it
-    EXPECT_EQ(n_field, want.size());
-    EXPECT_EQ(hashes, want);
-
-    comm.barrier();
-    if (comm.getRank() == 0) std::remove(path.c_str());
-}
-
 TEST(UniqueHashes, PatternStatsWritesTheSameFile) {
     // The pattern_stats side output reuses its PatchSet's shards; it must be
     // byte-identical to the standalone writer's.
@@ -268,22 +237,75 @@ TEST(UniqueHashes, PatternStatsWritesTheSameFile) {
     if (comm.getRank() == 0) { std::remove(standalone.c_str()); std::remove(side.c_str()); }
 }
 
-TEST(UniqueHashes, EmptyInputWritesHeaderOnly) {
+// ---- Uneven distributions, degenerate inputs, scale -------------------------
+
+TEST(PatternStats, AllPatchesOnOneRank) {
+    // The other ranks hold no occurrences at all but still own a hash shard
+    // and take part in every exchange.
     auto& comm = test_helpers::comm();
-    const std::string path = ::testing::TempDir() + "unique_hashes_empty.bin";
-    EXPECT_EQ(write_unique_hashes_file(comm, path, {}), 0u);
-    const auto [n_field, hashes] = read_unique_hash_file(path);
-    EXPECT_EQ(n_field, 0u);
-    EXPECT_TRUE(hashes.empty());
-    comm.barrier();
-    if (comm.getRank() == 0) std::remove(path.c_str());
+    const auto data = small_synthetic(83);
+    const auto ref  = host_reference(data);
+    for (int owner : {0, comm.getSize() - 1}) {
+        expect_stats_eq(distributed_stats(comm,
+            test_helpers::slice_all_on_rank(data.patches, data.coords, owner, comm.getRank()),
+            kAll), ref);
+    }
 }
 
-TEST(UniqueHashes, IoErrorThrowsOnEveryRank) {
+TEST(PatternStats, RoundRobinDistribution) {
     auto& comm = test_helpers::comm();
-    auto slice = slice_patches_by_rank(small_synthetic(67).patches,
-                                       comm.getRank(), comm.getSize());
-    EXPECT_THROW(write_unique_hashes_file(comm, ::testing::TempDir() + "no_such_dir/u.bin",
-                                          std::move(slice.patches)),
-                 std::runtime_error);
+    const auto data = small_synthetic(89);
+    expect_stats_eq(distributed_stats(comm,
+        test_helpers::slice_round_robin(data.patches, data.coords, comm.getRank(), comm.getSize()),
+        kAll), host_reference(data));
+}
+
+TEST(PatternStats, EmptyInput) {
+    auto& comm = test_helpers::comm();
+    EXPECT_TRUE(distributed_stats(comm, PatchSlice{}, 10).empty());
+}
+
+TEST(PatternStats, OneHashInEveryPatch) {
+    // The whole occurrence load of one hash lands on a single owner rank, and
+    // its occurrences tie on the representative point. The other hashes are
+    // few enough that most ranks own an empty shard.
+    auto& comm = test_helpers::comm();
+    SyntheticData d;
+    for (std::uint64_t p = 0; p < 300; ++p) {
+        const double x = static_cast<double>(p % 7);
+        d.patches.push_back({1234567, 1234567, 10 + p % 3});
+        d.coords.push_back({{x, 2.0}, {x, 1.0}, {5.0, static_cast<double>(p)}});
+    }
+    d.patches.push_back({});  // an empty patch
+    d.coords.push_back({});
+
+    const auto ref = host_reference(d);
+    ASSERT_EQ(ref.front().hash, 1234567u);
+    ASSERT_EQ(ref.front().count, 300u);
+    expect_stats_eq(distributed_stats(comm, d, kAll), ref);
+}
+
+TEST(PatternStats, SmallExchangeChunks) {
+    // Host exchanges split into many tiny point-to-point chunks (odd size, so
+    // boundaries fall inside elements).
+    auto& comm = test_helpers::comm();
+    const test_helpers::ChunkBytesGuard guard(29);
+    const auto data = small_synthetic(97);
+    expect_stats_eq(distributed_stats(comm, data, kAll), host_reference(data));
+}
+
+TEST(PatternStats, MediumScale) {
+    auto& comm = test_helpers::comm();
+    SyntheticParams p;
+    p.M = test_helpers::scale_patch_count(20000);
+    p.N = p.M * 8; p.K_mean = 32; p.overlap = 0.5; p.seed = 101;
+    SyntheticData d;
+    d.patches = generate_synthetic(p);
+    d.coords  = generate_synthetic_coords(p, d.patches);
+    const auto ref = host_reference(d);
+
+    const std::uint64_t k = 1000;
+    const auto topk = distributed_stats(comm, d, k);
+    ASSERT_EQ(topk.size(), std::min<std::size_t>(k, ref.size()));
+    expect_stats_eq(topk, {ref.begin(), ref.begin() + static_cast<std::ptrdiff_t>(topk.size())});
 }
