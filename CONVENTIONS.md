@@ -117,10 +117,17 @@ agent marks `in_progress` before starting a step and `completed` after
 verification passes. The user can see live progress in the spinner.
 
 ### Build verification matrix
-- `mpirun -n 1 ctest` — single-rank correctness
-- `mpirun -n <num_gpus> ctest` — multi-rank correctness (NCCL needs 1
-  process per GPU, no oversubscription). Default ctest is `-n 2`; override
-  via `-DSTPS_TEST_NRANKS=<n>`.
+- `ctest` — runs each suite once per rank count; every distributed test
+  compares against a rank-independent host reference, so this is also the
+  rank-invariance check.
+  - `stps_tests_np<n>` — GPU suite (NCCL needs 1 process per GPU, no
+    oversubscription). Default counts `1;2`; a count above the visible GPUs
+    is skipped. Override via `-DSTPS_TEST_NRANKS="1;2;4;8"`.
+  - `stps_host_tests_np<n>` — host-only subset (unique-hash path,
+    collectives), no GPU needed. Default counts `1;2;4;8`
+    (`-DSTPS_HOST_TEST_NRANKS=...`).
+- `STPS_TEST_SCALE_M=<patches> ctest` — raises the `*Scale*` tests from the
+  20k-patch default to a size worth running on real hardware.
 - `mpirun -n <num_gpus> ... usc-patch-select --N ...` — smoke at scale.
 - Configure with `-DUSC_PROFILE=ON`, then `mpirun -n <num_gpus> ... usc-patch-select ...`
   — per-stage breakdown when investigating regressions or new bottlenecks.

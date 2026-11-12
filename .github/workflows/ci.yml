@@ -43,6 +43,15 @@ jobs:
           ./build/src/usc-patch-select --N 2000 --M 200 --K 20 --overlap 0.4 --seed 42 \
               --dump ci-smoke.stps
           test -s ci-smoke.stps
+      # The host-only suite needs no GPU: the distributed hash sort and the
+      # size_t-count exchanges at 1/2/4/8 ranks.
+      - name: Host-only distributed tests (1/2/4/8 ranks)
+        env:
+          OMPI_ALLOW_RUN_AS_ROOT: "1"
+          OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+        run: |
+          export LD_LIBRARY_PATH="$HOME/install/stComm/lib:${LD_LIBRARY_PATH:-}"
+          cd build && ctest -R stps_host_tests --output-on-failure
 
   gpu-test:
     name: ctest (self-hosted GPU runner)

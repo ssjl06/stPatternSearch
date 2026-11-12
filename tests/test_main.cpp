@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
                     "Re-run with mpirun -n <=%d.\n", size, num_gpus, num_gpus);
             }
             stComm::Comm::finalize();
-            return 2;
+            return 77;  // ctest SKIP_RETURN_CODE: not a failure of the code under test
         }
         const int device_id = rank % num_gpus;
         cudaSetDevice(device_id);
