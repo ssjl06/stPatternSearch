@@ -14,6 +14,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <utility>
+#include <string>
+#include <cstdlib>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <iostream>
@@ -408,6 +412,70 @@ __global__ void patch_record_winner_kernel(const std::uint64_t* global_key,
     w->newly_count = static_cast<unsigned int>(*global_key >> 32);
 }
 
+// -DUSC_PROFILE timing of the device-resident loops. Two views, picked with
+// the STPS_LOOP_PROFILE environment variable:
+//   (unset)  "batch"  — no extra synchronization: per batch, the time the host
+//            spends enqueueing against the time it then waits for the stream
+//            to drain. Enqueue ≈ total means the loop is bound by launching.
+//   "stages" — the stream is drained after every stage and the wait is billed
+//            to that stage. Stages then run one at a time, so the sum exceeds
+//            the normal loop time; it shows where the device work is.
+// Compiled out (every call a no-op) without USC_PROFILE.
+class LoopProfiler {
+public:
+    LoopProfiler(cudaStream_t stream, std::vector<const char*> stages)
+        : stream_(stream), names_(std::move(stages)), ns_(names_.size(), 0) {
+        if (!detail::kProfileEnabled) return;
+        const char* mode = std::getenv("STPS_LOOP_PROFILE");
+        stages_mode_ = mode && std::string(mode) == "stages";
+        last_ = Clock::now();
+    }
+    // End of stage `i` (stages view only).
+    void mark(std::size_t i) {
+        if (!detail::kProfileEnabled || !stages_mode_) return;
+        cuda_check(cudaStreamSynchronize(stream_), "loop profiler sync");
+        ns_[i] += lap();
+    }
+    void batch_enqueued() { if (detail::kProfileEnabled) enqueue_ns_ += lap(); }
+    void batch_drained()  { if (detail::kProfileEnabled) drain_ns_ += lap(); }
+    void step() { ++steps_; }
+
+    void report(std::FILE* out, const char* title, int rank) const {
+        if (!detail::kProfileEnabled) return;
+        const double steps = static_cast<double>(steps_ ? steps_ : 1);
+        std::fprintf(out, "%s rank=%d steps=%llu  (per-step us, total ms)\n", title, rank,
+                     static_cast<unsigned long long>(steps_));
+        const auto line = [&](const char* name, std::int64_t ns) {
+            std::fprintf(out, "  %-22s %8.2f us  %10.1f ms\n", name,
+                         static_cast<double>(ns) * 1e-3 / steps,
+                         static_cast<double>(ns) * 1e-6);
+        };
+        if (stages_mode_) {
+            for (std::size_t i = 0; i < names_.size(); ++i) line(names_[i], ns_[i]);
+            line("(batch state read)", drain_ns_);
+        } else {
+            line("host enqueue", enqueue_ns_);
+            line("wait for stream", drain_ns_);
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    std::int64_t lap() {
+        const auto now = Clock::now();
+        const auto d = std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_).count();
+        last_ = now;
+        return d;
+    }
+    cudaStream_t              stream_;
+    std::vector<const char*>  names_;
+    std::vector<std::int64_t> ns_;
+    std::int64_t              enqueue_ns_ = 0, drain_ns_ = 0;
+    std::uint64_t             steps_ = 0;
+    bool                      stages_mode_ = false;
+    Clock::time_point         last_;
+};
+
 }  // namespace
 
 UscPatchSelectorImpl::UscPatchSelectorImpl(stComm::Comm& comm)
@@ -481,8 +549,7 @@ PatchSelection UscPatchSelectorImpl::patch_select(
 // previous batch's last winner score, and winner scores never increase, so
 // every list of the batch fits. size == 1 skips both collectives.
 //
-// -DUSC_PROFILE stage timers are absent here for the same reason as in
-// ByElement: there are no host-visible stage boundaries inside a batch.
+// -DUSC_PROFILE: see LoopProfiler.
 PatchSelection UscPatchSelectorImpl::select() {
     PatchSelection result;
     result.covered_count = 0;
@@ -522,6 +589,12 @@ PatchSelection UscPatchSelectorImpl::select() {
         d_argmax_temp.resize(temp_bytes);
     }
 
+    enum { kPArgmax, kPPack, kPKeyReduce, kPCommit, kPBuild, kPPayloadReduce, kPRecord,
+           kPSetBits, kPScoreUpdate };
+    LoopProfiler prof(stream, {"argmax", "pack key", "key reduce (+clear)", "commit",
+                               "build newly", "payload reduce", "record", "set_bits",
+                               "score update"});
+
     // Batch sizing as in ByElement: at least ceil(remaining / bound) more
     // iterations must run, so that many never overshoot the end of the solve.
     constexpr std::uint64_t kMaxBatch = 128;
@@ -538,8 +611,10 @@ PatchSelection UscPatchSelectorImpl::select() {
                                           d_scores_.data(), d_argmax_result.data(),
                                           static_cast<int>(M_loc), stream);
             }
+            prof.mark(kPArgmax);
             patch_pack_candidate_kernel<<<1, 1, 0, stream>>>(
                 d_argmax_result.data(), M_loc > 0 ? 1 : 0, rank, d_key_local.data());
+            prof.mark(kPPack);
             if (size > 1) {
                 comm_.allreduce<stComm::Space::Device, std::uint64_t>(
                     d_key_local.data(), d_key_global.data(), 1, stComm::ReduceOp::Max);
@@ -547,41 +622,52 @@ PatchSelection UscPatchSelectorImpl::select() {
                                            (bound + 1) * sizeof(std::uint64_t), stream),
                            "payload clear");
             }
+            prof.mark(kPKeyReduce);
             patch_commit_winner_kernel<<<1, 1, 0, stream>>>(
                 d_key, d_argmax_result.data(), rank, N,
                 patch_set_->d_patch_offsets(), d_global_ids_.data(),
                 d_scores_.data(), d_send.data(), bound,
                 d_state.data(), d_winner.data());
+            prof.mark(kPCommit);
             fixed_build_newly_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 patch_set_->d_patch_data(), d_covered_.data(),
                 d_send.data(), d_winner.data());
+            prof.mark(kPBuild);
             if (size > 1) {
                 comm_.allreduce<stComm::Space::Device, std::uint64_t>(
                     d_send.data(), d_recv.data(), bound + 1, stComm::ReduceOp::Sum);
             }
+            prof.mark(kPPayloadReduce);
             patch_record_winner_kernel<<<1, 1, 0, stream>>>(
                 d_key, d_payload, bound, d_selected.data(),
                 d_state.data(), d_winner.data());
+            prof.mark(kPRecord);
             fixed_set_bits_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_covered_.data(), d_payload, d_winner.data());
+            prof.mark(kPSetBits);
             fixed_score_update_kernel
                 <<<kFixedGridBlocks, kScoreBlockThreads, 0, stream>>>(
                 d_payload, d_winner.data(),
                 patch_set_->d_inv_keys(), patch_set_->inv_keys().size(),
                 patch_set_->d_inv_offsets(), patch_set_->d_inv_data(),
                 d_scores_.data());
+            prof.mark(kPScoreUpdate);
+            prof.step();
         }
         cuda_launch_check("device-resident batch (patch)");
+        prof.batch_enqueued();
         // Drain through stComm (polled: also watches for async NCCL failures),
         // then read the state — see the ByElement loop.
         comm_.nccl().barrier();
         cuda_check(cudaMemcpy(&h_state, d_state.data(), sizeof(h_state),
                               cudaMemcpyDeviceToHost),
                    "device-resident batch (patch) state copy");
+        prof.batch_drained();
         if (h_state.done) break;
         bound = std::max<std::uint64_t>(h_state.last_score, 1);
     }
 
+    prof.report(stderr, "[stps-profile usc by-patch loop]", rank);
     result.covered_count = h_state.covered_count;
     result.iterations    = h_state.num_selected;
     if (h_state.num_selected) {
@@ -868,8 +954,7 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 // size == 1 has no one to exchange with: the decrements go straight into the
 // scores (strategy-A update), no collective at all.
 //
-// -DUSC_PROFILE stage timers are deliberately absent here: with no
-// per-step syncs there are no host-visible stage boundaries to time.
+// -DUSC_PROFILE: see LoopProfiler.
 PatchSelection UscElemPatchSelectorImpl::select() {
     PatchSelection result;
     result.covered_count = 0;
@@ -944,6 +1029,12 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     // that many — capped at kMaxBatch — never overshoots the end of the solve.
     // Both inputs come from reduced state, so every rank picks the same batch.
     constexpr std::uint64_t kMaxBatch = 128;
+    enum { kEPlan, kEFill, kEReduce, kEApply, kEArgmax, kECommit, kEBuild, kESetBits,
+           kEDegrees, kEScan, kEBegin, kEScoreUpdate };
+    LoopProfiler prof(stream, {"delta plan", "delta fill", "delta reduce", "delta apply",
+                               "argmax", "commit", "build newly", "set_bits",
+                               "delta degrees", "delta prefix scan", "delta begin",
+                               "score update (1 rank)"});
     LoopState h_state{};
     while (true) {
         const std::uint64_t remaining = N_ - h_state.covered_count;
@@ -969,52 +1060,66 @@ PatchSelection UscElemPatchSelectorImpl::select() {
         for (std::uint64_t b = 0; b < batch; ++b) {
             if (exchange) {
                 elem_delta_plan_kernel<<<1, 1, 0, stream>>>(d_cursor.data(), window, d_segment);
+                prof.mark(kEPlan);
                 elem_delta_fill_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                     d_newly_ids.data(), d_cursor.data(), d_prefix.data(),
                     d_inv_keys_.data(), num_inv_keys_, d_inv_offsets_.data(),
                     d_inv_data_.data(), d_segment + 2);
+                prof.mark(kEFill);
                 if (size > 1) {
                     // Enqueue-only — no wait.
                     comm_.allreduce<stComm::Space::Device, DeltaWord>(
                         d_send.data(), d_recv_buf.data(), usize * (window + 2),
                         stComm::ReduceOp::Sum);
                 }
+                prof.mark(kEReduce);
                 elem_delta_apply_kernel<<<apply_blocks, kFixedBlockThreads, 0, stream>>>(
                     d_recv, usize, window, d_scores_.data());
+                prof.mark(kEApply);
             }
             std::size_t temp_bytes = d_argmax_temp.bytes();
             cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
                                       d_scores_.data(), d_argmax_result.data(),
                                       static_cast<int>(M_global_), stream);
+            prof.mark(kEArgmax);
             elem_commit_winner_kernel<<<1, 1, 0, stream>>>(
                 d_argmax_result.data(), d_sub_offsets_.data(), N_,
                 d_scores_.data(), d_selected.data(),
                 d_recv, exchange ? size : 0, window,
                 d_state.data(), d_winner.data());
+            prof.mark(kECommit);
             fixed_build_newly_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_patch_data_.data(), d_covered_.data(),
                 d_newly_ids.data(), d_winner.data());
+            prof.mark(kEBuild);
             fixed_set_bits_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_covered_.data(), d_newly_ids.data(), d_winner.data());
+            prof.mark(kESetBits);
             if (exchange) {
                 elem_delta_degrees_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                     d_newly_ids.data(), d_winner.data(),
                     d_inv_keys_.data(), num_inv_keys_, d_inv_offsets_.data(),
                     len, d_deg.data());
+                prof.mark(kEDegrees);
                 std::size_t scan_bytes = d_scan_temp.bytes();
                 cub::DeviceScan::ExclusiveSum(d_scan_temp.data(), scan_bytes, d_deg.data(),
                                               d_prefix.data(), len + 1, stream);
+                prof.mark(kEScan);
                 elem_delta_begin_kernel<<<1, 1, 0, stream>>>(
                     d_winner.data(), d_prefix.data(), len, d_cursor.data());
+                prof.mark(kEBegin);
             } else {
                 fixed_score_update_kernel<<<kFixedGridBlocks, kScoreBlockThreads, 0, stream>>>(
                     d_newly_ids.data(), d_winner.data(),
                     d_inv_keys_.data(), num_inv_keys_,
                     d_inv_offsets_.data(), d_inv_data_.data(),
                     d_scores_.data());
+                prof.mark(kEScoreUpdate);
             }
+            prof.step();
         }
         cuda_launch_check("device-resident batch (elem)");
+        prof.batch_enqueued();
         // Drain the stream through stComm, not cudaStreamSynchronize: the
         // batch has allreduces in flight, and stComm's polled sync also
         // watches the communicator for async failures (dead peer, network
@@ -1026,12 +1131,14 @@ PatchSelection UscElemPatchSelectorImpl::select() {
         cuda_check(cudaMemcpy(&h_state, d_state.data(), sizeof(h_state),
                               cudaMemcpyDeviceToHost),
                    "device-resident batch (elem) state copy");
+        prof.batch_drained();
         if (h_state.done) break;
         if (h_state.num_selected) {
             score_bound = std::max<std::uint64_t>(h_state.last_score, 1);
         }
     }
 
+    prof.report(stderr, "[stps-profile usc by-element loop]", comm_.getRank());
     // Drain the device-side result: selected slots → caller PatchIds.
     result.covered_count = h_state.covered_count;
     result.iterations    = h_state.num_selected;
