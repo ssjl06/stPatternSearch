@@ -19,6 +19,8 @@ stComm::Comm& stPS::test_helpers::comm() {
     return *g_comm;
 }
 
+const char* stPS::test_helpers::suite_name() { return "host"; }
+
 int main(int argc, char** argv) {
     stComm::Comm::initialize(&argc, &argv);
 
