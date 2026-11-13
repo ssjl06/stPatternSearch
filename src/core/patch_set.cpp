@@ -2,12 +2,14 @@
 
 #include "core/collective.hpp"
 #include "core/csr.hpp"
+#include "core/host_profiler.hpp"
 #include "core/inverted_index.hpp"
 
 #include <stComm/stComm.h>
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +88,8 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     const int size = comm.getSize();
     const int rank = comm.getRank();
     const auto usize = static_cast<std::size_t>(size);
+    using W = detail::PhaseTimer::Where;
+    detail::PhaseTimer phases;
 
     // Design doc §5.1 distributed setup. Patches are already partitioned across
     // ranks (permanent). Within setup we perform a *temporary* hash partition:
@@ -106,6 +110,8 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
         std::sort(local_uniq.begin(), local_uniq.end());
         local_uniq.erase(std::unique(local_uniq.begin(), local_uniq.end()), local_uniq.end());
     }
+
+    phases.mark("flatten + sort + unique", W::Host);
 
     // Step 2: sample-sort based partitioning. Every rank computes the same
     // (size-1) splitters from gathered samples, then routes each hash to its
@@ -129,6 +135,8 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     std::vector<Hash> recvbuf(total_recv);
     comm.alltoallv<stComm::Space::Host, Hash>(local_uniq.data(), counts.send.data(),
                                    recvbuf.data(), counts.recv.data())->wait();
+
+    phases.mark("splitters + hash exchange", W::HostComm);
 
     // Step 5: form this rank's bucket universe — sorted unique view of recvbuf.
     // Keep recvbuf intact for the per-arrival-slot lookup in Step 8.
@@ -156,6 +164,8 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     }
     recvbuf.clear(); recvbuf.shrink_to_fit();
 
+    phases.mark("shard sort + id assignment", W::Host);
+
     // Step 9: reverse alltoallv — IDs travel back to original senders. The
     // send and recv counts swap roles relative to Step 4, so id_back[i] is the
     // global ID of local_uniq[i].
@@ -163,6 +173,8 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     comm.alltoallv<stComm::Space::Host, std::uint64_t>(id_response.data(), counts.recv.data(),
                                             id_back.data(),     counts.send.data())->wait();
     id_response.clear(); id_response.shrink_to_fit();
+
+    phases.mark("id return exchange", W::HostComm);
 
     // Step 10: local_uniq[i] ↔ id_back[i] are paired by construction. Build
     // this rank's hash → id map. A hash table on purpose: a binary search over
@@ -196,6 +208,8 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
         dst.erase(std::unique(dst.begin(), dst.end()), dst.end());
         std::vector<Hash>().swap(src);  // release the hashes as we go
     }
+    phases.mark("hash table + translate patches", W::Host);
+    phases.report(stderr, "[stps-profile hash->id map]", rank);
     return out;
 }
 
@@ -203,12 +217,17 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
                    PatchSetMirrors mirrors) {
     // Shared §5.1 hash → ID mapping, then the patch-partitioned structures:
     // patch CSR + inverted index stay partitioned by patch ID.
+    using W = detail::PhaseTimer::Where;
+    detail::PhaseTimer phases;
     IdMappedPatches mapped = map_hashes_to_element_ids(comm, std::move(raw_patches));
     N_            = mapped.N;
     shard_hashes_ = std::move(mapped.shard_hashes);
     shard_start_  = mapped.shard_start;
+    phases.mark("hash->id map (detailed above)", W::Host);
     patches_      = build_patch_csr(mapped.id_patches);
+    phases.mark("patch CSR build", W::Host);
     inv_          = build_inverted_index(patches_, N_);
+    phases.mark("inverted index build", W::Host);
 
     // Mirror host state to device — consumed by the algorithm layers' kernels.
     // The inverted-index layout (keys + offsets) is always mirrored; the patch
@@ -223,6 +242,8 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
         upload(d_patch_data_, patches_.data);
         upload(d_inv_data_,   inv_.data);
     }
+    phases.mark("upload to device", W::Transfer);
+    phases.report(stderr, "[stps-profile PatchSet]", comm.getRank());
 }
 
 }  // namespace stPS

@@ -281,10 +281,13 @@ PatchSelection UscPatchSelectorImpl::patch_select(
         std::vector<std::vector<Hash>> raw_patches,
         std::vector<PatchId>           global_ids) {
     patch_global_ids_ = std::move(global_ids);
+    using W = detail::PhaseTimer::Where;
+    detail::PhaseTimer phases;
 
     // Shared preprocessing: distributed hash→id mapping + PatchCsr + InvertedIndex
     // + device mirrors. USC owns only the score/covered state initialized below.
     patch_set_ = std::make_unique<PatchSet>(comm_, std::move(raw_patches));
+    phases.mark("PatchSet setup (detailed above)", W::Host);
 
     const std::uint64_t M_local = patch_set_->M_local();
     const std::uint64_t N       = patch_set_->N();
@@ -301,8 +304,14 @@ PatchSelection UscPatchSelectorImpl::patch_select(
         d_scores_.copy_from_host(initial_scores.data(), M_local);
     }
     d_covered_.zero();
+    phases.mark("initial scores", W::Transfer);
 
-    return select();
+    PatchSelection result = select();
+    // Host round-trips every iteration: the loop's own gpu/host tables above
+    // split it further.
+    phases.mark("greedy loop", W::Mixed);
+    phases.report(stderr, "[stps-profile usc by-patch]", comm_.getRank());
+    return result;
 }
 
 // Multi-rank greedy loop. Hot data (PatchCsr, scores, covered, newly_covered)
@@ -547,10 +556,13 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
         std::vector<PatchId>           global_ids) {
     const int size = comm_.getSize();
     const int rank = comm_.getRank();
+    using W = detail::PhaseTimer::Where;
+    detail::PhaseTimer phases;
 
     // Shared §5.1 preprocessing: hash → dense ElementId translation.
     IdMappedPatches mapped = map_hashes_to_element_ids(comm_, std::move(raw_patches));
     N_ = mapped.N;
+    phases.mark("hash->id map (detailed above)", W::Host);
 
     // ---- Global slot assignment (rank-major input order) --------------------
     // Slot of local patch p on rank r = (Σ M_local below r) + p. With
@@ -591,6 +603,8 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     const std::uint64_t shard_end =
         std::min<std::uint64_t>((static_cast<std::uint64_t>(rank) + 1) * shard_size, N_);
     shard_extent_ = shard_end - shard_base_;
+
+    phases.mark("slot assignment", W::HostComm);
 
     // ---- Incidence redistribution --------------------------------------------
     // Every (slot, element) incidence flies to the element's owner shard. Each
@@ -641,6 +655,8 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     send_slots.clear(); send_slots.shrink_to_fit();
     send_elems.clear(); send_elems.shrink_to_fit();
 
+    phases.mark("incidence redistribution", W::HostComm);
+
     // ---- Shard-local sub-CSR over all M_global patches -----------------------
     // Store SHARD-LOCAL element IDs (global − shard_base_): the covered bitset
     // and every kernel then index the local shard exactly like ByPatch indexes
@@ -666,6 +682,8 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     // Shard-local inverted index (keys are shard-local IDs, values are global
     // slots) — drives the strategy-A partial-score update.
     inv_ = build_inverted_index(sub, shard_extent_ ? shard_extent_ : 1);
+
+    phases.mark("sub-CSR + inverted index build", W::Host);
 
     // ---- Device mirrors + algorithm state -------------------------------------
     if (!sub.data.empty()) {
@@ -731,8 +749,12 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 
     d_covered_.resize((shard_extent_ + 63) / 64);
     d_covered_.zero();
+    phases.mark("upload + initial scores", W::Transfer);
 
-    return select();
+    PatchSelection result = select();
+    phases.mark("greedy loop", W::Device);
+    phases.report(stderr, "[stps-profile usc by-element]", rank);
+    return result;
 }
 
 // Element-partitioned greedy loop (§7.3) — DEVICE-RESIDENT (Full-GPU track).
