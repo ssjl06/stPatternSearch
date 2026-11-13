@@ -2,8 +2,9 @@
 
 #include "core/collective.hpp"
 #include "core/csr.hpp"
+#include "core/hash_id_map_device.hpp"
 #include "core/host_profiler.hpp"
-#include "core/inverted_index.hpp"
+#include "core/inverted_index_device.hpp"
 
 #include <stComm/stComm.h>
 
@@ -12,9 +13,52 @@
 #include <cstdio>
 #include <numeric>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace stPS {
+
+namespace detail {
+
+std::vector<std::size_t> splitter_sample_indices(std::size_t n) {
+    std::vector<std::size_t> idx;
+    if (n == 0) return idx;
+    const auto k = static_cast<std::size_t>(kSplitterSamplesPerRank);
+    idx.resize(k);
+    for (std::size_t i = 0; i < k; ++i) {
+        // Fewer hashes than samples: repeat the last one, so every rank still
+        // contributes the same fixed count.
+        idx[i] = n <= k ? std::min(i, n - 1) : (i * (n - 1)) / (k - 1);
+    }
+    return idx;
+}
+
+std::vector<Hash> splitters_from_sample(stComm::Comm& comm, std::vector<Hash> local_sample) {
+    const int size = comm.getSize();
+    if (size <= 1) return {};
+    // A rank without hashes sends zeros as placeholders — they are sorted with
+    // the real samples; the bias is minimal.
+    if (local_sample.empty()) local_sample.assign(kSplitterSamplesPerRank, Hash{0});
+
+    // Uniform recvcounts: every rank sends exactly kSplitterSamplesPerRank.
+    const std::size_t total_samples = static_cast<std::size_t>(size) * kSplitterSamplesPerRank;
+    std::vector<Hash> all_samples(total_samples);
+    std::vector<int>  recvcounts(static_cast<std::size_t>(size), kSplitterSamplesPerRank);
+    comm.allgatherv<stComm::Space::Host, Hash>(local_sample.data(), kSplitterSamplesPerRank,
+                                   all_samples.data(), recvcounts.data())->wait();
+
+    // Every rank sorts the same samples, so every rank picks the same splitters.
+    std::sort(all_samples.begin(), all_samples.end());
+    std::vector<Hash> splitters;
+    splitters.reserve(static_cast<std::size_t>(size - 1));
+    for (int r = 1; r < size; ++r) {
+        splitters.push_back(
+            all_samples[static_cast<std::size_t>(r) * kSplitterSamplesPerRank]);
+    }
+    return splitters;
+}
+
+}  // namespace detail
 
 namespace {
 
@@ -28,50 +72,11 @@ namespace {
 // returns empty (no partitioning needed).
 std::vector<Hash> compute_splitters(const std::vector<Hash>& local_uniq_sorted,
                                     stComm::Comm& comm) {
-    constexpr int kSamplesPerRank = 128;
-    const int size = comm.getSize();
-    if (size <= 1) return {};
-
-    // Step 1: pick kSamplesPerRank evenly-spaced indices from local_uniq_sorted.
-    // If we have fewer hashes than samples, pad by repeating the last element
-    // so every rank contributes the same fixed count (simplifies allgather).
-    std::vector<Hash> local_sample(kSamplesPerRank);
-    const std::size_t n = local_uniq_sorted.size();
-    if (n == 0) {
-        // Edge case: rank has no hashes. Use 0 as a placeholder — these samples
-        // will be sorted with the real ones; bias is minimal since other ranks
-        // contribute meaningful samples.
-        std::fill(local_sample.begin(), local_sample.end(), Hash{0});
-    } else if (n <= static_cast<std::size_t>(kSamplesPerRank)) {
-        for (std::size_t i = 0; i < local_sample.size(); ++i) {
-            local_sample[i] = local_uniq_sorted[std::min(i, n - 1)];
-        }
-    } else {
-        for (std::size_t i = 0; i < local_sample.size(); ++i) {
-            const std::size_t idx = (i * (n - 1)) / (local_sample.size() - 1);
-            local_sample[i] = local_uniq_sorted[idx];
-        }
+    std::vector<Hash> local_sample;
+    for (std::size_t idx : detail::splitter_sample_indices(local_uniq_sorted.size())) {
+        local_sample.push_back(local_uniq_sorted[idx]);
     }
-
-    // Step 2: allgatherv all samples — uniform recvcounts since every rank
-    // sends exactly kSamplesPerRank hashes.
-    const std::size_t total_samples = static_cast<std::size_t>(size) * kSamplesPerRank;
-    std::vector<Hash> all_samples(total_samples);
-    std::vector<int>  recvcounts(static_cast<std::size_t>(size), kSamplesPerRank);
-    comm.allgatherv<stComm::Space::Host, Hash>(local_sample.data(), kSamplesPerRank,
-                                   all_samples.data(), recvcounts.data())->wait();
-
-    // Step 3: sort all samples (every rank computes identical splitters).
-    std::sort(all_samples.begin(), all_samples.end());
-
-    // Step 4: pick (size-1) splitters at positions kSamplesPerRank, 2*kSamplesPerRank, ...
-    std::vector<Hash> splitters;
-    splitters.reserve(static_cast<std::size_t>(size - 1));
-    for (int r = 1; r < size; ++r) {
-        splitters.push_back(
-            all_samples[static_cast<std::size_t>(r) * kSamplesPerRank]);
-    }
-    return splitters;
+    return detail::splitters_from_sample(comm, std::move(local_sample));
 }
 
 // Map a hash to its target rank via splitter binary search.
@@ -219,30 +224,36 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     // patch CSR + inverted index stay partitioned by patch ID.
     using W = detail::PhaseTimer::Where;
     detail::PhaseTimer phases;
-    IdMappedPatches mapped = map_hashes_to_element_ids(comm, std::move(raw_patches));
+    DeviceIdMappedPatches mapped =
+        map_hashes_to_element_ids_device(comm, std::move(raw_patches));
     N_            = mapped.N;
     shard_hashes_ = std::move(mapped.shard_hashes);
     shard_start_  = mapped.shard_start;
-    phases.mark("hash->id map (detailed above)", W::Host);
-    patches_      = build_patch_csr(mapped.id_patches);
-    phases.mark("patch CSR build", W::Host);
-    inv_          = build_inverted_index(patches_, N_);
-    phases.mark("inverted index build", W::Host);
+    phases.mark("hash->id map (detailed above)", W::Device);
 
-    // Mirror host state to device — consumed by the algorithm layers' kernels.
-    // The inverted-index layout (keys + offsets) is always mirrored; the patch
-    // CSR data and the index values only when the algorithm's kernels read them.
-    const auto upload = [](auto& dev, const auto& host) {
-        dev.resize(host.size());
-        if (!host.empty()) dev.copy_from_host(host.data(), host.size());
-    };
-    upload(d_inv_keys_,    inv_.keys);
-    upload(d_inv_offsets_, inv_.offsets);
+    // Inverted index: built on the device from the device CSR. UPS reads only
+    // its layout (keys + offsets), so the values are dropped there.
+    const std::uint64_t M     = mapped.M_local;
+    const std::uint64_t total = mapped.data.size();
+    DeviceInvertedIndex inv = build_inverted_index_device(
+        mapped.data.data(), mapped.offsets.data(), M, total, N_);
+    d_inv_keys_    = std::move(inv.keys);
+    d_inv_offsets_ = std::move(inv.offsets);
+    if (mirrors == PatchSetMirrors::All) d_inv_data_ = std::move(inv.data);
+    phases.mark("inverted index build", W::Device);
+
+    // Host views: the patch CSR and the index keys.
+    patches_.offsets.resize(M + 1);
+    mapped.offsets.copy_to_host(patches_.offsets.data(), M + 1);
+    patches_.data.resize(total);
+    if (total) mapped.data.copy_to_host(patches_.data.data(), total);
+    inv_keys_.resize(inv.num_keys);
+    if (inv.num_keys > 0) d_inv_keys_.copy_to_host(inv_keys_.data(), inv_keys_.size());
     if (mirrors == PatchSetMirrors::All) {
-        upload(d_patch_data_, patches_.data);
-        upload(d_inv_data_,   inv_.data);
+        d_patch_data_    = std::move(mapped.data);
+        d_patch_offsets_ = std::move(mapped.offsets);
     }
-    phases.mark("upload to device", W::Transfer);
+    phases.mark("host views download", W::Transfer);
     phases.report(stderr, "[stps-profile PatchSet]", comm.getRank());
 }
 

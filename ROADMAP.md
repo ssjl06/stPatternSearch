@@ -97,9 +97,11 @@ latency/overhead-bound, not compute-bound — optimize launches/syncs, not FLOPs
 > read per batch, zero per-iteration host round-trips. size == 1 skips the
 > allreduce — subsuming the single-rank prototype below. Bit-identical at all
 > scales, 31/31 ctest; LARGE/4× solve ~30% faster, Small `-n 2` regresses
-> (deep-pipeline overhead; see STATUS "M6.5"). ByPatch multi-rank stays
-> host-driven — its NCCL bcast root/count are data-dependent host scalars,
-> which is exactly what ByElement designed away. int32 wire scores landed as a
+> (deep-pipeline overhead; see STATUS "M6.5"). ByPatch is device-resident too
+> since 2026-11: the root-and-count broadcast became a fixed-length
+> `ncclAllReduce<SUM>` sized by the previous batch's winner score, and MAXLOC a
+> packed-key `ncclAllReduce<MAX>` (STATUS "Per-iteration flow"). Verified at 1 and
+> 2 ranks (2×A40). int32 wire scores landed as a
 > follow-up (allreduce halved; solve −21~27% at LARGE/4×/20×, setup-time
 > overflow proof — see STATUS). Remaining ideas: CUDA-graph batch capture,
 > NVLink validation.
@@ -264,7 +266,5 @@ Deviation from the original sketch: `generate_synthetic` stays in `src/data/`
 - **Stream awareness**: All kernels use the default stream. Per-step streams
   + explicit `cudaStreamSynchronize` would document intent and unlock
   comm/compute overlap.
-- **Profile gating**: `-DUSC_PROFILE=ON` compiles in the per-stage
-  `GpuProfiler` (CUDA events) + `HostProfiler` (host wall-clock) instrumentation
-  in `patch_select()`; off path has no sync. Used to confirm the 78% → 18%
-  shift; next useful for a possible argmax rework.
+- **Profile gating**: `-DUSC_PROFILE=ON` compiles in the `PhaseTimer` phase
+  split (host / transfer / device); off path has no sync.

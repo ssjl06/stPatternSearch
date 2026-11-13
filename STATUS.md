@@ -117,21 +117,29 @@ tests/
 | NCCL | system (`libnccl-dev`) | required at runtime for the hot-path bcast |
 | GoogleTest | system (`libgtest-dev`) for stComm; FetchContent 1.15.2 for stPS | |
 
-### Per-iteration host/device boundary (M5)
+### Per-iteration flow (ByPatch, device-resident)
 
-| Step | Where | Cost |
-|---|---|---|
-| CUB ArgMax + 16 B D2H | device + host stub | 16 B/iter |
-| MPI Allreduce&lt;MAXLOC&gt; on (score,rank) | host | NCCL has no MAXLOC |
-| MPI Bcast&lt;PatchId&gt; winner_global (8 B) | host | tiny |
-| build_newly_covered_kernel (winner only) | device | — |
-| **NCCL Bcast&lt;ElementId&gt; on d_newly_covered_ids** | **device-direct** | **no host staging** |
-| set_bits (d_covered_ only) + score_update_invidx_kernel (strategy A) | device | — |
-| H2D 8 B (Score = -1) winner disable | host stub | tiny |
+The host enqueues batches of up to 128 iterations on the NCCL stream and reads
+24 B of loop state per batch. Nothing crosses to the host inside an iteration.
 
-The payload (`d_newly_covered_ids`, sized winner_score × 8 B) **never visits host
-memory** in M5. Only the 16 B MAXLOC metadata is host-side, dictated by the NCCL
-API (root/count must be host scalars).
+| Step | Where |
+|---|---|
+| CUB ArgMax over local scores → 64-bit key `(score << 32) \| (2^32-1 − rank)` | device |
+| `ncclAllReduce<MAX>` of the key (1 element) — winner score + rank, ties → lowest rank | device |
+| commit kernel: loop state on every rank; the winner resolves its patch range, disables it | device |
+| winner compacts its still-uncovered elements into the payload | device |
+| `ncclAllReduce<SUM>` of the payload (`bound + 1` elements; only the winner's is non-zero) | device |
+| record selected patch, set_bits, strategy-A score update | device |
+
+`bound` is the previous batch's last winner score (winner scores never
+increase), so every list of a batch fits. size == 1 skips both collectives.
+Scores are int32 on the device (a patch holds at most INT_MAX elements).
+
+**Verification (2026-11-13, 2×A40, `NCCL_P2P_DISABLE=1`):** full suite at 1 and
+2 ranks plus the 1M-patch scale tests pass; selections are identical to the
+previous host-driven loop at both rank counts (200k and 2M patches). 2M patches:
+1 rank 53.6 s → 28.3 s, 2 ranks 51.9 s → 31.1 s. Not yet run beyond 2 ranks or
+on NVLink hardware.
 
 ## M6 architecture (`PartitionMode::ByElement`, opt-in)
 
@@ -336,10 +344,10 @@ issues).
    of −1 (no 64-bit `atomicSub` exists); decrements commute, so scores stay
    deterministic. The strategy-B kernel lives on the `main` branch for bisect.
 
-8. **Optional profile instrumentation in patch_select()** — compiled in by
-   `-DUSC_PROFILE=ON` (`GpuProfiler` CUDA-event timers + `HostProfiler` host
-   wall-clock timers); off path has no sync overhead. Used to pinpoint
-   per-stage cost. See "Profile baseline" below.
+8. **Optional phase timers** — compiled in by `-DUSC_PROFILE=ON`
+   (`PhaseTimer`): a wall-clock split of setup and solve into phases tagged
+   host / transfer / device. The greedy loops are device-resident and have no
+   per-stage timers (no host-visible stage boundaries inside a batch).
 
 ## Verification baseline (M5)
 

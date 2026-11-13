@@ -4,8 +4,10 @@ add_library(stPS STATIC
     core/collective.cpp
     core/csr.cpp
     core/inverted_index.cpp
+    core/inverted_index_device.cu
     core/device_buffer.cu
-    core/gpu_profiler.cu
+    core/device_primitives.cu
+    core/hash_id_map_device.cu
     core/host_profiler.cpp
     core/patch_set.cpp
     # usc/ — greedy minimum set-cover algorithm

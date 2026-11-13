@@ -2,9 +2,9 @@
 
 #include "core/csr.hpp"
 #include "core/device_buffer.hpp"
-#include "core/inverted_index.hpp"
 #include <stPS/types.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -39,6 +39,22 @@ struct IdMappedPatches {
 IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
                                           std::vector<std::vector<Hash>> raw_patches);
 
+namespace detail {
+
+// Sample-sort splitter selection, shared by the host and device mappings.
+inline constexpr int kSplitterSamplesPerRank = 128;
+
+// Evenly spaced positions in a sorted array of n values to sample: exactly
+// kSplitterSamplesPerRank of them, or none when n == 0.
+std::vector<std::size_t> splitter_sample_indices(std::size_t n);
+
+// Collective: gather every rank's sample (the values at the positions above;
+// empty for a rank without hashes) and return the size-1 splitters, identical
+// on every rank. A hash h belongs to rank upper_bound(splitters, h).
+std::vector<Hash> splitters_from_sample(stComm::Comm& comm, std::vector<Hash> local_sample);
+
+}  // namespace detail
+
 // Distributed, algorithm-neutral "hashed patch set" — the shared preprocessing
 // every patch algorithm (USC greedy set-cover, UPS pattern counting, ...) builds
 // on. Given each rank's patches as lists of Hash, it performs the distributed
@@ -72,7 +88,10 @@ public:
     std::uint64_t        N() const noexcept { return N_; }
     std::uint64_t        M_local() const noexcept { return patches_.M(); }
     const PatchCsr&      patches() const noexcept { return patches_; }
-    const InvertedIndex& inverted_index() const noexcept { return inv_; }
+    // Sorted element IDs that occur in this rank's patches — the inverted
+    // index keys. The index itself is built and kept on the device (see the
+    // d_inv_* mirrors); only its keys are copied back.
+    const std::vector<ElementId>& inv_keys() const noexcept { return inv_keys_; }
 
     // ElementId → Hash reverse map for this rank's element shard (see
     // IdMappedPatches::shard_hashes): shard_hashes()[i] is the hash of global
@@ -81,21 +100,23 @@ public:
     std::uint64_t            shard_start()  const noexcept { return shard_start_; }
 
     // Device mirrors (populated at construction) — raw const pointers for
-    // kernels. d_patch_data / d_inv_data are null unless PatchSetMirrors::All.
+    // kernels. d_patch_data / d_patch_offsets / d_inv_data are null unless PatchSetMirrors::All.
     const ElementId*     d_patch_data()    const noexcept { return d_patch_data_.data(); }
+    const std::uint64_t* d_patch_offsets() const noexcept { return d_patch_offsets_.data(); }
     const ElementId*     d_inv_keys()      const noexcept { return d_inv_keys_.data(); }
     const std::uint64_t* d_inv_offsets()   const noexcept { return d_inv_offsets_.data(); }
     const PatchId*       d_inv_data()      const noexcept { return d_inv_data_.data(); }
 
 private:
     PatchCsr      patches_;
-    InvertedIndex inv_;
+    std::vector<ElementId> inv_keys_;
     std::uint64_t N_ = 0;
 
     std::vector<Hash> shard_hashes_;
     std::uint64_t     shard_start_ = 0;
 
     DeviceBuffer<ElementId>     d_patch_data_;
+    DeviceBuffer<std::uint64_t> d_patch_offsets_;
     DeviceBuffer<ElementId>     d_inv_keys_;
     DeviceBuffer<std::uint64_t> d_inv_offsets_;
     DeviceBuffer<PatchId>       d_inv_data_;
