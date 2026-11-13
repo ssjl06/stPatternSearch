@@ -76,6 +76,17 @@ private:
     std::uint64_t max_initial_score_ = 0;      // largest patch over all ranks
 };
 
+namespace detail {
+// Test-only switches for the ByElement loop. The delta exchange normally runs
+// only with more than one rank; forcing it (and a tiny window) lets a
+// single-GPU run exercise the multi-step draining path.
+struct UscElemTestHooks {
+    bool          force_delta_exchange = false;
+    std::uint64_t delta_window         = 0;   // 0 = sized automatically
+};
+UscElemTestHooks& usc_elem_test_hooks();
+}  // namespace detail
+
 // Internal implementation of the public UscPatchSelector in
 // PartitionMode::ByElement — design doc §7.3, the element-partitioned covered
 // bitset. The element ID space [0, N) is statically sharded across ranks
@@ -86,23 +97,18 @@ private:
 //     shard (redistributed once at setup as (slot, element) incidences) plus
 //     the matching shard-local inverted index.
 //
-// Scores are maintained as per-rank partials (uncovered count within the local
-// shard, strategy-A decrements). Each iteration re-forms the full scores on
-// every rank with ONE fixed-size AllReduce<SUM> over M_global — the iteration's
-// only collective. Integer sums are exact and NCCL delivers identical results
-// on every rank, so each rank computes the same argmax locally: no MAXLOC, no
-// winner-payload broadcast, and covered_count advances by the (globally known)
-// winner score with zero extra communication. Communication per iteration is
-// O(M_global), independent of N.
+// Every rank keeps the FULL score of every patch (identical everywhere), so
+// each rank computes the same argmax locally: no MAXLOC, no winner-payload
+// broadcast, and covered_count advances by the (globally known) winner score.
+// What a selection changes travels as a "delta": the patch slots whose score
+// drops, sent by the rank that owns the newly covered element, through a
+// fixed-size window reduced with one small ncclAllReduce per step. Over a
+// whole solve every incidence is sent once — communication is O(incidences),
+// not O(iterations × M_global).
 //
-// The loop is DEVICE-RESIDENT (Full-GPU iteration track): because the one
-// collective has a fixed count and no root, the host can enqueue whole batches
-// of iterations — ncclAllReduce + CUB ArgMax + the four update kernels, all on
-// the NCCL stream — without knowing any iteration's outcome. A single-thread
-// commit kernel consumes the argmax result on device (append selected slot,
-// advance covered_count, winner disable, set a done flag); the host syncs once
-// per batch of iterations to read the 24 B loop state. There are no per-iteration
-// D2H/H2D round-trips at all.
+// The loop is DEVICE-RESIDENT: the window has a fixed size and no root, so the
+// host enqueues whole batches of steps on the NCCL stream without knowing any
+// outcome, and reads 24 B of loop state per batch.
 class UscElemPatchSelectorImpl {
 public:
     // `comm` must be a device-enabled Comm (Comm::onDevice).
@@ -134,6 +140,8 @@ private:
     // Largest initial global score — an upper bound on every winner's score,
     // used to size the first device-resident batch.
     std::uint64_t        max_initial_score_ = 0;
+    // Average patches per element (rounded up) — sizes the delta window.
+    std::uint64_t        avg_degree_ = 1;
 
     // Device state. d_patch_data_ stores SHARD-LOCAL element IDs (global ID −
     // shard_base_), so the covered bitset and the kernels index the local shard
@@ -145,8 +153,7 @@ private:
     DeviceBuffer<ElementId>     d_inv_keys_;        // shard-local inverted index
     DeviceBuffer<std::uint64_t> d_inv_offsets_;
     DeviceBuffer<PatchId>       d_inv_data_;        // values are global slots
-    DeviceBuffer<WireScore>     d_scores_partial_;  // M_global; this shard's part
-    DeviceBuffer<WireScore>     d_scores_sum_;      // M_global; allreduced full
+    DeviceBuffer<WireScore>     d_scores_;          // M_global; full scores (replicated)
     DeviceBuffer<std::uint64_t> d_covered_;         // shard_extent_/64 words
 };
 

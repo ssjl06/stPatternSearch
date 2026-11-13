@@ -9,6 +9,7 @@
 #include <stComm/stComm.h>
 
 #include <cub/device/device_reduce.cuh>
+#include <cub/device/device_scan.cuh>
 #include <cub/util_type.cuh>
 #include <cuda_runtime.h>
 
@@ -100,6 +101,10 @@ struct WinnerInfo {
     unsigned int  live;           // ByPatch: 1 while this iteration selects a patch
 };
 
+// One 32-bit word of the delta exchange (a count, a flag or a patch slot —
+// slots fit: M_global is within int range).
+using DeltaWord = std::uint32_t;
+
 // Single-thread commit: consume the argmax result entirely on device — the
 // decision the host used to make each iteration. Appends the winner slot,
 // advances covered_count by the (globally identical) winner score, resolves
@@ -111,14 +116,24 @@ struct WinnerInfo {
 __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore>* argmax,
                                           const std::uint64_t* sub_offsets,
                                           std::uint64_t        N,
-                                          WireScore*           scores_partial,
+                                          WireScore*           scores,
                                           PatchId*             selected_slots,
-                                          LoopState*       st,
-                                          WinnerInfo*      w) {
+                                          const DeltaWord*     delta_recv,
+                                          int                  delta_ranks,
+                                          std::uint64_t        delta_window,
+                                          LoopState*           st,
+                                          WinnerInfo*          w) {
     w->newly_count = 0;
     w->start = 0;
     w->end   = 0;
+    w->live  = 0;
     if (st->done) return;
+    // Delta exchange: while any rank still has score decrements to send, the
+    // replicated scores are not final — select nothing this step. The flags
+    // come out of the reduction, so every rank takes the same branch.
+    for (int r = 0; r < delta_ranks; ++r) {
+        if (delta_recv[static_cast<std::uint64_t>(r) * (delta_window + 2) + 1]) return;
+    }
     const WireScore score = argmax->value;
     if (score <= 0) { st->done = 1; return; }
     const int slot = argmax->key;
@@ -127,13 +142,12 @@ __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore
     st->last_score     = static_cast<std::uint32_t>(score);
     st->covered_count += static_cast<std::uint64_t>(score);
     if (st->covered_count >= N) st->done = 1;
+    w->live  = 1;
     w->start = sub_offsets[slot];
     w->end   = sub_offsets[slot + 1];
-    // Winner disable, fused. The strategy-A update of this same iteration will
-    // further decrement it by this shard's newly-covered count — it stays
-    // permanently negative either way, so the selection sequence is identical
-    // to the host loop's update-then-disable order.
-    scores_partial[slot] = kDisabledWireScore;
+    // Winner disable, fused. This iteration's decrements lower it further — it
+    // stays permanently negative either way.
+    scores[slot] = kDisabledWireScore;
 }
 
 // build_newly_covered, fixed-grid grid-stride: the range comes from w; the
@@ -196,6 +210,124 @@ __global__ void fixed_score_update_kernel(const ElementId*      newly_ids,
             atomicSub(reinterpret_cast<int*>(&scores[inv_data[i]]), 1);
         }
         __syncthreads();  // all readers done before thread 0 overwrites s_start/s_end
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ByElement delta exchange (multi-rank).
+//
+// Every rank keeps the FULL score of every patch. A selection changes them
+// only through the newly covered elements: each (element, patch) incidence of
+// such an element lowers that patch's score by one, and only the element's
+// owner rank knows those incidences. So instead of re-forming all M_global
+// scores every iteration, each rank ships the patch slots to decrement — its
+// "delta stream" for the iteration: the inverted-index lists of its newly
+// covered elements, concatenated.
+//
+// The stream travels through a fixed-size window so the host can enqueue
+// blind: per step each rank fills its own segment of a P-segment buffer
+// ([count, more-to-come flag, up to `window` slots]; the other segments stay
+// zero) and one ncclAllReduce<SUM> gives every rank all segments. A stream
+// longer than the window continues in the following steps, and no patch is
+// selected until every rank has sent everything (see the commit kernel).
+// Over a whole solve each incidence is sent once.
+// ---------------------------------------------------------------------------
+
+// Rank-local progress through the current iteration's delta stream.
+struct DeltaCursor {
+    std::uint64_t total;         // stream length
+    std::uint64_t sent;          // entries already shipped
+    std::uint64_t window_start;  // this step's window: [window_start, +n_send)
+    std::uint32_t n_send;
+    std::uint32_t n_newly;       // newly covered elements behind the stream
+};
+
+// deg[i] = inverted-index list length of newly covered element i, 0 for
+// i in [newly_count, len]. Only on a step that selected a patch — while a
+// stream is being drained the previous values must stay.
+__global__ void elem_delta_degrees_kernel(const ElementId*     newly_ids,
+                                          const WinnerInfo*    w,
+                                          const ElementId*     inv_keys,
+                                          std::uint64_t        inv_keys_n,
+                                          const std::uint64_t* inv_offsets,
+                                          std::uint64_t        len,
+                                          std::uint64_t*       deg) {
+    if (!w->live) return;
+    const unsigned int n = w->newly_count;
+    const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t i = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+         i <= len; i += stride) {
+        std::uint64_t d = 0;
+        if (i < n) {
+            std::uint64_t start, end;
+            inv_index_range(newly_ids[i], inv_keys, inv_keys_n, inv_offsets, start, end);
+            d = end - start;
+        }
+        deg[i] = d;
+    }
+}
+
+// `prefix` is the exclusive prefix sum of deg over [0, len], so prefix[len]
+// is the stream length.
+__global__ void elem_delta_begin_kernel(const WinnerInfo* w, const std::uint64_t* prefix,
+                                        std::uint64_t len, DeltaCursor* c) {
+    if (!w->live) return;
+    c->total   = prefix[len];
+    c->sent    = 0;
+    c->n_newly = w->newly_count;
+}
+
+// Take the next window off the stream and write this rank's segment header.
+__global__ void elem_delta_plan_kernel(DeltaCursor* c, std::uint64_t window,
+                                       DeltaWord* segment) {
+    const std::uint64_t left = c->total - c->sent;
+    const std::uint64_t n    = left < window ? left : window;
+    c->window_start = c->sent;
+    c->n_send       = static_cast<std::uint32_t>(n);
+    c->sent        += n;
+    segment[0] = static_cast<DeltaWord>(n);
+    segment[1] = (left - n) ? 1u : 0u;
+}
+
+// Write the window's slots: element i owns stream positions
+// [prefix[i], prefix[i + 1]).
+__global__ void elem_delta_fill_kernel(const ElementId*     newly_ids,
+                                       const DeltaCursor*   c,
+                                       const std::uint64_t* prefix,
+                                       const ElementId*     inv_keys,
+                                       std::uint64_t        inv_keys_n,
+                                       const std::uint64_t* inv_offsets,
+                                       const PatchId*       inv_data,
+                                       DeltaWord*           slots) {
+    const std::uint64_t ws = c->window_start;
+    const std::uint64_t we = ws + c->n_send;
+    const std::uint64_t n  = c->n_newly;
+    const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t i = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+         i < n; i += stride) {
+        const std::uint64_t lo = prefix[i];
+        const std::uint64_t hi = prefix[i + 1];
+        if (hi <= ws || lo >= we) continue;
+        std::uint64_t start, end;
+        inv_index_range(newly_ids[i], inv_keys, inv_keys_n, inv_offsets, start, end);
+        const std::uint64_t from = lo > ws ? lo : ws;
+        const std::uint64_t to   = hi < we ? hi : we;
+        for (std::uint64_t pos = from; pos < to; ++pos) {
+            slots[pos - ws] = static_cast<DeltaWord>(inv_data[start + (pos - lo)]);
+        }
+    }
+}
+
+// Apply every rank's window to the replicated scores. Decrements commute.
+__global__ void elem_delta_apply_kernel(const DeltaWord* recv, std::uint64_t ranks,
+                                        std::uint64_t window, WireScore* scores) {
+    const std::uint64_t total  = ranks * window;
+    const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t idx = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+         idx < total; idx += stride) {
+        const DeltaWord* segment = recv + (idx / window) * (window + 2);
+        const std::uint64_t j = idx % window;
+        if (j < segment[0]) atomicSub(reinterpret_cast<int*>(&scores[segment[2 + j]]), 1);
     }
 }
 
@@ -647,30 +779,29 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
         d_patch_data_.copy_from_host(sub.data.data(), sub.data.size());
     }
 
-    d_scores_partial_.resize(M_global_);
-    d_scores_sum_.resize(M_global_);
+    d_scores_.resize(M_global_);
     max_sub_len_ = 0;
     if (M_global_) {
-        // Initial partial score = this shard's slice of each patch (full score
-        // arrives via the per-iteration AllReduce<SUM>). Also record the widest
-        // sub-patch — it bounds the newly-covered scratch for the whole solve.
+        // This shard's slice of each patch; the full initial scores are their
+        // sum over the ranks (below). Also record the widest sub-patch — it
+        // bounds the newly-covered scratch for the whole solve.
         std::vector<WireScore> init(M_global_);
         for (std::uint64_t s = 0; s < M_global_; ++s) {
             const std::uint64_t len = sub.offsets[s + 1] - sub.offsets[s];
             init[s] = static_cast<WireScore>(len);
             max_sub_len_ = std::max(max_sub_len_, len);
         }
-        d_scores_partial_.copy_from_host(init.data(), M_global_);
         // Offsets mirror — the commit kernel resolves winner ranges on device,
         // so the host never touches the sub-CSR during the loop.
         d_sub_offsets_.resize(sub.offsets.size());
         d_sub_offsets_.copy_from_host(sub.offsets.data(), sub.offsets.size());
 
-        // Prove the int32 wire fits, once. Initial global scores (= deduped
-        // patch sizes) are the solve's maxima — scores only decrease — so if
-        // every initial sum fits with a P-sized margin (the disabled floor is
-        // −P − patch_size), every value the wire ever carries fits. A one-time
-        // host allreduce of the int64 partials makes the check exact.
+        // Full initial scores, replicated on every rank: one host allreduce of
+        // the per-shard slices, in int64 so the int32 fit can be proven
+        // exactly. Initial scores (= deduped patch sizes) are the solve's
+        // maxima — scores only decrease — and the disabled floor is
+        // −1 − patch_size, so if every initial score fits with a margin, every
+        // later value fits.
         std::vector<std::int64_t> init64(M_global_), sum64(M_global_);
         for (std::uint64_t s = 0; s < M_global_; ++s) init64[s] = init[s];
         comm_.allreduce<stComm::Space::Host, std::int64_t>(
@@ -681,6 +812,7 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
         // decrease) — select() sizes its first batch from it.
         max_initial_score_ = static_cast<std::uint64_t>(
             std::max<std::int64_t>(*std::max_element(sum64.begin(), sum64.end()), 0));
+        std::uint64_t incidences = 0;
         for (std::uint64_t s = 0; s < M_global_; ++s) {
             if (sum64[s] > wire_max) {
                 throw std::invalid_argument(
@@ -688,7 +820,12 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
                     " has " + std::to_string(sum64[s]) +
                     " unique elements — exceeds the int32 score wire format");
             }
+            init[s] = static_cast<WireScore>(sum64[s]);
+            incidences += static_cast<std::uint64_t>(sum64[s]);
         }
+        d_scores_.copy_from_host(init.data(), M_global_);
+        // Average patches per element, rounded up — sizes the delta window.
+        avg_degree_ = N_ ? (incidences + N_ - 1) / N_ : 1;
     }
 
     d_covered_.resize((shard_extent_ + 63) / 64);
@@ -701,114 +838,181 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     return result;
 }
 
-// Element-partitioned greedy loop (§7.3) — DEVICE-RESIDENT (Full-GPU track).
+// Element-partitioned greedy loop (§7.3) — DEVICE-RESIDENT.
 //
-// Per iteration, all enqueued on the NCCL stream with no host knowledge of
-// the outcome:
+// Every rank holds the full, identical score of every patch, so each rank
+// computes the same argmax on its own — no MAXLOC, no winner broadcast. What
+// travels is only what a selection changes: the patch slots whose score drops
+// (see "ByElement delta exchange" above). Per step, all enqueued on the NCCL
+// stream with no host knowledge of the outcome:
 //
-//        ncclAllReduce<SUM>(d_scores_partial_ → d_scores_sum_, M)   ← only collective
-//   [device] CUB ArgMax over the (identical) full scores
-//   [device] elem_commit_winner: append slot, covered_count += score,
-//            winner range resolve, winner disable, done flag   (1 thread)
-//   [device] elem_build_newly / elem_set_bits / elem_score_update
-//            (fixed grids; range/count read from device memory)
+//   [device] plan + fill this rank's window of pending decrements
+//        ncclAllReduce<SUM>(P segments of window + 2 words)   ← only collective
+//   [device] apply every rank's window to the scores
+//   [device] CUB ArgMax over the scores
+//   [device] commit: nothing while any rank has more to send; otherwise
+//            append slot, covered_count += score, winner range, disable
+//   [device] build newly covered (this shard) + set_bits
+//   [device] new delta stream: list lengths → prefix sum → cursor
 //
-// The host enqueues a batch of iterations at a time and then syncs ONCE to
-// read the 24 B loop state — there are no per-iteration D2H/H2D round-trips.
-// The batch is sized so it cannot run past the end of the solve (see the
-// loop): every enqueued iteration costs an M_global-wide allreduce, the
-// mode's dominant cost, whether or not it still has work to do. This
-// is only possible in ByElement: its collective has a fixed count and no
-// root, so it needs no host scalars (the exact blockers that keep the
-// ByPatch multi-rank loop host-driven; see ROADMAP "Full-GPU iteration
-// track"). Iterations enqueued past termination no-op on device, and `done`
-// derives only from allreduced values, so every rank leaves after the same
-// batch — collectives stay matched.
+// A step whose windows carried everything selects in the same step, so the
+// common case is one small collective per selection. The host enqueues a
+// batch of steps and syncs once to read the 24 B loop state; steps enqueued
+// past termination no-op, and every branch above derives from reduced
+// values, so all ranks stay in lockstep.
 //
-// size == 1 additionally skips the allreduce (partials ARE the full scores):
-// the pure kernel chain is the single-rank device-resident loop the ROADMAP
-// prototype validated at 2.7×.
+// The window is re-sized per batch from values every rank agrees on (the
+// winner-score bound and the average element degree): about four times the
+// expected decrements per rank and selection.
+//
+// size == 1 has no one to exchange with: the decrements go straight into the
+// scores (strategy-A update), no collective at all.
 //
 // -DUSC_PROFILE stage timers are deliberately absent here: with no
-// per-iteration syncs there are no host-visible stage boundaries to time.
-// Profile this loop with Nsight Systems instead.
+// per-step syncs there are no host-visible stage boundaries to time.
 PatchSelection UscElemPatchSelectorImpl::select() {
     PatchSelection result;
     result.covered_count = 0;
     result.iterations    = 0;
     if (M_global_ == 0 || N_ == 0) return result;   // agreed on every rank
 
-    const int size = comm_.getSize();
-    // Kernels ride the same stream as the collectives, so batch ordering is
-    // carried by the stream alone — no events, no per-iteration syncs.
+    const int  size  = comm_.getSize();
+    const auto usize = static_cast<std::uint64_t>(size);
+    const auto urank = static_cast<std::uint64_t>(comm_.getRank());
+    const detail::UscElemTestHooks& hooks = detail::usc_elem_test_hooks();
+    const bool exchange = size > 1 || hooks.force_delta_exchange;
+    // Kernels ride the same stream as the collectives, so ordering is carried
+    // by the stream alone — no events, no per-step syncs.
     cudaStream_t stream = comm_.nccl().getStream();
 
     DeviceBuffer<LoopState>  d_state(1);
     DeviceBuffer<WinnerInfo> d_winner(1);
     d_state.zero();
     d_winner.zero();
-    DeviceBuffer<PatchId>   d_selected(M_global_);
-    DeviceBuffer<ElementId> d_newly_ids(std::max<std::uint64_t>(max_sub_len_, 1));
-
-    // size == 1: the partial scores ARE the full scores — no allreduce at all.
-    const WireScore* d_full_scores = (size == 1) ? d_scores_partial_.data()
-                                                 : d_scores_sum_.data();
+    DeviceBuffer<PatchId>   d_selected(std::min(M_global_, N_));
+    const std::uint64_t max_newly = std::max<std::uint64_t>(max_sub_len_, 1);
+    DeviceBuffer<ElementId> d_newly_ids(max_newly);
 
     using ArgmaxPair = cub::KeyValuePair<int, WireScore>;
     DeviceBuffer<ArgmaxPair>   d_argmax_result(1);
     DeviceBuffer<std::uint8_t> d_argmax_temp;
     {
         std::size_t temp_bytes = 0;
-        cub::DeviceReduce::ArgMax(nullptr, temp_bytes, d_full_scores,
+        cub::DeviceReduce::ArgMax(nullptr, temp_bytes, d_scores_.data(),
                                   d_argmax_result.data(),
                                   static_cast<int>(M_global_));
         d_argmax_temp.resize(temp_bytes);
     }
 
-    // Batch sizing. Winner scores never increase over a greedy solve (covering
-    // elements only lowers every patch's score), so each remaining iteration
-    // covers at most `score_bound` elements and at least
-    // ceil(remaining / score_bound) more iterations must run. Enqueueing
-    // exactly that many — capped at kMaxBatch — never overshoots the end of
-    // the solve, where a fixed-size batch would burn up to kMaxBatch − 1 idle
-    // allreduce + argmax passes. Both inputs come from allreduced state, so
-    // every rank picks the same batch and the collectives stay matched.
-    constexpr std::uint64_t kMaxBatch = 128;
     std::uint64_t score_bound = std::max<std::uint64_t>(max_initial_score_, 1);
+
+    // Delta exchange state. The window only shrinks (score_bound does), so the
+    // first one sizes the buffers.
+    const auto window_for = [&](std::uint64_t bound) -> std::uint64_t {
+        if (hooks.delta_window) return hooks.delta_window;
+        const std::uint64_t expected = bound * avg_degree_ / usize;
+        return std::clamp<std::uint64_t>(4 * expected + 16, 64, std::uint64_t{1} << 16);
+    };
+    DeviceBuffer<DeltaCursor>   d_cursor;
+    DeviceBuffer<std::uint64_t> d_deg, d_prefix;
+    DeviceBuffer<DeltaWord>     d_send, d_recv_buf;
+    DeviceBuffer<std::uint8_t>  d_scan_temp;
+    std::uint64_t window = 0;
+    if (exchange) {
+        d_cursor.resize(1);
+        d_cursor.zero();
+        d_deg.resize(max_newly + 1);
+        d_prefix.resize(max_newly + 1);
+        d_deg.zero();
+        d_prefix.zero();
+        const std::uint64_t words = usize * (window_for(score_bound) + 2);
+        d_send.resize(words);
+        if (size > 1) d_recv_buf.resize(words);
+        std::size_t temp_bytes = 0;
+        cuda_check(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_deg.data(),
+                                                 d_prefix.data(), max_newly + 1),
+                   "delta prefix-sum sizing");
+        d_scan_temp.resize(temp_bytes);
+    }
+    // One rank (test hook): the "reduction" of a single segment is itself.
+    const DeltaWord* d_recv = size > 1 ? d_recv_buf.data() : d_send.data();
+
+    // Batch sizing. Winner scores never increase over a greedy solve (covering
+    // elements only lowers every patch's score), so each remaining selection
+    // covers at most `score_bound` elements and at least
+    // ceil(remaining / score_bound) more steps must run. Enqueueing exactly
+    // that many — capped at kMaxBatch — never overshoots the end of the solve.
+    // Both inputs come from reduced state, so every rank picks the same batch.
+    constexpr std::uint64_t kMaxBatch = 128;
     LoopState h_state{};
     while (true) {
         const std::uint64_t remaining = N_ - h_state.covered_count;
         const std::uint64_t batch = std::clamp<std::uint64_t>(
             remaining / score_bound + (remaining % score_bound != 0), 1, kMaxBatch);
+        // A newly-covered list never outgrows the winner score or the widest
+        // sub-patch.
+        const std::uint64_t len = std::min(score_bound, max_newly);
+        if (exchange) {
+            const std::uint64_t w = window_for(score_bound);
+            if (w != window) {
+                // Segments move with the window: the other ranks' segments of
+                // the send buffer must read zero again.
+                cuda_check(cudaMemsetAsync(d_send.data(), 0, d_send.bytes(), stream),
+                           "delta send clear");
+                window = w;
+            }
+        }
+        DeltaWord* d_segment = exchange ? d_send.data() + urank * (window + 2) : nullptr;
+        const unsigned apply_blocks = static_cast<unsigned>(
+            (usize * window + kFixedBlockThreads - 1) / kFixedBlockThreads);
+
         for (std::uint64_t b = 0; b < batch; ++b) {
-            if (size > 1) {
-                // Enqueue-only — no wait. Stream order makes iteration k's
-                // updated partials the input of iteration k+1's allreduce.
-                // int32 wire: half the payload of the naive int64 scores —
-                // this allreduce is the mode's dominant cost (see STATUS).
-                comm_.allreduce<stComm::Space::Device, WireScore>(
-                    d_scores_partial_.data(), d_scores_sum_.data(), M_global_,
-                    stComm::ReduceOp::Sum);
+            if (exchange) {
+                elem_delta_plan_kernel<<<1, 1, 0, stream>>>(d_cursor.data(), window, d_segment);
+                elem_delta_fill_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
+                    d_newly_ids.data(), d_cursor.data(), d_prefix.data(),
+                    d_inv_keys_.data(), num_inv_keys_, d_inv_offsets_.data(),
+                    d_inv_data_.data(), d_segment + 2);
+                if (size > 1) {
+                    // Enqueue-only — no wait.
+                    comm_.allreduce<stComm::Space::Device, DeltaWord>(
+                        d_send.data(), d_recv_buf.data(), usize * (window + 2),
+                        stComm::ReduceOp::Sum);
+                }
+                elem_delta_apply_kernel<<<apply_blocks, kFixedBlockThreads, 0, stream>>>(
+                    d_recv, usize, window, d_scores_.data());
             }
             std::size_t temp_bytes = d_argmax_temp.bytes();
             cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
-                                      d_full_scores,
-                                      d_argmax_result.data(),
+                                      d_scores_.data(), d_argmax_result.data(),
                                       static_cast<int>(M_global_), stream);
             elem_commit_winner_kernel<<<1, 1, 0, stream>>>(
                 d_argmax_result.data(), d_sub_offsets_.data(), N_,
-                d_scores_partial_.data(), d_selected.data(),
+                d_scores_.data(), d_selected.data(),
+                d_recv, exchange ? size : 0, window,
                 d_state.data(), d_winner.data());
             fixed_build_newly_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_patch_data_.data(), d_covered_.data(),
                 d_newly_ids.data(), d_winner.data());
             fixed_set_bits_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_covered_.data(), d_newly_ids.data(), d_winner.data());
-            fixed_score_update_kernel<<<kFixedGridBlocks, kScoreBlockThreads, 0, stream>>>(
-                d_newly_ids.data(), d_winner.data(),
-                d_inv_keys_.data(), num_inv_keys_,
-                d_inv_offsets_.data(), d_inv_data_.data(),
-                d_scores_partial_.data());
+            if (exchange) {
+                elem_delta_degrees_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
+                    d_newly_ids.data(), d_winner.data(),
+                    d_inv_keys_.data(), num_inv_keys_, d_inv_offsets_.data(),
+                    len, d_deg.data());
+                std::size_t scan_bytes = d_scan_temp.bytes();
+                cub::DeviceScan::ExclusiveSum(d_scan_temp.data(), scan_bytes, d_deg.data(),
+                                              d_prefix.data(), len + 1, stream);
+                elem_delta_begin_kernel<<<1, 1, 0, stream>>>(
+                    d_winner.data(), d_prefix.data(), len, d_cursor.data());
+            } else {
+                fixed_score_update_kernel<<<kFixedGridBlocks, kScoreBlockThreads, 0, stream>>>(
+                    d_newly_ids.data(), d_winner.data(),
+                    d_inv_keys_.data(), num_inv_keys_,
+                    d_inv_offsets_.data(), d_inv_data_.data(),
+                    d_scores_.data());
+            }
         }
         cuda_launch_check("device-resident batch (elem)");
         // Drain the stream through stComm, not cudaStreamSynchronize: the
@@ -823,7 +1027,9 @@ PatchSelection UscElemPatchSelectorImpl::select() {
                               cudaMemcpyDeviceToHost),
                    "device-resident batch (elem) state copy");
         if (h_state.done) break;
-        score_bound = std::max<std::uint64_t>(h_state.last_score, 1);
+        if (h_state.num_selected) {
+            score_bound = std::max<std::uint64_t>(h_state.last_score, 1);
+        }
     }
 
     // Drain the device-side result: selected slots → caller PatchIds.
@@ -839,6 +1045,13 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     }
     return result;
 }
+
+namespace detail {
+UscElemTestHooks& usc_elem_test_hooks() {
+    static UscElemTestHooks hooks;
+    return hooks;
+}
+}  // namespace detail
 
 // ============================================================================
 // Public facade: stPS::UscPatchSelector — pImpl routing to the ByPatch or
