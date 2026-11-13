@@ -1,5 +1,6 @@
 #include <stPS/stPS.h>          // public API under test: UscPatchSelector, slice, types
 #include "usc/brute_force.hpp"  // white-box reference (brute_force_select)
+#include "usc/usc_patch_selector_impl.hpp"  // ByElement test hooks
 #include "data/synthetic.hpp"
 #include "helpers/chunk_guard.hpp"
 #include "helpers/distribute.hpp"
@@ -147,6 +148,40 @@ TEST(SolverEquivalenceElem, MediumHighOverlap) {
 
 TEST(SolverEquivalenceElem, LargerMidOverlap) {
     run_case(10000, 500, 50, 0.5, 1, PartitionMode::ByElement);
+}
+
+// The ByElement delta exchange with its window forced: on, even at one rank
+// (where it is normally skipped), and small enough that one selection's score
+// decrements need several steps to drain. Window 0 = the automatic size.
+class DeltaWindowGuard {
+public:
+    explicit DeltaWindowGuard(std::uint64_t window)
+        : saved_(detail::usc_elem_test_hooks()) {
+        detail::usc_elem_test_hooks() = {true, window};
+    }
+    ~DeltaWindowGuard() { detail::usc_elem_test_hooks() = saved_; }
+    DeltaWindowGuard(const DeltaWindowGuard&) = delete;
+    DeltaWindowGuard& operator=(const DeltaWindowGuard&) = delete;
+private:
+    detail::UscElemTestHooks saved_;
+};
+
+TEST(SolverEquivalenceElem, DeltaExchangeWindows) {
+    for (std::uint64_t window : {0u, 1u, 3u, 17u, 4096u}) {
+        SCOPED_TRACE("delta window " + std::to_string(window));
+        DeltaWindowGuard guard(window);
+        run_case(100, 50, 10, 0.3, 1, PartitionMode::ByElement);
+        run_case(1000, 200, 30, 0.7, 2, PartitionMode::ByElement);
+        run_case(1000, 200, 30, 0.1, 3, PartitionMode::ByElement);
+    }
+}
+
+TEST(SolverEquivalenceElem, DeltaExchangeLarger) {
+    for (std::uint64_t window : {0u, 5u}) {
+        SCOPED_TRACE("delta window " + std::to_string(window));
+        DeltaWindowGuard guard(window);
+        run_case(10000, 500, 50, 0.5, 1, PartitionMode::ByElement);
+    }
 }
 
 TEST(UscPatchSelectorApi, RejectsGlobalIdCountMismatch) {

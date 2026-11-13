@@ -177,6 +177,32 @@ dominates), exactly as the design doc predicted:
 All three scales bit-identical between modes and sizes 1/2 (`selected` =
 353 / 5378 / 14889).
 
+### ByElement delta exchange (2026-11) — supersedes the per-iteration score allreduce
+
+The tables above describe the original loop, whose one collective was an
+M_global-wide score allreduce every iteration. At scale that dominated
+everything (2M patches, 2 ranks: 545 s against 31 s for ByPatch).
+
+Now every rank keeps the full score of every patch, and a selection ships only
+what it changes: the patch slots whose score drops, sent by the rank owning the
+newly covered element. They travel through a fixed-size window (one small
+`ncclAllReduce<SUM>` of P × (window + 2) 32-bit words per step); a longer
+stream continues in the next steps and nothing is selected until every rank
+has sent everything. Over a solve each incidence is sent once: communication
+is O(incidences), not O(iterations × M_global). The window is re-sized per
+batch from the winner-score bound and the average element degree. Still
+device-resident (batches of steps, 24 B state read per batch); size == 1 is
+unchanged (no collective).
+
+Tests force the exchange at one rank with windows of 1..4096 slots
+(`detail::usc_elem_test_hooks`), so the draining path runs on a single GPU.
+
+Verified 2026-11-13 on 2×A40 (`NCCL_P2P_DISABLE=1`): full suite at 1 and 2
+ranks + the 1M-patch scale test pass, selections identical to the previous
+loop. ByElement at 2 ranks: 200k patches 20.4 s → 4.9 s; 2M patches 545 s →
+48.3 s (1 rank: 30.3 s; ByPatch at 2 ranks: 31.4 s). Not yet run beyond 2
+ranks or on NVLink hardware.
+
 ### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
 
 Because ByElement's one collective has a fixed count and no root (the exact
