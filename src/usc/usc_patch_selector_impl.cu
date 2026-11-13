@@ -8,12 +8,14 @@
 
 #include <stComm/stComm.h>
 
-#include <cub/device/device_reduce.cuh>
 #include <cub/device/device_scan.cuh>
-#include <cub/util_type.cuh>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <utility>
+#include <string>
+#include <cstdlib>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <iostream>
@@ -70,6 +72,116 @@ __device__ inline void inv_index_range(ElementId            id,
 // the binary search and are skipped.
 
 // ---------------------------------------------------------------------------
+// Block maxima: argmax without scanning every score every step.
+//
+// The scores are cut into blocks of 2^shift patches, each with its maximum and
+// the first patch holding it. A step changes few scores (the winner, plus the
+// patches sharing its newly covered elements), so every writer marks the
+// block it touched and the next step recomputes only those blocks; the winner
+// is then the argmax over the block maxima — M / 2^shift values instead of M.
+// Both stages keep the first position among equal scores, so the selection is
+// the one a full scan gives.
+// ---------------------------------------------------------------------------
+
+struct MaxBlocks {
+    WireScore*    block_val;   // per block: maximum score
+    int*          block_arg;   // per block: first patch with that score
+    unsigned int* dirty;       // per block: 1 while queued for a refresh
+    unsigned int* list;        // queued blocks, list[0 .. *count)
+    unsigned int* count;
+    unsigned int  shift;
+};
+
+// Called by whoever changes scores[patch]. A block is queued once.
+__device__ inline void mark_dirty(const MaxBlocks& t, std::uint64_t patch) {
+    const unsigned int b = static_cast<unsigned int>(patch >> t.shift);
+    if (t.dirty[b] == 0 && atomicExch(&t.dirty[b], 1u) == 0) {
+        t.list[atomicAdd(t.count, 1u)] = b;
+    }
+}
+
+constexpr int kRefreshThreads = 64;   // power of two (tree reduction)
+constexpr WireScore kLowestScore = std::numeric_limits<WireScore>::min();
+constexpr int       kNoPosition  = std::numeric_limits<int>::max();
+
+// Recompute the queued blocks. One CUDA block per queued block, striding over
+// the list; its threads scan the block's scores and reduce to (max, first
+// position). The queue itself is emptied by the commit kernel that follows.
+__global__ void block_max_refresh_kernel(const WireScore* scores, std::uint64_t M,
+                                         MaxBlocks t) {
+    __shared__ WireScore s_val[kRefreshThreads];
+    __shared__ int       s_arg[kRefreshThreads];
+    const unsigned int n   = *t.count;
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int e = blockIdx.x; e < n; e += gridDim.x) {
+        const unsigned int  b  = t.list[e];
+        const std::uint64_t lo = static_cast<std::uint64_t>(b) << t.shift;
+        std::uint64_t hi = lo + (std::uint64_t{1} << t.shift);
+        if (hi > M) hi = M;
+        WireScore best = kLowestScore;
+        int       arg  = kNoPosition;
+        // Ascending positions and a strict >: the first maximum is kept.
+        for (std::uint64_t i = lo + tid; i < hi; i += kRefreshThreads) {
+            const WireScore v = scores[i];
+            if (v > best) { best = v; arg = static_cast<int>(i); }
+        }
+        s_val[tid] = best;
+        s_arg[tid] = arg;
+        __syncthreads();
+        for (unsigned int half = kRefreshThreads / 2; half > 0; half >>= 1) {
+            if (tid < half) {
+                const WireScore ov = s_val[tid + half];
+                const int       oa = s_arg[tid + half];
+                if (ov > s_val[tid] || (ov == s_val[tid] && oa < s_arg[tid])) {
+                    s_val[tid] = ov;
+                    s_arg[tid] = oa;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            t.block_val[b] = s_val[0];
+            t.block_arg[b] = s_arg[0];
+            t.dirty[b]     = 0;
+        }
+        __syncthreads();  // results written before the next round reuses s_*
+    }
+}
+
+constexpr int kTopThreads = 1024;   // one CUDA block; power of two
+
+// Second stage, run by ONE CUDA block of kTopThreads threads: the maximum
+// over the block maxima, first block among equals. On return thread 0 holds
+// the winning score and patch in s_val[0] / s_arg[0] (s_arg is the PATCH, via
+// block_arg). The loops fuse this into the kernel that consumes the winner,
+// saving a launch per step — the loop is bound by launches, not by GPU work.
+__device__ inline void reduce_block_maxima(const MaxBlocks& t, std::uint64_t num_blocks,
+                                           WireScore* s_val, int* s_arg) {
+    const unsigned int tid = threadIdx.x;
+    WireScore best = kLowestScore;
+    int       blk  = kNoPosition;
+    for (std::uint64_t b = tid; b < num_blocks; b += kTopThreads) {
+        const WireScore v = t.block_val[b];
+        if (v > best) { best = v; blk = static_cast<int>(b); }
+    }
+    s_val[tid] = best;
+    s_arg[tid] = blk;
+    __syncthreads();
+    for (unsigned int half = kTopThreads / 2; half > 0; half >>= 1) {
+        if (tid < half) {
+            const WireScore ov = s_val[tid + half];
+            const int       oa = s_arg[tid + half];
+            if (ov > s_val[tid] || (ov == s_val[tid] && oa < s_arg[tid])) {
+                s_val[tid] = ov;
+                s_arg[tid] = oa;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0 && s_arg[0] != kNoPosition) s_arg[0] = t.block_arg[s_arg[0]];
+}
+
+// ---------------------------------------------------------------------------
 // Device-resident loop kernels (Full-GPU iteration track), shared by both
 // partition modes.
 //
@@ -105,15 +217,15 @@ struct WinnerInfo {
 // slots fit: M_global is within int range).
 using DeltaWord = std::uint32_t;
 
-// Single-thread commit: consume the argmax result entirely on device — the
-// decision the host used to make each iteration. Appends the winner slot,
+// Commit: pick the winner (second argmax stage, all threads) and, on thread 0,
+// consume it entirely on device — the decision a host loop would make. Appends the winner slot,
 // advances covered_count by the (globally identical) winner score, resolves
 // the winner's sub-CSR range for the update kernels, fuses the winner disable,
 // and raises `done` on termination. Once done, every later enqueued iteration
 // sees start == end and newly_count == 0 and no-ops — a batch may overshoot
 // the end of the solve but never changes the result, and `done` derives only
 // from allreduced values, so it flips on every rank in the same iteration.
-__global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore>* argmax,
+__global__ void elem_commit_winner_kernel(std::uint64_t        num_blocks,
                                           const std::uint64_t* sub_offsets,
                                           std::uint64_t        N,
                                           WireScore*           scores,
@@ -121,8 +233,15 @@ __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore
                                           const DeltaWord*     delta_recv,
                                           int                  delta_ranks,
                                           std::uint64_t        delta_window,
+                                          MaxBlocks            blocks,
                                           LoopState*           st,
                                           WinnerInfo*          w) {
+    __shared__ WireScore s_val[kTopThreads];
+    __shared__ int       s_arg[kTopThreads];
+    reduce_block_maxima(blocks, num_blocks, s_val, s_arg);
+    if (threadIdx.x != 0) return;
+
+    *blocks.count = 0;   // the refresh before this consumed the queue
     w->newly_count = 0;
     w->start = 0;
     w->end   = 0;
@@ -134,9 +253,9 @@ __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore
     for (int r = 0; r < delta_ranks; ++r) {
         if (delta_recv[static_cast<std::uint64_t>(r) * (delta_window + 2) + 1]) return;
     }
-    const WireScore score = argmax->value;
+    const WireScore score = s_val[0];
     if (score <= 0) { st->done = 1; return; }
-    const int slot = argmax->key;
+    const int slot = s_arg[0];
     selected_slots[st->num_selected] = static_cast<PatchId>(slot);
     st->num_selected  += 1;
     st->last_score     = static_cast<std::uint32_t>(score);
@@ -148,6 +267,7 @@ __global__ void elem_commit_winner_kernel(const cub::KeyValuePair<int, WireScore
     // Winner disable, fused. This iteration's decrements lower it further — it
     // stays permanently negative either way.
     scores[slot] = kDisabledWireScore;
+    mark_dirty(blocks, static_cast<std::uint64_t>(slot));
 }
 
 // build_newly_covered, fixed-grid grid-stride: the range comes from w; the
@@ -196,7 +316,8 @@ __global__ void fixed_score_update_kernel(const ElementId*      newly_ids,
                                           std::uint64_t         inv_keys_n,
                                           const std::uint64_t*  inv_offsets,
                                           const PatchId*        inv_data,
-                                          WireScore*            scores) {
+                                          WireScore*            scores,
+                                          MaxBlocks             blocks) {
     const unsigned int n = w->newly_count;
     __shared__ std::uint64_t s_start;
     __shared__ std::uint64_t s_end;
@@ -207,7 +328,9 @@ __global__ void fixed_score_update_kernel(const ElementId*      newly_ids,
         __syncthreads();
         for (std::uint64_t i = s_start + threadIdx.x; i < s_end; i += blockDim.x) {
             // Decrements commute: the final scores are order-independent.
-            atomicSub(reinterpret_cast<int*>(&scores[inv_data[i]]), 1);
+            const PatchId q = inv_data[i];
+            atomicSub(reinterpret_cast<int*>(&scores[q]), 1);
+            mark_dirty(blocks, q);
         }
         __syncthreads();  // all readers done before thread 0 overwrites s_start/s_end
     }
@@ -320,14 +443,19 @@ __global__ void elem_delta_fill_kernel(const ElementId*     newly_ids,
 
 // Apply every rank's window to the replicated scores. Decrements commute.
 __global__ void elem_delta_apply_kernel(const DeltaWord* recv, std::uint64_t ranks,
-                                        std::uint64_t window, WireScore* scores) {
+                                        std::uint64_t window, WireScore* scores,
+                                        MaxBlocks blocks) {
     const std::uint64_t total  = ranks * window;
     const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
     for (std::uint64_t idx = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
          idx < total; idx += stride) {
         const DeltaWord* segment = recv + (idx / window) * (window + 2);
         const std::uint64_t j = idx % window;
-        if (j < segment[0]) atomicSub(reinterpret_cast<int*>(&scores[segment[2 + j]]), 1);
+        if (j < segment[0]) {
+            const DeltaWord q = segment[2 + j];
+            atomicSub(reinterpret_cast<int*>(&scores[q]), 1);
+            mark_dirty(blocks, q);
+        }
     }
 }
 
@@ -344,14 +472,22 @@ __global__ void elem_delta_apply_kernel(const DeltaWord* recv, std::uint64_t ran
 
 constexpr std::uint64_t kKeyRankMask = 0xFFFFFFFFull;
 
-__global__ void patch_pack_candidate_kernel(const cub::KeyValuePair<int, WireScore>* argmax,
-                                            int has_patches, int my_rank,
+// This rank's best patch of the step (meaningful when its key is non-zero).
+struct PatchCandidate { int patch; };
+
+__global__ void patch_pack_candidate_kernel(MaxBlocks blocks, std::uint64_t num_blocks,
+                                            int my_rank, PatchCandidate* candidate,
                                             std::uint64_t* key) {
+    __shared__ WireScore s_val[kTopThreads];
+    __shared__ int       s_arg[kTopThreads];
+    reduce_block_maxima(blocks, num_blocks, s_val, s_arg);
+    if (threadIdx.x != 0) return;
     std::uint64_t k = 0;
-    if (has_patches && argmax->value > 0) {
-        k = (static_cast<std::uint64_t>(argmax->value) << 32)
+    if (num_blocks && s_val[0] > 0) {
+        k = (static_cast<std::uint64_t>(s_val[0]) << 32)
           | (kKeyRankMask - static_cast<std::uint64_t>(my_rank));
     }
+    candidate->patch = s_arg[0];
     *key = k;
 }
 
@@ -361,7 +497,7 @@ __global__ void patch_pack_candidate_kernel(const cub::KeyValuePair<int, WireSco
 // payload's last slot. Once done, later iterations of the batch see an empty
 // range and a zero count and no-op.
 __global__ void patch_commit_winner_kernel(const std::uint64_t* global_key,
-                                           const cub::KeyValuePair<int, WireScore>* argmax,
+                                           const PatchCandidate* candidate,
                                            int                  my_rank,
                                            std::uint64_t        N,
                                            const std::uint64_t* patch_offsets,
@@ -369,8 +505,10 @@ __global__ void patch_commit_winner_kernel(const std::uint64_t* global_key,
                                            WireScore*           scores,
                                            std::uint64_t*       payload,
                                            std::uint64_t        gid_slot,
+                                           MaxBlocks            blocks,
                                            LoopState*           st,
                                            WinnerInfo*          w) {
+    if (blocks.count) *blocks.count = 0;   // the refresh before this consumed the queue
     w->newly_count = 0;
     w->start = 0;
     w->end   = 0;
@@ -385,12 +523,13 @@ __global__ void patch_commit_winner_kernel(const std::uint64_t* global_key,
     if (st->covered_count >= N) st->done = 1;
     w->live = 1;
     if (kKeyRankMask - (key & kKeyRankMask) == static_cast<std::uint64_t>(my_rank)) {
-        const int p = argmax->key;
+        const int p = candidate->patch;
         w->start = patch_offsets[p];
         w->end   = patch_offsets[p + 1];
         // Fused winner disable; this iteration's score update decrements it
         // further, so it stays negative.
         scores[p] = kDisabledWireScore;
+        mark_dirty(blocks, static_cast<std::uint64_t>(p));
         payload[gid_slot] = patch_global_ids[p];
     }
 }
@@ -407,6 +546,122 @@ __global__ void patch_record_winner_kernel(const std::uint64_t* global_key,
     selected[st->num_selected - 1] = payload[gid_slot];
     w->newly_count = static_cast<unsigned int>(*global_key >> 32);
 }
+
+// Host-side owner of the block maxima over one score array. Per step the
+// loops enqueue refresh() and then their own kernel that runs
+// reduce_block_maxima over num_blocks().
+class BlockArgmax {
+public:
+    BlockArgmax(const WireScore* d_scores, std::uint64_t M) : d_scores_(d_scores), M_(M) {
+        if (M_ == 0) return;
+        // Block size near sqrt(M / 128): a step refreshes on the order of a
+        // hundred blocks, so this balances the refresh against the scan of
+        // the block maxima.
+        shift_ = 4;
+        while (shift_ < 12 && (std::uint64_t{1} << (2 * shift_)) * 128 < M_) ++shift_;
+        num_blocks_ = (M_ + (std::uint64_t{1} << shift_) - 1) >> shift_;
+        d_val_.resize(num_blocks_);
+        d_arg_.resize(num_blocks_);
+        d_dirty_.resize(num_blocks_);
+        d_list_.resize(num_blocks_);
+        d_count_.resize(1);
+        // Everything queued: the first refresh builds all the maxima.
+        std::vector<unsigned int> all(num_blocks_);
+        for (std::uint64_t b = 0; b < num_blocks_; ++b) all[b] = static_cast<unsigned int>(b);
+        d_list_.copy_from_host(all.data(), num_blocks_);
+        std::fill(all.begin(), all.end(), 1u);
+        d_dirty_.copy_from_host(all.data(), num_blocks_);
+        const auto n = static_cast<unsigned int>(num_blocks_);
+        d_count_.copy_from_host(&n, 1);
+    }
+
+    std::uint64_t num_blocks() const noexcept { return num_blocks_; }
+
+    // All-null view when there are no patches: nothing ever marks or reads it.
+    MaxBlocks view() {
+        return {d_val_.data(), d_arg_.data(), d_dirty_.data(), d_list_.data(),
+                d_count_.data(), shift_};
+    }
+
+    void refresh(cudaStream_t stream) {
+        if (M_ == 0) return;
+        block_max_refresh_kernel<<<kFixedGridBlocks, kRefreshThreads, 0, stream>>>(
+            d_scores_, M_, view());
+    }
+
+private:
+    const WireScore* d_scores_;
+    std::uint64_t    M_;
+    unsigned int     shift_      = 0;
+    std::uint64_t    num_blocks_ = 0;
+    DeviceBuffer<WireScore>    d_val_;
+    DeviceBuffer<int>          d_arg_;
+    DeviceBuffer<unsigned int> d_dirty_, d_list_, d_count_;
+};
+
+// -DUSC_PROFILE timing of the device-resident loops. Two views, picked with
+// the STPS_LOOP_PROFILE environment variable:
+//   (unset)  "batch"  — no extra synchronization: per batch, the time the host
+//            spends enqueueing against the time it then waits for the stream
+//            to drain. Enqueue ≈ total means the loop is bound by launching.
+//   "stages" — the stream is drained after every stage and the wait is billed
+//            to that stage. Stages then run one at a time, so the sum exceeds
+//            the normal loop time; it shows where the device work is.
+// Compiled out (every call a no-op) without USC_PROFILE.
+class LoopProfiler {
+public:
+    LoopProfiler(cudaStream_t stream, std::vector<const char*> stages)
+        : stream_(stream), names_(std::move(stages)), ns_(names_.size(), 0) {
+        if (!detail::kProfileEnabled) return;
+        const char* mode = std::getenv("STPS_LOOP_PROFILE");
+        stages_mode_ = mode && std::string(mode) == "stages";
+        last_ = Clock::now();
+    }
+    // End of stage `i` (stages view only).
+    void mark(std::size_t i) {
+        if (!detail::kProfileEnabled || !stages_mode_) return;
+        cuda_check(cudaStreamSynchronize(stream_), "loop profiler sync");
+        ns_[i] += lap();
+    }
+    void batch_enqueued() { if (detail::kProfileEnabled) enqueue_ns_ += lap(); }
+    void batch_drained()  { if (detail::kProfileEnabled) drain_ns_ += lap(); }
+    void step() { ++steps_; }
+
+    void report(std::FILE* out, const char* title, int rank) const {
+        if (!detail::kProfileEnabled) return;
+        const double steps = static_cast<double>(steps_ ? steps_ : 1);
+        std::fprintf(out, "%s rank=%d steps=%llu  (per-step us, total ms)\n", title, rank,
+                     static_cast<unsigned long long>(steps_));
+        const auto line = [&](const char* name, std::int64_t ns) {
+            std::fprintf(out, "  %-22s %8.2f us  %10.1f ms\n", name,
+                         static_cast<double>(ns) * 1e-3 / steps,
+                         static_cast<double>(ns) * 1e-6);
+        };
+        if (stages_mode_) {
+            for (std::size_t i = 0; i < names_.size(); ++i) line(names_[i], ns_[i]);
+            line("(batch state read)", drain_ns_);
+        } else {
+            line("host enqueue", enqueue_ns_);
+            line("wait for stream", drain_ns_);
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    std::int64_t lap() {
+        const auto now = Clock::now();
+        const auto d = std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_).count();
+        last_ = now;
+        return d;
+    }
+    cudaStream_t              stream_;
+    std::vector<const char*>  names_;
+    std::vector<std::int64_t> ns_;
+    std::int64_t              enqueue_ns_ = 0, drain_ns_ = 0;
+    std::uint64_t             steps_ = 0;
+    bool                      stages_mode_ = false;
+    Clock::time_point         last_;
+};
 
 }  // namespace
 
@@ -481,8 +736,7 @@ PatchSelection UscPatchSelectorImpl::patch_select(
 // previous batch's last winner score, and winner scores never increase, so
 // every list of the batch fits. size == 1 skips both collectives.
 //
-// -DUSC_PROFILE stage timers are absent here for the same reason as in
-// ByElement: there are no host-visible stage boundaries inside a batch.
+// -DUSC_PROFILE: see LoopProfiler.
 PatchSelection UscPatchSelectorImpl::select() {
     PatchSelection result;
     result.covered_count = 0;
@@ -511,16 +765,15 @@ PatchSelection UscPatchSelectorImpl::select() {
     DeviceBuffer<std::uint64_t> d_key_local(1), d_key_global(size > 1 ? 1 : 0);
     const std::uint64_t* d_key = size > 1 ? d_key_global.data() : d_key_local.data();
 
-    using ArgmaxPair = cub::KeyValuePair<int, WireScore>;
-    DeviceBuffer<ArgmaxPair>   d_argmax_result(1);
-    DeviceBuffer<std::uint8_t> d_argmax_temp;
-    d_argmax_result.zero();
-    if (M_loc > 0) {
-        std::size_t temp_bytes = 0;
-        cub::DeviceReduce::ArgMax(nullptr, temp_bytes, d_scores_.data(),
-                                  d_argmax_result.data(), static_cast<int>(M_loc));
-        d_argmax_temp.resize(temp_bytes);
-    }
+    DeviceBuffer<PatchCandidate> d_candidate(1);
+    d_candidate.zero();
+    BlockArgmax block_argmax(d_scores_.data(), M_loc);
+
+    enum { kPArgmax, kPPack, kPKeyReduce, kPCommit, kPBuild, kPPayloadReduce, kPRecord,
+           kPSetBits, kPScoreUpdate };
+    LoopProfiler prof(stream, {"refresh blocks", "pick + pack key", "key reduce (+clear)", "commit",
+                               "build newly", "payload reduce", "record", "set_bits",
+                               "score update"});
 
     // Batch sizing as in ByElement: at least ceil(remaining / bound) more
     // iterations must run, so that many never overshoot the end of the solve.
@@ -532,14 +785,12 @@ PatchSelection UscPatchSelectorImpl::select() {
         const std::uint64_t batch = std::clamp<std::uint64_t>(
             remaining / bound + (remaining % bound != 0), 1, kMaxBatch);
         for (std::uint64_t b = 0; b < batch; ++b) {
-            if (M_loc > 0) {
-                std::size_t temp_bytes = d_argmax_temp.bytes();
-                cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
-                                          d_scores_.data(), d_argmax_result.data(),
-                                          static_cast<int>(M_loc), stream);
-            }
-            patch_pack_candidate_kernel<<<1, 1, 0, stream>>>(
-                d_argmax_result.data(), M_loc > 0 ? 1 : 0, rank, d_key_local.data());
+            block_argmax.refresh(stream);
+            prof.mark(kPArgmax);
+            patch_pack_candidate_kernel<<<1, kTopThreads, 0, stream>>>(
+                block_argmax.view(), block_argmax.num_blocks(), rank,
+                d_candidate.data(), d_key_local.data());
+            prof.mark(kPPack);
             if (size > 1) {
                 comm_.allreduce<stComm::Space::Device, std::uint64_t>(
                     d_key_local.data(), d_key_global.data(), 1, stComm::ReduceOp::Max);
@@ -547,41 +798,52 @@ PatchSelection UscPatchSelectorImpl::select() {
                                            (bound + 1) * sizeof(std::uint64_t), stream),
                            "payload clear");
             }
+            prof.mark(kPKeyReduce);
             patch_commit_winner_kernel<<<1, 1, 0, stream>>>(
-                d_key, d_argmax_result.data(), rank, N,
+                d_key, d_candidate.data(), rank, N,
                 patch_set_->d_patch_offsets(), d_global_ids_.data(),
-                d_scores_.data(), d_send.data(), bound,
+                d_scores_.data(), d_send.data(), bound, block_argmax.view(),
                 d_state.data(), d_winner.data());
+            prof.mark(kPCommit);
             fixed_build_newly_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 patch_set_->d_patch_data(), d_covered_.data(),
                 d_send.data(), d_winner.data());
+            prof.mark(kPBuild);
             if (size > 1) {
                 comm_.allreduce<stComm::Space::Device, std::uint64_t>(
                     d_send.data(), d_recv.data(), bound + 1, stComm::ReduceOp::Sum);
             }
+            prof.mark(kPPayloadReduce);
             patch_record_winner_kernel<<<1, 1, 0, stream>>>(
                 d_key, d_payload, bound, d_selected.data(),
                 d_state.data(), d_winner.data());
+            prof.mark(kPRecord);
             fixed_set_bits_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_covered_.data(), d_payload, d_winner.data());
+            prof.mark(kPSetBits);
             fixed_score_update_kernel
                 <<<kFixedGridBlocks, kScoreBlockThreads, 0, stream>>>(
                 d_payload, d_winner.data(),
                 patch_set_->d_inv_keys(), patch_set_->inv_keys().size(),
                 patch_set_->d_inv_offsets(), patch_set_->d_inv_data(),
-                d_scores_.data());
+                d_scores_.data(), block_argmax.view());
+            prof.mark(kPScoreUpdate);
+            prof.step();
         }
         cuda_launch_check("device-resident batch (patch)");
+        prof.batch_enqueued();
         // Drain through stComm (polled: also watches for async NCCL failures),
         // then read the state — see the ByElement loop.
         comm_.nccl().barrier();
         cuda_check(cudaMemcpy(&h_state, d_state.data(), sizeof(h_state),
                               cudaMemcpyDeviceToHost),
                    "device-resident batch (patch) state copy");
+        prof.batch_drained();
         if (h_state.done) break;
         bound = std::max<std::uint64_t>(h_state.last_score, 1);
     }
 
+    prof.report(stderr, "[stps-profile usc by-patch loop]", rank);
     result.covered_count = h_state.covered_count;
     result.iterations    = h_state.num_selected;
     if (h_state.num_selected) {
@@ -868,8 +1130,7 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 // size == 1 has no one to exchange with: the decrements go straight into the
 // scores (strategy-A update), no collective at all.
 //
-// -DUSC_PROFILE stage timers are deliberately absent here: with no
-// per-step syncs there are no host-visible stage boundaries to time.
+// -DUSC_PROFILE: see LoopProfiler.
 PatchSelection UscElemPatchSelectorImpl::select() {
     PatchSelection result;
     result.covered_count = 0;
@@ -893,16 +1154,7 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     const std::uint64_t max_newly = std::max<std::uint64_t>(max_sub_len_, 1);
     DeviceBuffer<ElementId> d_newly_ids(max_newly);
 
-    using ArgmaxPair = cub::KeyValuePair<int, WireScore>;
-    DeviceBuffer<ArgmaxPair>   d_argmax_result(1);
-    DeviceBuffer<std::uint8_t> d_argmax_temp;
-    {
-        std::size_t temp_bytes = 0;
-        cub::DeviceReduce::ArgMax(nullptr, temp_bytes, d_scores_.data(),
-                                  d_argmax_result.data(),
-                                  static_cast<int>(M_global_));
-        d_argmax_temp.resize(temp_bytes);
-    }
+    BlockArgmax block_argmax(d_scores_.data(), M_global_);
 
     std::uint64_t score_bound = std::max<std::uint64_t>(max_initial_score_, 1);
 
@@ -944,6 +1196,12 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     // that many — capped at kMaxBatch — never overshoots the end of the solve.
     // Both inputs come from reduced state, so every rank picks the same batch.
     constexpr std::uint64_t kMaxBatch = 128;
+    enum { kEPlan, kEFill, kEReduce, kEApply, kEArgmax, kECommit, kEBuild, kESetBits,
+           kEDegrees, kEScan, kEBegin, kEScoreUpdate };
+    LoopProfiler prof(stream, {"delta plan", "delta fill", "delta reduce", "delta apply",
+                               "refresh blocks", "pick + commit", "build newly", "set_bits",
+                               "delta degrees", "delta prefix scan", "delta begin",
+                               "score update (1 rank)"});
     LoopState h_state{};
     while (true) {
         const std::uint64_t remaining = N_ - h_state.covered_count;
@@ -969,52 +1227,63 @@ PatchSelection UscElemPatchSelectorImpl::select() {
         for (std::uint64_t b = 0; b < batch; ++b) {
             if (exchange) {
                 elem_delta_plan_kernel<<<1, 1, 0, stream>>>(d_cursor.data(), window, d_segment);
+                prof.mark(kEPlan);
                 elem_delta_fill_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                     d_newly_ids.data(), d_cursor.data(), d_prefix.data(),
                     d_inv_keys_.data(), num_inv_keys_, d_inv_offsets_.data(),
                     d_inv_data_.data(), d_segment + 2);
+                prof.mark(kEFill);
                 if (size > 1) {
                     // Enqueue-only — no wait.
                     comm_.allreduce<stComm::Space::Device, DeltaWord>(
                         d_send.data(), d_recv_buf.data(), usize * (window + 2),
                         stComm::ReduceOp::Sum);
                 }
+                prof.mark(kEReduce);
                 elem_delta_apply_kernel<<<apply_blocks, kFixedBlockThreads, 0, stream>>>(
-                    d_recv, usize, window, d_scores_.data());
+                    d_recv, usize, window, d_scores_.data(), block_argmax.view());
+                prof.mark(kEApply);
             }
-            std::size_t temp_bytes = d_argmax_temp.bytes();
-            cub::DeviceReduce::ArgMax(d_argmax_temp.data(), temp_bytes,
-                                      d_scores_.data(), d_argmax_result.data(),
-                                      static_cast<int>(M_global_), stream);
-            elem_commit_winner_kernel<<<1, 1, 0, stream>>>(
-                d_argmax_result.data(), d_sub_offsets_.data(), N_,
+            block_argmax.refresh(stream);
+            prof.mark(kEArgmax);
+            elem_commit_winner_kernel<<<1, kTopThreads, 0, stream>>>(
+                block_argmax.num_blocks(), d_sub_offsets_.data(), N_,
                 d_scores_.data(), d_selected.data(),
-                d_recv, exchange ? size : 0, window,
+                d_recv, exchange ? size : 0, window, block_argmax.view(),
                 d_state.data(), d_winner.data());
+            prof.mark(kECommit);
             fixed_build_newly_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_patch_data_.data(), d_covered_.data(),
                 d_newly_ids.data(), d_winner.data());
+            prof.mark(kEBuild);
             fixed_set_bits_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                 d_covered_.data(), d_newly_ids.data(), d_winner.data());
+            prof.mark(kESetBits);
             if (exchange) {
                 elem_delta_degrees_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                     d_newly_ids.data(), d_winner.data(),
                     d_inv_keys_.data(), num_inv_keys_, d_inv_offsets_.data(),
                     len, d_deg.data());
+                prof.mark(kEDegrees);
                 std::size_t scan_bytes = d_scan_temp.bytes();
                 cub::DeviceScan::ExclusiveSum(d_scan_temp.data(), scan_bytes, d_deg.data(),
                                               d_prefix.data(), len + 1, stream);
+                prof.mark(kEScan);
                 elem_delta_begin_kernel<<<1, 1, 0, stream>>>(
                     d_winner.data(), d_prefix.data(), len, d_cursor.data());
+                prof.mark(kEBegin);
             } else {
                 fixed_score_update_kernel<<<kFixedGridBlocks, kScoreBlockThreads, 0, stream>>>(
                     d_newly_ids.data(), d_winner.data(),
                     d_inv_keys_.data(), num_inv_keys_,
                     d_inv_offsets_.data(), d_inv_data_.data(),
-                    d_scores_.data());
+                    d_scores_.data(), block_argmax.view());
+                prof.mark(kEScoreUpdate);
             }
+            prof.step();
         }
         cuda_launch_check("device-resident batch (elem)");
+        prof.batch_enqueued();
         // Drain the stream through stComm, not cudaStreamSynchronize: the
         // batch has allreduces in flight, and stComm's polled sync also
         // watches the communicator for async failures (dead peer, network
@@ -1026,12 +1295,14 @@ PatchSelection UscElemPatchSelectorImpl::select() {
         cuda_check(cudaMemcpy(&h_state, d_state.data(), sizeof(h_state),
                               cudaMemcpyDeviceToHost),
                    "device-resident batch (elem) state copy");
+        prof.batch_drained();
         if (h_state.done) break;
         if (h_state.num_selected) {
             score_bound = std::max<std::uint64_t>(h_state.last_score, 1);
         }
     }
 
+    prof.report(stderr, "[stps-profile usc by-element loop]", comm_.getRank());
     // Drain the device-side result: selected slots → caller PatchIds.
     result.covered_count = h_state.covered_count;
     result.iterations    = h_state.num_selected;
