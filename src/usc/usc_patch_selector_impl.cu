@@ -4,6 +4,7 @@
 #include "core/cuda_check.hpp"
 #include "core/gpu_profiler.hpp"
 #include "core/host_profiler.hpp"
+#include "core/hash_id_map_device.hpp"
 #include "core/inverted_index_device.hpp"
 
 #include <stComm/stComm.h>
@@ -288,7 +289,7 @@ PatchSelection UscPatchSelectorImpl::patch_select(
     // Shared preprocessing: distributed hash→id mapping + PatchCsr + InvertedIndex
     // + device mirrors. USC owns only the score/covered state initialized below.
     patch_set_ = std::make_unique<PatchSet>(comm_, std::move(raw_patches));
-    phases.mark("PatchSet setup (detailed above)", W::Host);
+    phases.mark("PatchSet setup (detailed above)", W::Device);
 
     const std::uint64_t M_local = patch_set_->M_local();
     const std::uint64_t N       = patch_set_->N();
@@ -560,9 +561,22 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     detail::PhaseTimer phases;
 
     // Shared §5.1 preprocessing: hash → dense ElementId translation.
-    IdMappedPatches mapped = map_hashes_to_element_ids(comm_, std::move(raw_patches));
-    N_ = mapped.N;
-    phases.mark("hash->id map (detailed above)", W::Host);
+    // The mapping runs on the device; the translated patches come back as a
+    // host CSR for the redistribution below (still host-side).
+    PatchCsr id_csr;
+    {
+        DeviceIdMappedPatches mapped =
+            map_hashes_to_element_ids_device(comm_, std::move(raw_patches));
+        N_ = mapped.N;
+        phases.mark("hash->id map (detailed above)", W::Device);
+        id_csr.offsets.resize(mapped.M_local + 1);
+        mapped.offsets.copy_to_host(id_csr.offsets.data(), id_csr.offsets.size());
+        id_csr.data.resize(mapped.data.size());
+        if (!id_csr.data.empty()) {
+            mapped.data.copy_to_host(id_csr.data.data(), id_csr.data.size());
+        }
+        phases.mark("id patches download", W::Transfer);
+    }
 
     // ---- Global slot assignment (rank-major input order) --------------------
     // Slot of local patch p on rank r = (Σ M_local below r) + p. With
@@ -570,7 +584,7 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     // order, so the smallest-slot tie-break in select() matches
     // brute_force_select's smallest-PatchId rule (and ByPatch's
     // smallest-rank-then-smallest-local-index MAXLOC rule).
-    const std::uint64_t M_local = mapped.id_patches.size();
+    const std::uint64_t M_local = id_csr.M();
     std::uint64_t slot_start = 0;
     comm_.exscan<stComm::Space::Host>(M_local, &slot_start, stComm::ReduceOp::Sum)->wait();
     std::uint64_t M_global = (rank == size - 1) ? slot_start + M_local : 0;
@@ -619,8 +633,7 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     // rank's incidences pass INT_MAX on a full-chip input, and nothing here
     // caps them.
     std::vector<std::size_t> sendcounts(usize, 0);
-    for (const auto& p : mapped.id_patches)
-        for (ElementId e : p) ++sendcounts[owner_of(e)];
+    for (ElementId e : id_csr.data) ++sendcounts[owner_of(e)];
 
     // Exchange the counts so every rank learns its recv counts.
     const ExchangeCounts counts = exchange_counts(comm_, std::move(sendcounts));
@@ -633,14 +646,13 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     std::vector<ElementId> send_elems(total_send);
     for (std::uint64_t p = 0; p < M_local; ++p) {
         const PatchId slot = slot_start + p;
-        for (ElementId e : mapped.id_patches[p]) {
+        for (ElementId e : id_csr.patch(p)) {
             const std::size_t at = cursor[owner_of(e)]++;
             send_slots[at] = slot;
             send_elems[at] = e;
         }
     }
-    mapped.id_patches.clear();
-    mapped.id_patches.shrink_to_fit();
+    id_csr = PatchCsr{};
 
     // Ship the incidences as two parallel alltoallv's sharing one count layout.
     const std::size_t total_recv =

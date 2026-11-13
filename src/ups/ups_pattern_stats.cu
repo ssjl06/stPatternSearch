@@ -247,7 +247,7 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         }
     }
 
-    phases.mark("PatchSet setup (detailed above)", W::Host);
+    phases.mark("PatchSet setup (detailed above)", W::Device);
 
     // ---- B. Local degrees (device): adjacent difference over the PatchSet's
     // inverted-index offsets mirror.

@@ -4,6 +4,7 @@
 #include "core/device_buffer.hpp"
 #include <stPS/types.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -37,6 +38,22 @@ struct IdMappedPatches {
 // Every rank must call together with its own local patches.
 IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
                                           std::vector<std::vector<Hash>> raw_patches);
+
+namespace detail {
+
+// Sample-sort splitter selection, shared by the host and device mappings.
+inline constexpr int kSplitterSamplesPerRank = 128;
+
+// Evenly spaced positions in a sorted array of n values to sample: exactly
+// kSplitterSamplesPerRank of them, or none when n == 0.
+std::vector<std::size_t> splitter_sample_indices(std::size_t n);
+
+// Collective: gather every rank's sample (the values at the positions above;
+// empty for a rank without hashes) and return the size-1 splitters, identical
+// on every rank. A hash h belongs to rank upper_bound(splitters, h).
+std::vector<Hash> splitters_from_sample(stComm::Comm& comm, std::vector<Hash> local_sample);
+
+}  // namespace detail
 
 // Distributed, algorithm-neutral "hashed patch set" — the shared preprocessing
 // every patch algorithm (USC greedy set-cover, UPS pattern counting, ...) builds
