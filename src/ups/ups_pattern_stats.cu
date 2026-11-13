@@ -3,6 +3,7 @@
 #include "core/collective.hpp"
 #include "core/cuda_check.hpp"
 #include "core/device_buffer.hpp"
+#include "core/host_profiler.hpp"
 #include "core/patch_set.hpp"
 #include "ups/unique_hash_file.hpp"
 
@@ -149,6 +150,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     const int size = comm.getSize();
     const int rank = comm.getRank();
     DeviceBuffer<unsigned char> d_temp;
+    using W = detail::PhaseTimer::Where;
+    detail::PhaseTimer phases;
 
     // ---- A. Local occurrence reduction (device): sort this rank's raw
     // (hash, point) occurrences by hash, then reduce-by-key with lexicographic
@@ -163,6 +166,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         h_occ_pts.insert(h_occ_pts.end(), coords[p].begin(), coords[p].end());
     }
     coords.clear(); coords.shrink_to_fit();
+
+    phases.mark("flatten occurrences", W::Host);
 
     // One representative per local unique hash, right-sized: everything else
     // from this stage (24 B per raw occurrence) is released before the PatchSet
@@ -207,6 +212,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         }
     }
 
+    phases.mark("A occurrence reduction", W::Device);
+
     // ---- Shared distributed setup. The §5.1 mapping assigns IDs in global
     // hash order, so the hash-sorted reduction above pairs positionally with
     // the PatchSet's sorted inverted-index keys.
@@ -239,6 +246,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
                 err.empty() ? std::string("pattern_stats: setup failed on another rank") : err);
         }
     }
+
+    phases.mark("PatchSet setup (detailed above)", W::Host);
 
     // ---- B. Local degrees (device): adjacent difference over the PatchSet's
     // inverted-index offsets mirror.
@@ -303,6 +312,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     comm.alltoallv<stComm::Space::Device, double>(
         reinterpret_cast<const double*>(d_min_pts.data()), sendcounts2.data(),
         reinterpret_cast<double*>(d_r_pts.data()), recvcounts2.data())->wait();
+
+    phases.mark("B degrees + C route to owners", W::Device);
 
     // ---- D. Owner-side reduction (device): sort arrivals by id, sum the
     // degrees, keep the lexicographic-min location, scatter into the dense
@@ -404,6 +415,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         }
     }
 
+    phases.mark("D owner reduction + E local top-k", W::Device);
+
     // ---- F. Global merge (host): gather every rank's candidates (variable
     // counts, tiny) and reduce identically everywhere. Any global top-k entry
     // is in its owner's local top-k, so this is exact. All ranks hold size×k
@@ -439,6 +452,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     const std::size_t k_global = std::min<std::size_t>(k, merged.size());
     std::partial_sort(merged.begin(), merged.begin() + k_global, merged.end(), stat_before);
     merged.resize(k_global);
+    phases.mark("F global merge", W::HostComm);
+    phases.report(stderr, "[stps-profile ups]", rank);
     return merged;
 }
 
