@@ -203,6 +203,24 @@ loop. ByElement at 2 ranks: 200k patches 20.4 s → 4.9 s; 2M patches 545 s →
 48.3 s (1 rank: 30.3 s; ByPatch at 2 ranks: 31.4 s). Not yet run beyond 2
 ranks or on NVLink hardware.
 
+### Block maxima instead of a full argmax scan (2026-11, both modes)
+
+Profiling the loops (`-DUSC_PROFILE`, `LoopProfiler`) showed the per-step
+argmax over all scores as the largest single cost at 1 rank, and the only one
+growing with the patch count. The scores are now cut into blocks of 2^shift
+patches (near sqrt(M / 128)), each with its maximum and first position; every
+kernel that changes a score queues the block it touched, the next step
+recomputes only the queued blocks, and the winner is the maximum over the
+block maxima. That second stage is fused into the kernel that consumes the
+winner (ByPatch: key packing; ByElement: commit), so the launch count per step
+is unchanged — the loops are bound by launches as much as by GPU work. First
+position among equal scores is kept at both stages: selections are identical.
+
+2×A40, 2M patches, USC total (before → after): ByPatch 1 rank 28.4 s → 19.4 s,
+2 ranks 31.8 s → 32.2 s; ByElement 1 rank 30.5 s → 21.2 s, 2 ranks 48.2 s →
+37.2 s. Per step at 2 ranks the host now spends ~32 µs enqueueing (two NCCL
+submissions are ~16 µs of it) against ~16–21 µs of stream time.
+
 ### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
 
 Because ByElement's one collective has a fixed count and no root (the exact
