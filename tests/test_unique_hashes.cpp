@@ -50,10 +50,11 @@ std::vector<Hash> all_unique(const Patches& patches) {
     return all;
 }
 
-// ctest runs the same binary at several rank counts, possibly in parallel:
-// keep their files apart.
+// ctest runs these tests from two executables, each at several rank counts,
+// possibly in parallel: keep their files apart.
 std::string temp_path(stComm::Comm& comm, const std::string& name) {
-    return ::testing::TempDir() + name + "_np" + std::to_string(comm.getSize()) + ".bin";
+    return ::testing::TempDir() + name + "_" + test_helpers::suite_name() +
+           "_np" + std::to_string(comm.getSize()) + ".bin";
 }
 
 // Write `mine` (this rank's share of `full`) collectively, then have every

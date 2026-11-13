@@ -21,6 +21,8 @@ stComm::Comm& stPS::test_helpers::comm() {
     return *g_comm;
 }
 
+const char* stPS::test_helpers::suite_name() { return "gpu"; }
+
 int main(int argc, char** argv) {
     stComm::Comm::initialize(&argc, &argv);
 
