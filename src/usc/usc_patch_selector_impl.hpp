@@ -32,10 +32,10 @@ inline constexpr WireScore kDisabledWireScore = -1;
 // this class owns only the USC-specific state (per-patch scores + cumulative
 // covered bitset) and the greedy main loop.
 //
-// The host (MPI) side drives the tiny per-iteration metadata (16B MAXLOC + 8B
-// winner_global); the per-iteration newly_covered_ids payload travels
-// device-direct over NCCL via the same Comm's Device space. The Comm must be
-// device-enabled (built with Comm::onDevice) — USC is GPU-only.
+// The loop is device-resident: each iteration is two small NCCL reductions (the
+// winner key, then the winner's newly covered elements) between kernels, all
+// enqueued in batches; the host reads 24 B of loop state per batch. The Comm
+// must be device-enabled (built with Comm::onDevice) — USC is GPU-only.
 class UscPatchSelectorImpl {
 public:
     // `comm` must be a device-enabled Comm (Comm::onDevice).
@@ -68,8 +68,12 @@ private:
 
     // USC-specific device state. Populated at the start of patch_select() and
     // consumed by the greedy kernels. Empty until then.
-    DeviceBuffer<Score>         d_scores_;     // per-patch remaining-coverage score
+    DeviceBuffer<WireScore>     d_scores_;     // per-patch remaining-coverage score
     DeviceBuffer<std::uint64_t> d_covered_;    // N/64 words, cumulative covered bitset
+    DeviceBuffer<PatchId>       d_global_ids_; // patch_global_ids_ on the device
+
+    std::uint64_t M_global_          = 0;      // patches over all ranks
+    std::uint64_t max_initial_score_ = 0;      // largest patch over all ranks
 };
 
 // Internal implementation of the public UscPatchSelector in

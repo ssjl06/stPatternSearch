@@ -249,7 +249,10 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     if (total) mapped.data.copy_to_host(patches_.data.data(), total);
     inv_keys_.resize(inv.num_keys);
     if (inv.num_keys > 0) d_inv_keys_.copy_to_host(inv_keys_.data(), inv_keys_.size());
-    if (mirrors == PatchSetMirrors::All) d_patch_data_ = std::move(mapped.data);
+    if (mirrors == PatchSetMirrors::All) {
+        d_patch_data_    = std::move(mapped.data);
+        d_patch_offsets_ = std::move(mapped.offsets);
+    }
     phases.mark("host views download", W::Transfer);
     phases.report(stderr, "[stps-profile PatchSet]", comm.getRank());
 }
