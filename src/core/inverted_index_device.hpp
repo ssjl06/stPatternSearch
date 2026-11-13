@@ -29,4 +29,11 @@ struct DeviceInvertedIndex {
 // sort runs (two key and two value buffers), 8 B of which stay as `data`.
 DeviceInvertedIndex build_inverted_index_device(const PatchCsr& patches, std::uint64_t N);
 
+// Same, from a CSR already in device memory (`d_offsets` has M + 1 entries,
+// `d_data` has total == d_offsets[M]). The inputs are only read.
+DeviceInvertedIndex build_inverted_index_device(const ElementId* d_data,
+                                                const std::uint64_t* d_offsets,
+                                                std::uint64_t M, std::uint64_t total,
+                                                std::uint64_t N);
+
 }  // namespace stPS

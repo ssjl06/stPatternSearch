@@ -3,6 +3,7 @@ add_executable(stps_tests
     test_bitset.cpp
     test_csr.cpp
     test_inverted_index.cpp
+    test_hash_id_map.cpp
     test_synthetic.cpp
     test_patch_set.cpp
     test_brute_force.cpp
