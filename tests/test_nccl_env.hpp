@@ -10,4 +10,8 @@ namespace stPS::test_helpers {
 // MPI/NCCL finalize, which test_main handles.
 stComm::Comm& comm();
 
+// Which test executable this is ("gpu" or "host"). Test files built into both
+// use it to keep their temp files apart: ctest may run the two side by side.
+const char* suite_name();
+
 }  // namespace stPS::test_helpers
