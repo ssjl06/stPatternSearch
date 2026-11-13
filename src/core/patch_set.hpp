@@ -2,7 +2,6 @@
 
 #include "core/csr.hpp"
 #include "core/device_buffer.hpp"
-#include "core/inverted_index.hpp"
 #include <stPS/types.hpp>
 
 #include <cstdint>
@@ -72,7 +71,10 @@ public:
     std::uint64_t        N() const noexcept { return N_; }
     std::uint64_t        M_local() const noexcept { return patches_.M(); }
     const PatchCsr&      patches() const noexcept { return patches_; }
-    const InvertedIndex& inverted_index() const noexcept { return inv_; }
+    // Sorted element IDs that occur in this rank's patches — the inverted
+    // index keys. The index itself is built and kept on the device (see the
+    // d_inv_* mirrors); only its keys are copied back.
+    const std::vector<ElementId>& inv_keys() const noexcept { return inv_keys_; }
 
     // ElementId → Hash reverse map for this rank's element shard (see
     // IdMappedPatches::shard_hashes): shard_hashes()[i] is the hash of global
@@ -89,7 +91,7 @@ public:
 
 private:
     PatchCsr      patches_;
-    InvertedIndex inv_;
+    std::vector<ElementId> inv_keys_;
     std::uint64_t N_ = 0;
 
     std::vector<Hash> shard_hashes_;

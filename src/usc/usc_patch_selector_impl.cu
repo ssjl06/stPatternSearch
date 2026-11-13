@@ -4,6 +4,7 @@
 #include "core/cuda_check.hpp"
 #include "core/gpu_profiler.hpp"
 #include "core/host_profiler.hpp"
+#include "core/inverted_index_device.hpp"
 
 #include <stComm/stComm.h>
 
@@ -331,7 +332,7 @@ PatchSelection UscPatchSelectorImpl::select() {
     // Views into the shared PatchSet (built in patch_select). USC keeps only
     // d_scores_ / d_covered_ of its own; everything else is read from here.
     const PatchCsr&      patches       = patch_set_->patches();
-    const InvertedIndex& inv           = patch_set_->inverted_index();
+    const std::uint64_t  num_inv_keys  = patch_set_->inv_keys().size();
     const std::uint64_t  N             = patch_set_->N();
     const ElementId*     d_patch_data  = patch_set_->d_patch_data();
     const ElementId*     d_inv_keys    = patch_set_->d_inv_keys();
@@ -492,7 +493,7 @@ PatchSelection UscPatchSelectorImpl::select() {
                 d_newly_covered_ids.data(),
                 static_cast<std::uint64_t>(winner_score),
                 d_inv_keys,
-                inv.num_keys(),
+                num_inv_keys,
                 d_inv_offsets,
                 d_inv_data,
                 d_scores_.data());
@@ -536,7 +537,6 @@ void UscPatchSelectorImpl::print_selection(const PatchSelection& r) const {
 std::uint64_t        UscPatchSelectorImpl::N() const            { return patch_set_->N(); }
 std::uint64_t        UscPatchSelectorImpl::M_local() const      { return patch_set_->M_local(); }
 const PatchCsr&      UscPatchSelectorImpl::patches() const      { return patch_set_->patches(); }
-const InvertedIndex& UscPatchSelectorImpl::inverted_index() const { return patch_set_->inverted_index(); }
 
 // ============================================================================
 // UscElemPatchSelectorImpl — PartitionMode::ByElement (design doc §7.3)
@@ -679,28 +679,23 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     for (std::size_t i = 0; i < inc.size(); ++i) sub.data[i] = inc[i].elem;
     inc.clear(); inc.shrink_to_fit();
 
-    // Shard-local inverted index (keys are shard-local IDs, values are global
-    // slots) — drives the strategy-A partial-score update.
-    inv_ = build_inverted_index(sub, shard_extent_ ? shard_extent_ : 1);
-
-    phases.mark("sub-CSR + inverted index build", W::Host);
+    phases.mark("sub-CSR build", W::Host);
 
     // ---- Device mirrors + algorithm state -------------------------------------
+    // Shard-local inverted index (keys are shard-local IDs, values are global
+    // slots) — drives the strategy-A partial-score update. Built on the device.
+    {
+        DeviceInvertedIndex inv =
+            build_inverted_index_device(sub, shard_extent_ ? shard_extent_ : 1);
+        num_inv_keys_  = inv.num_keys;
+        d_inv_keys_    = std::move(inv.keys);
+        d_inv_offsets_ = std::move(inv.offsets);
+        d_inv_data_    = std::move(inv.data);
+    }
+    phases.mark("inverted index build", W::Device);
     if (!sub.data.empty()) {
         d_patch_data_.resize(sub.data.size());
         d_patch_data_.copy_from_host(sub.data.data(), sub.data.size());
-    }
-    if (!inv_.keys.empty()) {
-        d_inv_keys_.resize(inv_.keys.size());
-        d_inv_keys_.copy_from_host(inv_.keys.data(), inv_.keys.size());
-    }
-    if (!inv_.offsets.empty()) {
-        d_inv_offsets_.resize(inv_.offsets.size());
-        d_inv_offsets_.copy_from_host(inv_.offsets.data(), inv_.offsets.size());
-    }
-    if (!inv_.data.empty()) {
-        d_inv_data_.resize(inv_.data.size());
-        d_inv_data_.copy_from_host(inv_.data.data(), inv_.data.size());
     }
 
     d_scores_partial_.resize(M_global_);
@@ -862,7 +857,7 @@ PatchSelection UscElemPatchSelectorImpl::select() {
                 d_covered_.data(), d_newly_ids.data(), d_winner.data());
             elem_score_update_kernel<<<kElemGridBlocks, kScoreBlockThreads, 0, stream>>>(
                 d_newly_ids.data(), d_winner.data(),
-                d_inv_keys_.data(), inv_.num_keys(),
+                d_inv_keys_.data(), num_inv_keys_,
                 d_inv_offsets_.data(), d_inv_data_.data(),
                 d_scores_partial_.data());
         }
