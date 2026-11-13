@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/device_buffer.hpp"
-#include "core/inverted_index.hpp"
 #include "core/patch_set.hpp"
 #include <stPS/usc_patch_selector.hpp>   // PatchSelection + the public UscPatchSelector this backs
 #include <stPS/types.hpp>
@@ -57,7 +56,6 @@ public:
     std::uint64_t        N() const;
     std::uint64_t        M_local() const;
     const PatchCsr&      patches() const;
-    const InvertedIndex& inverted_index() const;
 
 private:
     // Greedy main loop over the built patch_set_ + USC device state.
@@ -127,7 +125,7 @@ private:
     // selected list into the result). max_sub_len_ bounds any winner's
     // shard-local sub-patch, sizing the newly-covered scratch once up front.
     std::vector<PatchId> slot_to_gid_;
-    InvertedIndex        inv_;   // shard-local: keys are shard-local IDs
+    std::uint64_t        num_inv_keys_ = 0;  // shard-local inverted index (device only)
     std::uint64_t        max_sub_len_ = 0;
     // Largest initial global score — an upper bound on every winner's score,
     // used to size the first device-resident batch.

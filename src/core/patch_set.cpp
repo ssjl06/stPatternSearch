@@ -3,7 +3,7 @@
 #include "core/collective.hpp"
 #include "core/csr.hpp"
 #include "core/host_profiler.hpp"
-#include "core/inverted_index.hpp"
+#include "core/inverted_index_device.hpp"
 
 #include <stComm/stComm.h>
 
@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <numeric>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace stPS {
@@ -226,21 +227,19 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     phases.mark("hash->id map (detailed above)", W::Host);
     patches_      = build_patch_csr(mapped.id_patches);
     phases.mark("patch CSR build", W::Host);
-    inv_          = build_inverted_index(patches_, N_);
-    phases.mark("inverted index build", W::Host);
+    // Inverted index: built on the device from the CSR. UPS reads only its
+    // layout (keys + offsets), so the values are dropped there.
+    DeviceInvertedIndex inv = build_inverted_index_device(patches_, N_);
+    d_inv_keys_    = std::move(inv.keys);
+    d_inv_offsets_ = std::move(inv.offsets);
+    if (mirrors == PatchSetMirrors::All) d_inv_data_ = std::move(inv.data);
+    phases.mark("inverted index build", W::Device);
 
-    // Mirror host state to device — consumed by the algorithm layers' kernels.
-    // The inverted-index layout (keys + offsets) is always mirrored; the patch
-    // CSR data and the index values only when the algorithm's kernels read them.
-    const auto upload = [](auto& dev, const auto& host) {
-        dev.resize(host.size());
-        if (!host.empty()) dev.copy_from_host(host.data(), host.size());
-    };
-    upload(d_inv_keys_,    inv_.keys);
-    upload(d_inv_offsets_, inv_.offsets);
-    if (mirrors == PatchSetMirrors::All) {
-        upload(d_patch_data_, patches_.data);
-        upload(d_inv_data_,   inv_.data);
+    inv_keys_.resize(inv.num_keys);
+    if (inv.num_keys > 0) d_inv_keys_.copy_to_host(inv_keys_.data(), inv_keys_.size());
+    if (mirrors == PatchSetMirrors::All && !patches_.data.empty()) {
+        d_patch_data_.resize(patches_.data.size());
+        d_patch_data_.copy_from_host(patches_.data.data(), patches_.data.size());
     }
     phases.mark("upload to device", W::Transfer);
     phases.report(stderr, "[stps-profile PatchSet]", comm.getRank());

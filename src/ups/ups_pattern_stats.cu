@@ -225,8 +225,8 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         write_unique_hash_shards(comm, unique_hashes_path,
                                  ps.shard_hashes(), ps.shard_start(), ps.N());
     }
-    const InvertedIndex& inv = ps.inverted_index();
-    const std::uint64_t n_local = inv.keys.size();
+    const std::vector<ElementId>& inv_keys = ps.inv_keys();
+    const std::uint64_t n_local = inv_keys.size();
     // Per-rank conditions, agreed collectively so no rank throws alone and
     // strands the others in the exchange below.
     {
@@ -270,12 +270,12 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         starts[static_cast<std::size_t>(size)] = ps.N();
     }
 
-    // inv.keys is sorted → each owner's entries form one contiguous run; the
+    // inv_keys is sorted → each owner's entries form one contiguous run; the
     // host copy of the keys yields sendcounts without a D2H transfer.
     std::vector<std::size_t> owner_counts(static_cast<std::size_t>(size), 0);
     for (std::size_t i = 0; i < n_local; ++i) {
         const auto owner = static_cast<std::size_t>(
-            std::upper_bound(starts.begin() + 1, starts.begin() + size, inv.keys[i]) -
+            std::upper_bound(starts.begin() + 1, starts.begin() + size, inv_keys[i]) -
             (starts.begin() + 1));
         ++owner_counts[owner];
     }
