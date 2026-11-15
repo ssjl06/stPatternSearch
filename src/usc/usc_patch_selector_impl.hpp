@@ -26,16 +26,28 @@ namespace stPS {
 using WireScore = std::int32_t;
 inline constexpr WireScore kDisabledWireScore = -1;
 
+namespace detail {
+// Test-only switch for the ByPatch loop: cap on the candidates examined per
+// round (0 = default). 1 turns the loop into one selection per round; small
+// values exercise the end-of-round and skip paths.
+struct UscPatchTestHooks {
+    std::uint64_t max_candidates = 0;
+};
+UscPatchTestHooks& usc_patch_test_hooks();
+}  // namespace detail
+
 // Internal implementation of the public UscPatchSelector: distributed greedy
 // minimum set-cover. The shared preprocessing — distributed hash→id mapping,
 // PatchCsr, InvertedIndex, and their device mirrors — is delegated to PatchSet;
 // this class owns only the USC-specific state (per-patch scores + cumulative
 // covered bitset) and the greedy main loop.
 //
-// The loop is device-resident: each iteration is two small NCCL reductions (the
-// winner key, then the winner's newly covered elements) between kernels, all
-// enqueued in batches; the host reads 24 B of loop state per batch. The Comm
-// must be device-enabled (built with Comm::onDevice) — USC is GPU-only.
+// The loop is device-resident and selects several patches per round: the best
+// candidates of all ranks are gathered, their still-uncovered elements
+// exchanged, and every rank accepts the same conflict-free prefix — exactly
+// the patches sequential greedy would pick. Two small NCCL reductions per
+// round, all enqueued in batches; the host reads 24 B of loop state per
+// batch. The Comm must be device-enabled (Comm::onDevice) — USC is GPU-only.
 class UscPatchSelectorImpl {
 public:
     // `comm` must be a device-enabled Comm (Comm::onDevice).

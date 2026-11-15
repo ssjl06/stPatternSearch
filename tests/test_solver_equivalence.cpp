@@ -184,6 +184,40 @@ TEST(SolverEquivalenceElem, DeltaExchangeLarger) {
     }
 }
 
+// The ByPatch round with its candidate count capped: 1 is one selection per
+// round, small values end rounds early and skip conflicting candidates, 0 is
+// the default. Every setting must give the brute-force selection.
+class CandidateCapGuard {
+public:
+    explicit CandidateCapGuard(std::uint64_t cap)
+        : saved_(detail::usc_patch_test_hooks()) {
+        detail::usc_patch_test_hooks() = {cap};
+    }
+    ~CandidateCapGuard() { detail::usc_patch_test_hooks() = saved_; }
+    CandidateCapGuard(const CandidateCapGuard&) = delete;
+    CandidateCapGuard& operator=(const CandidateCapGuard&) = delete;
+private:
+    detail::UscPatchTestHooks saved_;
+};
+
+TEST(SolverEquivalence, CandidateCaps) {
+    for (std::uint64_t cap : {1u, 2u, 3u, 7u, 64u, 1024u}) {
+        SCOPED_TRACE("candidate cap " + std::to_string(cap));
+        CandidateCapGuard guard(cap);
+        run_case(100, 50, 10, 0.3, 1);
+        run_case(1000, 200, 30, 0.7, 2);
+        run_case(1000, 200, 30, 0.1, 3);
+        run_case(10000, 500, 50, 0.5, 1);
+    }
+}
+
+// Heavy overlap and many equal scores: most candidates conflict with an
+// accepted one, so rounds are short and the skip rule decides the order.
+TEST(SolverEquivalence, DenseConflicts) {
+    for (std::uint64_t seed : {1u, 2u, 3u}) run_case(300, 400, 12, 0.95, seed);
+    for (std::uint64_t seed : {1u, 2u}) run_case(2000, 1500, 8, 0.9, seed);
+}
+
 TEST(UscPatchSelectorApi, RejectsGlobalIdCountMismatch) {
     // Every rank passes one ID short, so all throw before any collective.
     stComm::Comm& comm = test_helpers::comm();
