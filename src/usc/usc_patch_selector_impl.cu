@@ -149,44 +149,37 @@ __global__ void block_max_refresh_kernel(const WireScore* scores, std::uint64_t 
     }
 }
 
-constexpr int kTopThreads = 1024;   // one CUDA block; power of two
+constexpr int kTopThreads = 1024;   // one CUDA block
 
-// Run by ONE CUDA block of kTopThreads threads: the maximum of
-// values[lo, hi), first position among equals. On return thread 0 holds it in
-// s_val[0] / s_arg[0] (kNoPosition for an empty range).
-__device__ inline void reduce_range_max(const WireScore* values, std::uint64_t lo,
-                                        std::uint64_t hi, WireScore* s_val, int* s_arg) {
-    const unsigned int tid = threadIdx.x;
-    WireScore best = kLowestScore;
-    int       pos  = kNoPosition;
-    for (std::uint64_t i = lo + tid; i < hi; i += kTopThreads) {
-        const WireScore v = values[i];
-        if (v > best) { best = v; pos = static_cast<int>(i); }
-    }
-    s_val[tid] = best;
-    s_arg[tid] = pos;
-    __syncthreads();
-    for (unsigned int half = kTopThreads / 2; half > 0; half >>= 1) {
-        if (tid < half) {
-            const WireScore ov = s_val[tid + half];
-            const int       oa = s_arg[tid + half];
-            if (ov > s_val[tid] || (ov == s_val[tid] && oa < s_arg[tid])) {
-                s_val[tid] = ov;
-                s_arg[tid] = oa;
-            }
-        }
-        __syncthreads();
-    }
+// (score, position) packed so that the larger key is the larger score and,
+// among equal scores, the smaller position. 0 never encodes a real entry
+// (positions stay below 2^31), so it stands for "nothing".
+__device__ inline unsigned long long pack_max_key(WireScore score, std::uint64_t pos) {
+    const unsigned long long biased = static_cast<std::uint32_t>(score) ^ 0x80000000u;
+    return (biased << 32) | (0xFFFFFFFFull - pos);
+}
+__device__ inline WireScore max_key_score(unsigned long long key) {
+    return static_cast<WireScore>(static_cast<std::uint32_t>(key >> 32) ^ 0x80000000u);
+}
+__device__ inline int max_key_position(unsigned long long key) {
+    return static_cast<int>(0xFFFFFFFFull - (key & 0xFFFFFFFFull));
 }
 
-// Second argmax stage: the maximum over the block maxima; thread 0 ends up
-// with the winning score and PATCH (via block_arg). The loops fuse this into
-// the kernel that consumes the winner, saving a launch per step — the loops
-// are bound by launches as much as by GPU work.
-__device__ inline void reduce_block_maxima(const MaxBlocks& t, std::uint64_t num_blocks,
-                                           WireScore* s_val, int* s_arg) {
-    reduce_range_max(t.block_val, 0, num_blocks, s_val, s_arg);
-    if (threadIdx.x == 0 && s_arg[0] != kNoPosition) s_arg[0] = t.block_arg[s_arg[0]];
+// Run by every thread of ONE CUDA block: the maximum of values[lo, hi), first
+// position among equals, left in *s_key (shared; 0 for an empty range). One
+// atomic per thread instead of a reduction tree: the candidate extraction
+// calls this twice per candidate, and the tree's barriers dominated it.
+__device__ inline void reduce_range_max(const WireScore* values, std::uint64_t lo,
+                                        std::uint64_t hi, unsigned long long* s_key) {
+    if (threadIdx.x == 0) *s_key = 0;
+    __syncthreads();
+    unsigned long long best = 0;
+    for (std::uint64_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const unsigned long long k = pack_max_key(values[i], i);
+        if (k > best) best = k;
+    }
+    if (best) atomicMax(s_key, best);
+    __syncthreads();
 }
 
 // ---------------------------------------------------------------------------
@@ -420,21 +413,22 @@ __global__ void extract_candidates_kernel(WireScore* scores, std::uint64_t M,
                                                 unsigned int K, int my_rank,
                                                 int* cand_patch, WireScore* cand_score,
                                                 std::uint64_t* key_segment) {
-    __shared__ WireScore s_val[kTopThreads];
-    __shared__ int       s_arg[kTopThreads];
-    __shared__ int       s_patch;   // patch just set aside, -1 = no more candidates
+    __shared__ unsigned long long s_key;
+    __shared__ int                s_patch;   // patch just set aside, -1 = no more candidates
     const unsigned int tid = threadIdx.x;
     if (tid == 0 && blocks.count) *blocks.count = 0;   // the refresh before this consumed the queue
     unsigned int j = 0;
     for (; j < K; ++j) {
-        reduce_block_maxima(blocks, num_blocks, s_val, s_arg);
+        // Second argmax stage: the best block maximum, first block among equals.
+        reduce_range_max(blocks.block_val, 0, num_blocks, &s_key);
         if (tid == 0) {
             s_patch = -1;
-            if (num_blocks && s_val[0] > 0) {
-                const int p = s_arg[0];
+            const WireScore score = s_key ? max_key_score(s_key) : 0;
+            if (score > 0) {
+                const int p = blocks.block_arg[max_key_position(s_key)];
                 cand_patch[j]  = p;
-                cand_score[j]  = s_val[0];
-                key_segment[j] = pack_candidate_key(s_val[0], my_rank, j);
+                cand_score[j]  = score;
+                key_segment[j] = pack_candidate_key(score, my_rank, j);
                 scores[p]      = kDisabledWireScore;
                 s_patch        = p;
             }
@@ -445,10 +439,10 @@ __global__ void extract_candidates_kernel(WireScore* scores, std::uint64_t M,
         const std::uint64_t lo = b << blocks.shift;
         std::uint64_t hi = lo + (std::uint64_t{1} << blocks.shift);
         if (hi > M) hi = M;
-        reduce_range_max(scores, lo, hi, s_val, s_arg);
+        reduce_range_max(scores, lo, hi, &s_key);
         if (tid == 0) {
-            blocks.block_val[b] = s_val[0];
-            blocks.block_arg[b] = s_arg[0];
+            blocks.block_val[b] = max_key_score(s_key);
+            blocks.block_arg[b] = max_key_position(s_key);
         }
         __syncthreads();
     }
@@ -771,9 +765,9 @@ __global__ void elem_build_accepted_kernel(const ElementId*     patch_data,
     }
 }
 
-// Host-side owner of the block maxima over one score array. Per step the
-// loops enqueue refresh() and then their own kernel that runs
-// reduce_block_maxima over num_blocks().
+// Host-side owner of the block maxima over one score array. Per round the
+// loops enqueue refresh() and then extract_candidates_kernel over
+// num_blocks().
 class BlockArgmax {
 public:
     BlockArgmax(const WireScore* d_scores, std::uint64_t M) : d_scores_(d_scores), M_(M) {
