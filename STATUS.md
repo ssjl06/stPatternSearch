@@ -246,6 +246,35 @@ position among equal scores is kept at both stages: selections are identical.
 37.2 s. Per step at 2 ranks the host now spends ~32 µs enqueueing (two NCCL
 submissions are ~16 µs of it) against ~16–21 µs of stream time.
 
+### ByElement: several selections per round (2026-11)
+
+Same rule as the ByPatch rounds (accept the conflict-free candidates in greedy
+order, skip the conflicting ones, end when a skipped one may outrank the
+next). Every rank holds every score, so all ranks extract the same K
+candidates without communication; what they cannot see alone is whether two
+candidates share a still-uncovered element, since a patch's elements are
+spread over the shards. Each rank counts the shared elements inside its shard
+for every candidate pair, one `ncclAllReduce<SUM>` sums the K × K table, and
+every rank walks the candidates against the same table. The delta exchange
+then carries the score decrements of all accepted patches at once. Two
+collectives per step. K is at most 256 and shrinks with the widest sub-patch
+(the pair counting does K² lookups per element).
+
+Verified 2026-11-15 on 2×A40 (`NCCL_P2P_DISABLE=1`): full suite at 1 and 2
+ranks + the 1M-patch scale test pass; selections identical. USC ByElement
+total, 2M patches (before → after):
+
+| input | 1 rank | 2 ranks |
+|---|---|---|
+| 32 per patch, overlap 0.5 | 21.1 s → 10.4 s | 37.7 s → 8.6 s |
+| 200 per patch, overlap 0.5 | 41.5 s → 37.2 s | 28.7 s → 20.0 s |
+| 32 per patch, overlap 0.9 | 8.2 s → 6.5 s | 9.7 s → 4.0 s |
+
+The loop itself is ~5 s on the first input (2528 steps; candidate extraction
+~1.3 ms of each ~2 ms step). The rest is setup, which in this mode still
+redistributes the incidences and builds the sub-CSR on the host — now the
+larger part, and what keeps the 200-per-patch input slow.
+
 ### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
 
 Because ByElement's one collective has a fixed count and no root (the exact
