@@ -192,17 +192,16 @@ __device__ inline void reduce_block_maxima(const MaxBlocks& t, std::uint64_t num
 // Device-resident loop kernels (Full-GPU iteration track), shared by both
 // partition modes.
 //
-// The host enqueues whole batches of iterations blind, so every launch here
-// uses a FIXED grid and reads the winner's range / newly-covered count from
-// device memory — the host knows neither when it enqueues. All per-iteration
-// control flow (winner resolution, covered_count, termination, winner
-// disable) lives in each mode's single-thread commit kernel.
+// The host enqueues whole batches of rounds blind, so every launch here uses a
+// FIXED grid and reads counts from device memory — the host knows no outcome
+// when it enqueues. All per-round control flow (which patches are selected,
+// covered_count, termination) lives in each mode's walk kernel.
 // ---------------------------------------------------------------------------
 
 constexpr int kFixedGridBlocks   = 256;  // fixed grid for the grid-stride kernels
 constexpr int kFixedBlockThreads = 128;
 
-// Device-resident loop state — the commit kernel is its only writer; the host
+// Device-resident loop state — the walk kernel is its only writer; the host
 // reads it once per batch (24 B D2H) to decide whether to enqueue more.
 struct LoopState {
     std::uint64_t covered_count;
@@ -211,108 +210,16 @@ struct LoopState {
     std::uint32_t last_score;     // most recent winner's score (batch sizing)
 };
 
-// Per-iteration winner scratch: written by the commit kernel, consumed by the
-// three update kernels of the same (stream-ordered) iteration.
+// Per-round scratch, written by the mode's walk / build kernels and read by
+// the update kernels of the same (stream-ordered) round.
 struct WinnerInfo {
-    std::uint64_t start;          // winner's shard-local sub-CSR range
-    std::uint64_t end;
-    unsigned int  newly_count;    // atomic output of the build kernel
-    unsigned int  live;           // ByPatch: 1 while this iteration selects a patch
+    unsigned int newly_count;   // elements newly covered this round (this rank's view)
+    unsigned int live;          // 1 while this round selected at least one patch
 };
 
-// One 32-bit word of the delta exchange (a count, a flag or a patch slot —
-// slots fit: M_global is within int range).
+// One 32-bit word of the ByElement exchanges (a count, a flag or a patch slot
+// — slots fit: M_global is within int range).
 using DeltaWord = std::uint32_t;
-
-// Commit: pick the winner (second argmax stage, all threads) and, on thread 0,
-// consume it entirely on device — the decision a host loop would make. Appends the winner slot,
-// advances covered_count by the (globally identical) winner score, resolves
-// the winner's sub-CSR range for the update kernels, fuses the winner disable,
-// and raises `done` on termination. Once done, every later enqueued iteration
-// sees start == end and newly_count == 0 and no-ops — a batch may overshoot
-// the end of the solve but never changes the result, and `done` derives only
-// from allreduced values, so it flips on every rank in the same iteration.
-__global__ void elem_commit_winner_kernel(std::uint64_t        num_blocks,
-                                          const std::uint64_t* sub_offsets,
-                                          std::uint64_t        N,
-                                          WireScore*           scores,
-                                          PatchId*             selected_slots,
-                                          const DeltaWord*     delta_recv,
-                                          int                  delta_ranks,
-                                          std::uint64_t        delta_window,
-                                          MaxBlocks            blocks,
-                                          LoopState*           st,
-                                          WinnerInfo*          w) {
-    __shared__ WireScore s_val[kTopThreads];
-    __shared__ int       s_arg[kTopThreads];
-    reduce_block_maxima(blocks, num_blocks, s_val, s_arg);
-    if (threadIdx.x != 0) return;
-
-    *blocks.count = 0;   // the refresh before this consumed the queue
-    w->newly_count = 0;
-    w->start = 0;
-    w->end   = 0;
-    w->live  = 0;
-    if (st->done) return;
-    // Delta exchange: while any rank still has score decrements to send, the
-    // replicated scores are not final — select nothing this step. The flags
-    // come out of the reduction, so every rank takes the same branch.
-    for (int r = 0; r < delta_ranks; ++r) {
-        if (delta_recv[static_cast<std::uint64_t>(r) * (delta_window + 2) + 1]) return;
-    }
-    const WireScore score = s_val[0];
-    if (score <= 0) { st->done = 1; return; }
-    const int slot = s_arg[0];
-    selected_slots[st->num_selected] = static_cast<PatchId>(slot);
-    st->num_selected  += 1;
-    st->last_score     = static_cast<std::uint32_t>(score);
-    st->covered_count += static_cast<std::uint64_t>(score);
-    if (st->covered_count >= N) st->done = 1;
-    w->live  = 1;
-    w->start = sub_offsets[slot];
-    w->end   = sub_offsets[slot + 1];
-    // Winner disable, fused. This iteration's decrements lower it further — it
-    // stays permanently negative either way.
-    scores[slot] = kDisabledWireScore;
-    mark_dirty(blocks, static_cast<std::uint64_t>(slot));
-}
-
-// build_newly_covered, fixed-grid grid-stride: the range comes from w; the
-// compact output count is w->newly_count (same non-deterministic order /
-// deterministic set as build_newly_covered_kernel).
-__global__ void fixed_build_newly_kernel(const ElementId*     patch_data,
-                                        const std::uint64_t* covered,
-                                        ElementId*           out_ids,
-                                        WinnerInfo*      w) {
-    const std::uint64_t stride =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t i = w->start
-             + blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
-         i < w->end; i += stride) {
-        const ElementId id = patch_data[i];
-        if (((covered[id >> 6] >> (id & 63)) & 1ULL) == 0) {
-            const unsigned int slot = atomicAdd(&w->newly_count, 1u);
-            out_ids[slot] = id;
-        }
-    }
-}
-
-// set_bits, fixed-grid grid-stride over w->newly_count (final by stream order:
-// the build kernel completed before this launch starts).
-__global__ void fixed_set_bits_kernel(std::uint64_t*        bitset,
-                                     const ElementId*      ids,
-                                     const WinnerInfo* w) {
-    const unsigned int n = w->newly_count;
-    const std::uint64_t stride =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t i =
-             blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
-         i < n; i += stride) {
-        const ElementId id = ids[i];
-        atomicOr(reinterpret_cast<unsigned long long*>(&bitset[id >> 6]),
-                 static_cast<unsigned long long>(1ULL << (id & 63)));
-    }
-}
 
 // Strategy-A score update, fixed-grid: blocks stride over the newly covered
 // elements. One block resolves an element's patch-list range (thread 0, shared
@@ -502,11 +409,12 @@ __device__ inline std::uint64_t pack_candidate_key(WireScore score, int rank, un
          | (kKeyField - j);
 }
 
-// This rank's K best patches, best first. One CUDA block: K times, take the
+// The K best patches of one score array, best first (ByPatch: this rank's
+// patches; ByElement: all patches, identical on every rank). One CUDA block: K times, take the
 // maximum over the block maxima, set that patch aside (its score is parked in
 // cand_score and the slot disabled) and recompute its block. The parked
-// scores come back in patch_restore_kernel unless the patch is selected.
-__global__ void patch_extract_candidates_kernel(WireScore* scores, std::uint64_t M,
+// scores come back in restore_candidates_kernel unless the patch is selected.
+__global__ void extract_candidates_kernel(WireScore* scores, std::uint64_t M,
                                                 MaxBlocks blocks, std::uint64_t num_blocks,
                                                 unsigned int K, int my_rank,
                                                 int* cand_patch, WireScore* cand_score,
@@ -708,16 +616,158 @@ __global__ void patch_walk_kernel(const std::uint64_t* global_keys,
 // Give the parked scores back to every candidate that was not selected. Must
 // run before the score update, which then lowers them like any other patch.
 // A selected patch stays disabled.
-__global__ void patch_restore_kernel(const int* cand_patch, const WireScore* cand_score,
+__global__ void restore_candidates_kernel(const int* cand_patch, const WireScore* cand_score,
                                      const std::uint64_t* key_segment, const int* slot_of,
                                      const unsigned int* accepted, unsigned int K,
                                      WireScore* scores, MaxBlocks blocks) {
     const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= K || key_segment[j] == 0) return;
     const int p = cand_patch[j];
-    const int g = slot_of[j];
+    const int g = slot_of ? slot_of[j] : static_cast<int>(j);   // null: local order IS the global one
     if (g < 0 || !accepted[g]) scores[p] = cand_score[j];
     mark_dirty(blocks, static_cast<std::uint64_t>(p));
+}
+
+// ---------------------------------------------------------------------------
+// ByElement: several selections per round, same rule as ByPatch (see "ByPatch
+// device-resident loop"). Every rank holds every score, so all ranks extract
+// the same K candidates with no communication — but a candidate's elements
+// are spread over the shards, so no rank can tell alone whether two
+// candidates share a still-uncovered element. Each rank counts the shared
+// elements inside its shard for every candidate pair; one reduction sums the
+// K x K table; every rank then walks the candidates against the same table.
+//
+// The table gives pairwise counts, not the size of a union, so a skipped
+// candidate's remaining score is bounded with the largest single overlap —
+// never below the truth, which only ends a round earlier than necessary.
+// ---------------------------------------------------------------------------
+
+// overlap[i * K + j] (i < j) += still-uncovered elements of this shard that
+// candidates i and j share. One CUDA block per candidate j, striding; each
+// thread takes elements of j's sub-list and looks them up in every earlier
+// candidate's (sorted) sub-list. The caller zeroes the table.
+__global__ void elem_overlap_kernel(const ElementId*     patch_data,
+                                    const std::uint64_t* sub_offsets,
+                                    const std::uint64_t* covered,
+                                    const int*           cand_patch,
+                                    const std::uint64_t* keys,
+                                    unsigned int         K,
+                                    DeltaWord*           overlap) {
+    for (unsigned int j = blockIdx.x; j < K; j += gridDim.x) {
+        if (keys[j] == 0) continue;
+        const int pj = cand_patch[j];
+        const std::uint64_t end = sub_offsets[pj + 1];
+        for (std::uint64_t e = sub_offsets[pj] + threadIdx.x; e < end; e += blockDim.x) {
+            const ElementId id = patch_data[e];
+            if ((covered[id >> 6] >> (id & 63)) & 1ULL) continue;
+            for (unsigned int i = 0; i < j; ++i) {
+                const int pi = cand_patch[i];
+                std::uint64_t lo = sub_offsets[pi], hi = sub_offsets[pi + 1];
+                const std::uint64_t stop = hi;
+                while (lo < hi) {
+                    const std::uint64_t mid = lo + (hi - lo) / 2;
+                    if (patch_data[mid] < id) lo = mid + 1; else hi = mid;
+                }
+                if (lo < stop && patch_data[lo] == id) {
+                    atomicAdd(&overlap[static_cast<std::uint64_t>(i) * K + j], 1u);
+                }
+            }
+        }
+    }
+}
+
+// The walk, identical on every rank (it reads only replicated or reduced
+// data). One CUDA block. Nothing is selected while any rank still has score
+// decrements to send (the delta exchange's flags): the scores the candidates
+// were extracted from are not final then.
+__global__ void elem_walk_kernel(const int*           cand_patch,
+                                 const WireScore*     cand_score,
+                                 const std::uint64_t* keys,
+                                 const DeltaWord*     overlap,
+                                 unsigned int         K,
+                                 std::uint64_t        N,
+                                 const DeltaWord*     delta_recv,
+                                 int                  delta_ranks,
+                                 std::uint64_t        delta_window,
+                                 unsigned int*        accepted,
+                                 PatchId*             selected_slots,
+                                 LoopState*           st,
+                                 WinnerInfo*          w) {
+    __shared__ unsigned int s_max_overlap;
+    __shared__ int          s_decision;   // 0 continue, 2 end of round
+    const unsigned int tid = threadIdx.x;
+    if (tid < K) accepted[tid] = 0;
+    std::uint64_t skip_best = 0;      // thread 0 only
+    bool          draining  = false;  // thread 0 only
+    if (tid == 0) {
+        w->newly_count = 0;
+        w->live        = 0;
+        for (int r = 0; r < delta_ranks; ++r) {
+            if (delta_recv[static_cast<std::uint64_t>(r) * (delta_window + 2) + 1]) draining = true;
+        }
+        s_decision = (st->done || draining) ? 2 : 0;
+    }
+    __syncthreads();
+    if (s_decision != 2) {
+        for (unsigned int g = 0; g < K; ++g) {
+            const std::uint64_t score = keys[g] ? static_cast<std::uint64_t>(cand_score[g]) : 0;
+            if (tid == 0) {
+                s_max_overlap = 0;
+                s_decision    = (score == 0 || skip_best >= score) ? 2 : 0;
+            }
+            __syncthreads();
+            if (s_decision == 2) break;
+            if (tid < g && accepted[tid]) {
+                const DeltaWord shared_count = overlap[static_cast<std::uint64_t>(tid) * K + g];
+                if (shared_count) atomicMax(&s_max_overlap, shared_count);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                if (s_max_overlap == 0) {
+                    accepted[g] = 1;
+                    selected_slots[st->num_selected] = static_cast<PatchId>(cand_patch[g]);
+                    st->num_selected  += 1;
+                    st->last_score     = static_cast<std::uint32_t>(score);
+                    st->covered_count += score;
+                    w->live = 1;
+                    if (st->covered_count >= N) { st->done = 1; s_decision = 2; }
+                } else {
+                    const std::uint64_t left = score - s_max_overlap;
+                    if (left > skip_best) skip_best = left;
+                }
+            }
+            __syncthreads();
+            if (s_decision == 2) break;
+        }
+    }
+    // No positive score anywhere: the solve is over.
+    if (tid == 0 && !st->done && !draining && keys[0] == 0) st->done = 1;
+}
+
+// This shard's part of the accepted patches: append their still-uncovered
+// elements to `newly` and set their covered bits. Accepted patches share no
+// uncovered element, so the blocks do not interfere.
+__global__ void elem_build_accepted_kernel(const ElementId*     patch_data,
+                                           const std::uint64_t* sub_offsets,
+                                           std::uint64_t*       covered,
+                                           const int*           cand_patch,
+                                           const unsigned int*  accepted,
+                                           unsigned int         K,
+                                           ElementId*           newly,
+                                           WinnerInfo*          w) {
+    for (unsigned int j = blockIdx.x; j < K; j += gridDim.x) {
+        if (!accepted[j]) continue;
+        const int p = cand_patch[j];
+        const std::uint64_t end = sub_offsets[p + 1];
+        for (std::uint64_t e = sub_offsets[p] + threadIdx.x; e < end; e += blockDim.x) {
+            const ElementId id = patch_data[e];
+            if (((covered[id >> 6] >> (id & 63)) & 1ULL) == 0) {
+                newly[atomicAdd(&w->newly_count, 1u)] = id;
+                atomicOr(reinterpret_cast<unsigned long long*>(&covered[id >> 6]),
+                         static_cast<unsigned long long>(1ULL << (id & 63)));
+            }
+        }
+    }
 }
 
 // Host-side owner of the block maxima over one score array. Per step the
@@ -996,7 +1046,7 @@ PatchSelection UscPatchSelectorImpl::select() {
         for (std::uint64_t b = 0; b < batch; ++b) {
             block_argmax.refresh(stream);
             prof.mark(kPRefresh);
-            patch_extract_candidates_kernel<<<1, kTopThreads, 0, stream>>>(
+            extract_candidates_kernel<<<1, kTopThreads, 0, stream>>>(
                 d_scores_.data(), M_loc, block_argmax.view(), block_argmax.num_blocks(),
                 K, rank, d_cand_patch.data(), d_cand_score.data(), d_key_segment);
             prof.mark(kPExtract);
@@ -1033,7 +1083,7 @@ PatchSelection UscPatchSelectorImpl::select() {
                 d_covered_.data(), d_accepted.data(), d_newly.data(),
                 d_selected.data(), d_state.data(), d_winner.data());
             prof.mark(kPWalk);
-            patch_restore_kernel<<<(K + kFixedBlockThreads - 1) / kFixedBlockThreads,
+            restore_candidates_kernel<<<(K + kFixedBlockThreads - 1) / kFixedBlockThreads,
                                    kFixedBlockThreads, 0, stream>>>(
                 d_cand_patch.data(), d_cand_score.data(), d_key_segment, d_slot_of.data(),
                 d_accepted.data(), K, d_scores_.data(), block_argmax.view());
@@ -1324,35 +1374,38 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     return result;
 }
 
-// Element-partitioned greedy loop (§7.3) — DEVICE-RESIDENT.
+// Element-partitioned greedy loop (§7.3) — DEVICE-RESIDENT, several
+// selections per round.
 //
-// Every rank holds the full, identical score of every patch, so each rank
-// computes the same argmax on its own — no MAXLOC, no winner broadcast. What
-// travels is only what a selection changes: the patch slots whose score drops
-// (see "ByElement delta exchange" above). Per step, all enqueued on the NCCL
-// stream with no host knowledge of the outcome:
+// Every rank holds the full, identical score of every patch, so all ranks
+// extract the same K candidates on their own. What travels is (1) which
+// candidates share still-uncovered elements — a K x K table of counts, each
+// rank contributing its shard — and (2) what the selections change: the patch
+// slots whose score drops (see "ByElement delta exchange"). Per step, all
+// enqueued on the NCCL stream with no host knowledge of the outcome:
 //
 //   [device] plan + fill this rank's window of pending decrements
-//        ncclAllReduce<SUM>(P segments of window + 2 words)   ← only collective
+//        ncclAllReduce<SUM>(P segments of window + 2 words)
 //   [device] apply every rank's window to the scores
-//   [device] CUB ArgMax over the scores
-//   [device] commit: nothing while any rank has more to send; otherwise
-//            append slot, covered_count += score, winner range, disable
-//   [device] build newly covered (this shard) + set_bits
+//   [device] refresh block maxima, extract the K best patches (scores parked)
+//   [device] count shared uncovered elements per candidate pair, this shard
+//        ncclAllReduce<SUM>(K x K words)
+//   [device] walk: accept / skip / end — nothing while any rank has more
+//            decrements to send; this shard's elements of the accepted
+//            patches → newly covered + covered bits; restore parked scores
 //   [device] new delta stream: list lengths → prefix sum → cursor
 //
-// A step whose windows carried everything selects in the same step, so the
-// common case is one small collective per selection. The host enqueues a
-// batch of steps and syncs once to read the 24 B loop state; steps enqueued
-// past termination no-op, and every branch above derives from reduced
-// values, so all ranks stay in lockstep.
+// Two collectives per step. The host enqueues a batch of steps and syncs
+// once to read the 24 B loop state; steps enqueued past termination no-op,
+// and every branch derives from reduced or replicated values, so all ranks
+// stay in lockstep.
 //
-// The window is re-sized per batch from values every rank agrees on (the
-// winner-score bound and the average element degree): about four times the
-// expected decrements per rank and selection.
+// K is bounded so that the pair counting (K^2 lookups per element of a
+// sub-patch) stays cheap; the delta window is re-sized per batch from values
+// every rank agrees on.
 //
-// size == 1 has no one to exchange with: the decrements go straight into the
-// scores (strategy-A update), no collective at all.
+// size == 1 has no one to exchange with: no collective at all, and the
+// decrements go straight into the scores (strategy-A update).
 //
 // -DUSC_PROFILE: see LoopProfiler.
 PatchSelection UscElemPatchSelectorImpl::select() {
@@ -1374,20 +1427,37 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     DeviceBuffer<WinnerInfo> d_winner(1);
     d_state.zero();
     d_winner.zero();
-    DeviceBuffer<PatchId>   d_selected(std::min(M_global_, N_));
-    const std::uint64_t max_newly = std::max<std::uint64_t>(max_sub_len_, 1);
-    DeviceBuffer<ElementId> d_newly_ids(max_newly);
+    DeviceBuffer<PatchId> d_selected(std::min(M_global_, N_));
+
+    // Candidates per round: the pair counting does K^2 lookups per element of
+    // a sub-patch, so K shrinks as the widest sub-patch grows.
+    const std::uint64_t max_sub = std::max<std::uint64_t>(max_sub_len_, 1);
+    std::uint64_t k_fit = 1;
+    while (k_fit < 256 && (2 * k_fit) * (2 * k_fit) * max_sub <= (std::uint64_t{1} << 26)) k_fit *= 2;
+    const auto K = static_cast<unsigned int>(
+        hooks.max_candidates ? std::min<std::uint64_t>(hooks.max_candidates, kTopThreads) : k_fit);
+    const std::uint64_t newly_cap = static_cast<std::uint64_t>(K) * max_sub;
+
+    DeviceBuffer<int>           d_cand_patch(K);
+    DeviceBuffer<WireScore>     d_cand_score(K);
+    DeviceBuffer<std::uint64_t> d_keys(K);
+    DeviceBuffer<unsigned int>  d_accepted(K);
+    DeviceBuffer<DeltaWord>     d_overlap_send(static_cast<std::uint64_t>(K) * K);
+    DeviceBuffer<DeltaWord>     d_overlap_recv_buf(size > 1 ? static_cast<std::uint64_t>(K) * K : 0);
+    const DeltaWord* d_overlap = size > 1 ? d_overlap_recv_buf.data() : d_overlap_send.data();
+    DeviceBuffer<ElementId>     d_newly_ids(newly_cap);
 
     BlockArgmax block_argmax(d_scores_.data(), M_global_);
 
     std::uint64_t score_bound = std::max<std::uint64_t>(max_initial_score_, 1);
 
     // Delta exchange state. The window only shrinks (score_bound does), so the
-    // first one sizes the buffers.
+    // first one sizes the buffers. About four times the decrements one rank
+    // expects from a full round.
     const auto window_for = [&](std::uint64_t bound) -> std::uint64_t {
         if (hooks.delta_window) return hooks.delta_window;
-        const std::uint64_t expected = bound * avg_degree_ / usize;
-        return std::clamp<std::uint64_t>(4 * expected + 16, 64, std::uint64_t{1} << 16);
+        const std::uint64_t expected = K * bound * avg_degree_ / usize;
+        return std::clamp<std::uint64_t>(4 * expected + 16, 64, std::uint64_t{1} << 18);
     };
     DeviceBuffer<DeltaCursor>   d_cursor;
     DeviceBuffer<std::uint64_t> d_deg, d_prefix;
@@ -1397,8 +1467,8 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     if (exchange) {
         d_cursor.resize(1);
         d_cursor.zero();
-        d_deg.resize(max_newly + 1);
-        d_prefix.resize(max_newly + 1);
+        d_deg.resize(newly_cap + 1);
+        d_prefix.resize(newly_cap + 1);
         d_deg.zero();
         d_prefix.zero();
         const std::uint64_t words = usize * (window_for(score_bound) + 2);
@@ -1406,34 +1476,32 @@ PatchSelection UscElemPatchSelectorImpl::select() {
         if (size > 1) d_recv_buf.resize(words);
         std::size_t temp_bytes = 0;
         cuda_check(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_deg.data(),
-                                                 d_prefix.data(), max_newly + 1),
+                                                 d_prefix.data(), newly_cap + 1),
                    "delta prefix-sum sizing");
         d_scan_temp.resize(temp_bytes);
     }
     // One rank (test hook): the "reduction" of a single segment is itself.
     const DeltaWord* d_recv = size > 1 ? d_recv_buf.data() : d_send.data();
 
-    // Batch sizing. Winner scores never increase over a greedy solve (covering
-    // elements only lowers every patch's score), so each remaining selection
-    // covers at most `score_bound` elements and at least
-    // ceil(remaining / score_bound) more steps must run. Enqueueing exactly
-    // that many — capped at kMaxBatch — never overshoots the end of the solve.
-    // Both inputs come from reduced state, so every rank picks the same batch.
-    constexpr std::uint64_t kMaxBatch = 128;
-    enum { kEPlan, kEFill, kEReduce, kEApply, kEArgmax, kECommit, kEBuild, kESetBits,
-           kEDegrees, kEScan, kEBegin, kEScoreUpdate };
+    constexpr std::uint64_t kMaxBatch = 16;   // steps
+    enum { kEPlan, kEFill, kEReduce, kEApply, kERefresh, kEExtract, kEOverlap, kEOverlapReduce,
+           kEWalk, kEBuild, kERestore, kEDegrees, kEScan, kEBegin, kEScoreUpdate };
     LoopProfiler prof(stream, {"delta plan", "delta fill", "delta reduce", "delta apply",
-                               "refresh blocks", "pick + commit", "build newly", "set_bits",
+                               "refresh blocks", "extract candidates", "pair overlaps",
+                               "overlap reduce", "walk", "build accepted", "restore",
                                "delta degrees", "delta prefix scan", "delta begin",
                                "score update (1 rank)"});
     LoopState h_state{};
     while (true) {
+        // A step covers at most K * score_bound elements, so at least this
+        // many more steps must run — enqueueing them never overshoots.
         const std::uint64_t remaining = N_ - h_state.covered_count;
+        const std::uint64_t per_step  = static_cast<std::uint64_t>(K) * score_bound;
         const std::uint64_t batch = std::clamp<std::uint64_t>(
-            remaining / score_bound + (remaining % score_bound != 0), 1, kMaxBatch);
-        // A newly-covered list never outgrows the winner score or the widest
-        // sub-patch.
-        const std::uint64_t len = std::min(score_bound, max_newly);
+            remaining / per_step + (remaining % per_step != 0), 1, kMaxBatch);
+        // A step's newly-covered list never outgrows K winners' scores or K
+        // sub-patches.
+        const std::uint64_t len = std::min(per_step, newly_cap);
         if (exchange) {
             const std::uint64_t w = window_for(score_bound);
             if (w != window) {
@@ -1469,20 +1537,38 @@ PatchSelection UscElemPatchSelectorImpl::select() {
                 prof.mark(kEApply);
             }
             block_argmax.refresh(stream);
-            prof.mark(kEArgmax);
-            elem_commit_winner_kernel<<<1, kTopThreads, 0, stream>>>(
-                block_argmax.num_blocks(), d_sub_offsets_.data(), N_,
-                d_scores_.data(), d_selected.data(),
-                d_recv, exchange ? size : 0, window, block_argmax.view(),
-                d_state.data(), d_winner.data());
-            prof.mark(kECommit);
-            fixed_build_newly_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
-                d_patch_data_.data(), d_covered_.data(),
+            prof.mark(kERefresh);
+            extract_candidates_kernel<<<1, kTopThreads, 0, stream>>>(
+                d_scores_.data(), M_global_, block_argmax.view(), block_argmax.num_blocks(),
+                K, 0, d_cand_patch.data(), d_cand_score.data(), d_keys.data());
+            prof.mark(kEExtract);
+            cuda_check(cudaMemsetAsync(d_overlap_send.data(), 0, d_overlap_send.bytes(), stream),
+                       "overlap clear");
+            elem_overlap_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
+                d_patch_data_.data(), d_sub_offsets_.data(), d_covered_.data(),
+                d_cand_patch.data(), d_keys.data(), K, d_overlap_send.data());
+            prof.mark(kEOverlap);
+            if (size > 1) {
+                comm_.allreduce<stComm::Space::Device, DeltaWord>(
+                    d_overlap_send.data(), d_overlap_recv_buf.data(),
+                    static_cast<std::uint64_t>(K) * K, stComm::ReduceOp::Sum);
+            }
+            prof.mark(kEOverlapReduce);
+            elem_walk_kernel<<<1, kTopThreads, 0, stream>>>(
+                d_cand_patch.data(), d_cand_score.data(), d_keys.data(), d_overlap, K, N_,
+                d_recv, exchange ? size : 0, window,
+                d_accepted.data(), d_selected.data(), d_state.data(), d_winner.data());
+            prof.mark(kEWalk);
+            elem_build_accepted_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
+                d_patch_data_.data(), d_sub_offsets_.data(), d_covered_.data(),
+                d_cand_patch.data(), d_accepted.data(), K,
                 d_newly_ids.data(), d_winner.data());
             prof.mark(kEBuild);
-            fixed_set_bits_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
-                d_covered_.data(), d_newly_ids.data(), d_winner.data());
-            prof.mark(kESetBits);
+            restore_candidates_kernel<<<(K + kFixedBlockThreads - 1) / kFixedBlockThreads,
+                                        kFixedBlockThreads, 0, stream>>>(
+                d_cand_patch.data(), d_cand_score.data(), d_keys.data(), nullptr,
+                d_accepted.data(), K, d_scores_.data(), block_argmax.view());
+            prof.mark(kERestore);
             if (exchange) {
                 elem_delta_degrees_kernel<<<kFixedGridBlocks, kFixedBlockThreads, 0, stream>>>(
                     d_newly_ids.data(), d_winner.data(),

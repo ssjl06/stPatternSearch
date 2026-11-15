@@ -218,6 +218,36 @@ TEST(SolverEquivalence, DenseConflicts) {
     for (std::uint64_t seed : {1u, 2u}) run_case(2000, 1500, 8, 0.9, seed);
 }
 
+// ByElement rounds: candidate cap x delta exchange (forced on, with a window
+// small enough to need several steps per round, or off = the 1-rank path).
+TEST(SolverEquivalenceElem, CandidateCaps) {
+    const detail::UscElemTestHooks saved = detail::usc_elem_test_hooks();
+    for (bool exchange : {false, true}) {
+        for (std::uint64_t cap : {1u, 2u, 3u, 7u, 64u, 1024u}) {
+            for (std::uint64_t window : {0u, 5u}) {
+                if (!exchange && window) continue;
+                SCOPED_TRACE("exchange " + std::to_string(exchange) + " cap " +
+                             std::to_string(cap) + " window " + std::to_string(window));
+                detail::usc_elem_test_hooks() = {exchange, window, cap};
+                run_case(100, 50, 10, 0.3, 1, PartitionMode::ByElement);
+                run_case(1000, 200, 30, 0.7, 2, PartitionMode::ByElement);
+                run_case(1000, 200, 30, 0.1, 3, PartitionMode::ByElement);
+            }
+        }
+    }
+    detail::usc_elem_test_hooks() = saved;
+}
+
+TEST(SolverEquivalenceElem, DenseConflicts) {
+    const detail::UscElemTestHooks saved = detail::usc_elem_test_hooks();
+    for (bool exchange : {false, true}) {
+        detail::usc_elem_test_hooks() = {exchange, 0, 0};
+        for (std::uint64_t seed : {1u, 2u, 3u}) run_case(300, 400, 12, 0.95, seed, PartitionMode::ByElement);
+        for (std::uint64_t seed : {1u, 2u}) run_case(2000, 1500, 8, 0.9, seed, PartitionMode::ByElement);
+    }
+    detail::usc_elem_test_hooks() = saved;
+}
+
 TEST(UscPatchSelectorApi, RejectsGlobalIdCountMismatch) {
     // Every rank passes one ID short, so all throw before any collective.
     stComm::Comm& comm = test_helpers::comm();

@@ -95,6 +95,7 @@ namespace detail {
 struct UscElemTestHooks {
     bool          force_delta_exchange = false;
     std::uint64_t delta_window         = 0;   // 0 = sized automatically
+    std::uint64_t max_candidates       = 0;   // per round; 0 = sized automatically
 };
 UscElemTestHooks& usc_elem_test_hooks();
 }  // namespace detail
