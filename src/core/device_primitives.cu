@@ -58,6 +58,22 @@ __global__ void expand_owners_kernel(const u64* offsets, u64 M, u64 total, u64* 
     owners[i] = lo;
 }
 
+__global__ void add_scalar_kernel(u64* values, u64 n, u64 delta) {
+    const u64 i = static_cast<u64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) values[i] += delta;
+}
+
+__global__ void offsets_from_owners_kernel(const u64* owners, u64 total, u64 M, u64* offsets) {
+    const u64 p = static_cast<u64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (p > M) return;
+    u64 lo = 0, hi = total;  // first position with owner >= p
+    while (lo < hi) {
+        const u64 mid = lo + (hi - lo) / 2;
+        if (owners[mid] < p) lo = mid + 1; else hi = mid;
+    }
+    offsets[p] = lo;
+}
+
 }  // namespace
 
 int bits_for(u64 bound) {
@@ -130,6 +146,18 @@ void expand_owners(const u64* offsets, u64 M, u64 total, u64* owners) {
     if (total == 0) return;
     expand_owners_kernel<<<device_blocks_for(total), kDeviceBlock>>>(offsets, M, total, owners);
     cuda_launch_check("expand_owners_kernel");
+}
+
+void add_scalar(u64* values, u64 n, u64 delta) {
+    if (n == 0) return;
+    add_scalar_kernel<<<device_blocks_for(n), kDeviceBlock>>>(values, n, delta);
+    cuda_launch_check("add_scalar_kernel");
+}
+
+void offsets_from_sorted_owners(const u64* owners, u64 total, u64 M, u64* offsets) {
+    offsets_from_owners_kernel<<<device_blocks_for(M + 1), kDeviceBlock>>>(owners, total, M,
+                                                                          offsets);
+    cuda_launch_check("offsets_from_owners_kernel");
 }
 
 }  // namespace stPS::device

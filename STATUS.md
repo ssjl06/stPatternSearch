@@ -270,10 +270,36 @@ total, 2M patches (before → after):
 | 200 per patch, overlap 0.5 | 41.5 s → 37.2 s | 28.7 s → 20.0 s |
 | 32 per patch, overlap 0.9 | 8.2 s → 6.5 s | 9.7 s → 4.0 s |
 
-The loop itself is ~5 s on the first input (2528 steps; candidate extraction
-~1.3 ms of each ~2 ms step). The rest is setup, which in this mode still
-redistributes the incidences and builds the sub-CSR on the host — now the
-larger part, and what keeps the 200-per-patch input slow.
+The loop itself was ~5 s on the first input (2528 steps); the rest was this
+mode's host-side setup — moved to the device in the next section.
+
+### ByElement setup on the device + faster candidate extraction (2026-11)
+
+- **Setup.** The incidence redistribution and the sub-CSR build were the last
+  host stages of this mode. Shards are contiguous element ranges, so sorting
+  the (element, slot) pairs by element puts them in target-rank order: the
+  sorted arrays are the send buffers of two device-direct exchanges, and the
+  per-target counts are where the shard boundaries fall. On arrival two stable
+  radix passes order the pairs by (slot, element); the offsets are where each
+  slot's run starts. Only the M_global + 1 offsets return to the host, for the
+  initial-score sum over the ranks. Setup is now 99% device time.
+- **Extraction.** The K candidates of a round are K sequential argmaxes in one
+  kernel; each block-wide reduction is now one atomicMax per thread on a
+  packed (score, position) key instead of a 10-level tree with a barrier per
+  level (ByPatch: ~1.2 ms → ~0.54 ms per round; ByElement ~1.3 ms → ~0.74 ms).
+
+Verified 2026-11-15 on 2×A40 (`NCCL_P2P_DISABLE=1`): full suite at 1 and 2
+ranks + the 1M-patch scale test pass; selections identical. USC total, 2M
+patches (before → after):
+
+| input | mode | 1 rank | 2 ranks |
+|---|---|---|---|
+| 32 per patch, overlap 0.5 | ByPatch | 5.5 s → 4.2 s | 5.0 s → 4.0 s |
+| 32 per patch, overlap 0.5 | ByElement | 10.1 s → 4.4 s | 8.1 s → 4.4 s |
+| 200 per patch, overlap 0.5 | ByPatch | 6.9 s → 6.6 s | 4.3 s → 3.9 s |
+| 200 per patch, overlap 0.5 | ByElement | 38.0 s → 5.9 s | 19.7 s → 5.2 s |
+| 32 per patch, overlap 0.9 | ByPatch | 1.6 s → 1.5 s | 1.9 s → 1.6 s |
+| 32 per patch, overlap 0.9 | ByElement | 6.2 s → 1.4 s | 4.7 s → 1.8 s |
 
 ### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
 

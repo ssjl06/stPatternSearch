@@ -3,6 +3,7 @@
 #include "core/collective.hpp"
 #include "core/cuda_check.hpp"
 #include "core/host_profiler.hpp"
+#include "core/device_primitives.hpp"
 #include "core/hash_id_map_device.hpp"
 #include "core/inverted_index_device.hpp"
 
@@ -148,44 +149,37 @@ __global__ void block_max_refresh_kernel(const WireScore* scores, std::uint64_t 
     }
 }
 
-constexpr int kTopThreads = 1024;   // one CUDA block; power of two
+constexpr int kTopThreads = 1024;   // one CUDA block
 
-// Run by ONE CUDA block of kTopThreads threads: the maximum of
-// values[lo, hi), first position among equals. On return thread 0 holds it in
-// s_val[0] / s_arg[0] (kNoPosition for an empty range).
-__device__ inline void reduce_range_max(const WireScore* values, std::uint64_t lo,
-                                        std::uint64_t hi, WireScore* s_val, int* s_arg) {
-    const unsigned int tid = threadIdx.x;
-    WireScore best = kLowestScore;
-    int       pos  = kNoPosition;
-    for (std::uint64_t i = lo + tid; i < hi; i += kTopThreads) {
-        const WireScore v = values[i];
-        if (v > best) { best = v; pos = static_cast<int>(i); }
-    }
-    s_val[tid] = best;
-    s_arg[tid] = pos;
-    __syncthreads();
-    for (unsigned int half = kTopThreads / 2; half > 0; half >>= 1) {
-        if (tid < half) {
-            const WireScore ov = s_val[tid + half];
-            const int       oa = s_arg[tid + half];
-            if (ov > s_val[tid] || (ov == s_val[tid] && oa < s_arg[tid])) {
-                s_val[tid] = ov;
-                s_arg[tid] = oa;
-            }
-        }
-        __syncthreads();
-    }
+// (score, position) packed so that the larger key is the larger score and,
+// among equal scores, the smaller position. 0 never encodes a real entry
+// (positions stay below 2^31), so it stands for "nothing".
+__device__ inline unsigned long long pack_max_key(WireScore score, std::uint64_t pos) {
+    const unsigned long long biased = static_cast<std::uint32_t>(score) ^ 0x80000000u;
+    return (biased << 32) | (0xFFFFFFFFull - pos);
+}
+__device__ inline WireScore max_key_score(unsigned long long key) {
+    return static_cast<WireScore>(static_cast<std::uint32_t>(key >> 32) ^ 0x80000000u);
+}
+__device__ inline int max_key_position(unsigned long long key) {
+    return static_cast<int>(0xFFFFFFFFull - (key & 0xFFFFFFFFull));
 }
 
-// Second argmax stage: the maximum over the block maxima; thread 0 ends up
-// with the winning score and PATCH (via block_arg). The loops fuse this into
-// the kernel that consumes the winner, saving a launch per step — the loops
-// are bound by launches as much as by GPU work.
-__device__ inline void reduce_block_maxima(const MaxBlocks& t, std::uint64_t num_blocks,
-                                           WireScore* s_val, int* s_arg) {
-    reduce_range_max(t.block_val, 0, num_blocks, s_val, s_arg);
-    if (threadIdx.x == 0 && s_arg[0] != kNoPosition) s_arg[0] = t.block_arg[s_arg[0]];
+// Run by every thread of ONE CUDA block: the maximum of values[lo, hi), first
+// position among equals, left in *s_key (shared; 0 for an empty range). One
+// atomic per thread instead of a reduction tree: the candidate extraction
+// calls this twice per candidate, and the tree's barriers dominated it.
+__device__ inline void reduce_range_max(const WireScore* values, std::uint64_t lo,
+                                        std::uint64_t hi, unsigned long long* s_key) {
+    if (threadIdx.x == 0) *s_key = 0;
+    __syncthreads();
+    unsigned long long best = 0;
+    for (std::uint64_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const unsigned long long k = pack_max_key(values[i], i);
+        if (k > best) best = k;
+    }
+    if (best) atomicMax(s_key, best);
+    __syncthreads();
 }
 
 // ---------------------------------------------------------------------------
@@ -419,21 +413,22 @@ __global__ void extract_candidates_kernel(WireScore* scores, std::uint64_t M,
                                                 unsigned int K, int my_rank,
                                                 int* cand_patch, WireScore* cand_score,
                                                 std::uint64_t* key_segment) {
-    __shared__ WireScore s_val[kTopThreads];
-    __shared__ int       s_arg[kTopThreads];
-    __shared__ int       s_patch;   // patch just set aside, -1 = no more candidates
+    __shared__ unsigned long long s_key;
+    __shared__ int                s_patch;   // patch just set aside, -1 = no more candidates
     const unsigned int tid = threadIdx.x;
     if (tid == 0 && blocks.count) *blocks.count = 0;   // the refresh before this consumed the queue
     unsigned int j = 0;
     for (; j < K; ++j) {
-        reduce_block_maxima(blocks, num_blocks, s_val, s_arg);
+        // Second argmax stage: the best block maximum, first block among equals.
+        reduce_range_max(blocks.block_val, 0, num_blocks, &s_key);
         if (tid == 0) {
             s_patch = -1;
-            if (num_blocks && s_val[0] > 0) {
-                const int p = s_arg[0];
+            const WireScore score = s_key ? max_key_score(s_key) : 0;
+            if (score > 0) {
+                const int p = blocks.block_arg[max_key_position(s_key)];
                 cand_patch[j]  = p;
-                cand_score[j]  = s_val[0];
-                key_segment[j] = pack_candidate_key(s_val[0], my_rank, j);
+                cand_score[j]  = score;
+                key_segment[j] = pack_candidate_key(score, my_rank, j);
                 scores[p]      = kDisabledWireScore;
                 s_patch        = p;
             }
@@ -444,10 +439,10 @@ __global__ void extract_candidates_kernel(WireScore* scores, std::uint64_t M,
         const std::uint64_t lo = b << blocks.shift;
         std::uint64_t hi = lo + (std::uint64_t{1} << blocks.shift);
         if (hi > M) hi = M;
-        reduce_range_max(scores, lo, hi, s_val, s_arg);
+        reduce_range_max(scores, lo, hi, &s_key);
         if (tid == 0) {
-            blocks.block_val[b] = s_val[0];
-            blocks.block_arg[b] = s_arg[0];
+            blocks.block_val[b] = max_key_score(s_key);
+            blocks.block_arg[b] = max_key_position(s_key);
         }
         __syncthreads();
     }
@@ -770,9 +765,9 @@ __global__ void elem_build_accepted_kernel(const ElementId*     patch_data,
     }
 }
 
-// Host-side owner of the block maxima over one score array. Per step the
-// loops enqueue refresh() and then their own kernel that runs
-// reduce_block_maxima over num_blocks().
+// Host-side owner of the block maxima over one score array. Per round the
+// loops enqueue refresh() and then extract_candidates_kernel over
+// num_blocks().
 class BlockArgmax {
 public:
     BlockArgmax(const WireScore* d_scores, std::uint64_t M) : d_scores_(d_scores), M_(M) {
@@ -1166,22 +1161,12 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     detail::PhaseTimer phases;
 
     // Shared §5.1 preprocessing: hash → dense ElementId translation.
-    // The mapping runs on the device; the translated patches come back as a
-    // host CSR for the redistribution below (still host-side).
-    PatchCsr id_csr;
-    {
-        DeviceIdMappedPatches mapped =
-            map_hashes_to_element_ids_device(comm_, std::move(raw_patches));
-        N_ = mapped.N;
-        phases.mark("hash->id map (detailed above)", W::Device);
-        id_csr.offsets.resize(mapped.M_local + 1);
-        mapped.offsets.copy_to_host(id_csr.offsets.data(), id_csr.offsets.size());
-        id_csr.data.resize(mapped.data.size());
-        if (!id_csr.data.empty()) {
-            mapped.data.copy_to_host(id_csr.data.data(), id_csr.data.size());
-        }
-        phases.mark("id patches download", W::Transfer);
-    }
+    // The translated patches stay on the device (a CSR over this rank's
+    // patches); everything up to the loop works on them there.
+    DeviceIdMappedPatches mapped =
+        map_hashes_to_element_ids_device(comm_, std::move(raw_patches));
+    N_ = mapped.N;
+    phases.mark("hash->id map (detailed above)", W::Device);
 
     // ---- Global slot assignment (rank-major input order) --------------------
     // Slot of local patch p on rank r = (Σ M_local below r) + p. With
@@ -1189,7 +1174,7 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     // order, so the smallest-slot tie-break in select() matches
     // brute_force_select's smallest-PatchId rule (and ByPatch's
     // smallest-rank-then-smallest-local-index MAXLOC rule).
-    const std::uint64_t M_local = id_csr.M();
+    const std::uint64_t M_local = mapped.M_local;
     std::uint64_t slot_start = 0;
     comm_.exscan<stComm::Space::Host>(M_local, &slot_start, stComm::ReduceOp::Sum)->wait();
     std::uint64_t M_global = (rank == size - 1) ? slot_start + M_local : 0;
@@ -1225,95 +1210,95 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 
     phases.mark("slot assignment", W::HostComm);
 
-    // ---- Incidence redistribution --------------------------------------------
+    // ---- Incidence redistribution (device) -----------------------------------
     // Every (slot, element) incidence flies to the element's owner shard. Each
     // rank then holds, for ALL M_global patches, the sub-list inside its shard —
     // every incidence stored on exactly one rank (M·K/P per rank), tighter than
     // §7.5's conservative full patch replication.
+    //
+    // Shards are contiguous element ranges, so sorting the pairs by element
+    // lays them out in target-rank order: the sorted arrays ARE the send
+    // buffers, and the per-target counts are where the shard boundaries fall.
+    // 64-bit counts throughout (stComm's size_t-count exchange): a rank's
+    // incidences pass INT_MAX on a full-chip input.
     const auto usize = static_cast<std::size_t>(size);
-    const auto owner_of = [shard_size](ElementId e) {
-        return shard_size ? static_cast<std::size_t>(e / shard_size) : std::size_t{0};
-    };
-    // Counted in 64 bits and shipped with stComm's size_t-count exchange: a
-    // rank's incidences pass INT_MAX on a full-chip input, and nothing here
-    // caps them.
+    const std::uint64_t total_send = mapped.data.size();
+    DeviceBuffer<ElementId> d_send_elems = std::move(mapped.data);
+    DeviceBuffer<PatchId>   d_send_slots(total_send);
+    device::expand_owners(mapped.offsets.data(), M_local, total_send, d_send_slots.data());
+    device::add_scalar(d_send_slots.data(), total_send, slot_start);   // local patch → slot
+    cuda_sync_check("slot expansion");   // mapped.offsets is released next
+    mapped.offsets = DeviceBuffer<std::uint64_t>();
+    device::sort_pairs(d_send_elems, d_send_slots, device::bits_for(N_));
+
     std::vector<std::size_t> sendcounts(usize, 0);
-    for (ElementId e : id_csr.data) ++sendcounts[owner_of(e)];
-
-    // Exchange the counts so every rank learns its recv counts.
-    const ExchangeCounts counts = exchange_counts(comm_, std::move(sendcounts));
-
-    std::vector<std::size_t> cursor(usize, 0);  // per-target write head
-    for (std::size_t r = 1; r < usize; ++r) cursor[r] = cursor[r - 1] + counts.send[r - 1];
-    const std::size_t total_send =
-        std::accumulate(counts.send.begin(), counts.send.end(), std::size_t{0});
-    std::vector<PatchId>   send_slots(total_send);
-    std::vector<ElementId> send_elems(total_send);
-    for (std::uint64_t p = 0; p < M_local; ++p) {
-        const PatchId slot = slot_start + p;
-        for (ElementId e : id_csr.patch(p)) {
-            const std::size_t at = cursor[owner_of(e)]++;
-            send_slots[at] = slot;
-            send_elems[at] = e;
+    if (size > 1) {
+        std::vector<std::uint64_t> bounds(usize - 1), pos(usize - 1);
+        for (std::size_t r = 1; r < usize; ++r) bounds[r - 1] = r * shard_size;
+        DeviceBuffer<std::uint64_t> d_bounds(usize - 1), d_pos(usize - 1);
+        d_bounds.copy_from_host(bounds.data(), usize - 1);
+        device::lower_bound(d_send_elems.data(), total_send, d_bounds.data(), usize - 1,
+                            d_pos.data());
+        d_pos.copy_to_host(pos.data(), usize - 1);
+        std::uint64_t prev = 0;
+        for (std::size_t r = 0; r + 1 < usize; ++r) {
+            sendcounts[r] = pos[r] - prev;
+            prev = pos[r];
         }
+        sendcounts[usize - 1] = total_send - prev;
+    } else {
+        sendcounts[0] = total_send;
     }
-    id_csr = PatchCsr{};
-
-    // Ship the incidences as two parallel alltoallv's sharing one count layout.
+    const ExchangeCounts counts = exchange_counts(comm_, std::move(sendcounts));
     const std::size_t total_recv =
         std::accumulate(counts.recv.begin(), counts.recv.end(), std::size_t{0});
 
-    std::vector<PatchId>   recv_slots(total_recv);
-    std::vector<ElementId> recv_elems(total_recv);
-    comm_.alltoallv<stComm::Space::Host, PatchId>(send_slots.data(), counts.send.data(),
-                                                  recv_slots.data(), counts.recv.data())->wait();
-    comm_.alltoallv<stComm::Space::Host, ElementId>(send_elems.data(), counts.send.data(),
-                                                    recv_elems.data(), counts.recv.data())->wait();
-    send_slots.clear(); send_slots.shrink_to_fit();
-    send_elems.clear(); send_elems.shrink_to_fit();
+    // Two device-direct exchanges sharing one count layout.
+    DeviceBuffer<ElementId> d_elems(total_recv);
+    DeviceBuffer<PatchId>   d_slots(total_recv);
+    cuda_sync_check("pre incidence exchange");   // kernel outputs visible before NCCL reads
+    comm_.alltoallv<stComm::Space::Device, ElementId>(d_send_elems.data(), counts.send.data(),
+                                                      d_elems.data(), counts.recv.data())->wait();
+    comm_.alltoallv<stComm::Space::Device, PatchId>(d_send_slots.data(), counts.send.data(),
+                                                    d_slots.data(), counts.recv.data())->wait();
+    d_send_elems = DeviceBuffer<ElementId>();
+    d_send_slots = DeviceBuffer<PatchId>();
+    phases.mark("incidence redistribution", W::Device);
 
-    phases.mark("incidence redistribution", W::HostComm);
-
-    // ---- Shard-local sub-CSR over all M_global patches -----------------------
+    // ---- Shard-local sub-CSR over all M_global patches (device) ---------------
     // Store SHARD-LOCAL element IDs (global − shard_base_): the covered bitset
     // and every kernel then index the local shard exactly like ByPatch indexes
     // the full universe. Incidences are globally unique, so no dedupe needed.
-    struct Incidence { PatchId slot; ElementId elem; };
-    std::vector<Incidence> inc(total_recv);
-    for (std::size_t i = 0; i < total_recv; ++i)
-        inc[i] = { recv_slots[i], recv_elems[i] - shard_base_ };
-    recv_slots.clear(); recv_slots.shrink_to_fit();
-    recv_elems.clear(); recv_elems.shrink_to_fit();
-    std::sort(inc.begin(), inc.end(), [](const Incidence& a, const Incidence& b) {
-        return a.slot != b.slot ? a.slot < b.slot : a.elem < b.elem;
-    });
+    // Two stable passes — by element, then by slot — order them by
+    // (slot, element); the offsets are where each slot's run starts.
+    device::add_scalar(d_elems.data(), total_recv, std::uint64_t{0} - shard_base_);
+    device::sort_pairs(d_elems, d_slots, device::bits_for(shard_extent_));
+    device::sort_pairs(d_slots, d_elems, device::bits_for(M_global_));
+    d_sub_offsets_.resize(M_global_ + 1);
+    device::offsets_from_sorted_owners(d_slots.data(), total_recv, M_global_,
+                                       d_sub_offsets_.data());
+    cuda_sync_check("sub-CSR offsets");   // d_slots is released next
+    d_slots = DeviceBuffer<PatchId>();
+    d_patch_data_ = std::move(d_elems);
+    phases.mark("sub-CSR build", W::Device);
 
-    PatchCsr sub;
-    sub.offsets.assign(M_global_ + 1, 0);
-    sub.data.resize(total_recv);
-    for (const Incidence& x : inc) ++sub.offsets[x.slot + 1];
-    for (std::uint64_t s = 0; s < M_global_; ++s) sub.offsets[s + 1] += sub.offsets[s];
-    for (std::size_t i = 0; i < inc.size(); ++i) sub.data[i] = inc[i].elem;
-    inc.clear(); inc.shrink_to_fit();
-
-    phases.mark("sub-CSR build", W::Host);
-
-    // ---- Device mirrors + algorithm state -------------------------------------
     // Shard-local inverted index (keys are shard-local IDs, values are global
-    // slots) — drives the strategy-A partial-score update. Built on the device.
+    // slots) — drives the score updates.
     {
-        DeviceInvertedIndex inv =
-            build_inverted_index_device(sub, shard_extent_ ? shard_extent_ : 1);
+        DeviceInvertedIndex inv = build_inverted_index_device(
+            d_patch_data_.data(), d_sub_offsets_.data(), M_global_, total_recv,
+            shard_extent_ ? shard_extent_ : 1);
         num_inv_keys_  = inv.num_keys;
         d_inv_keys_    = std::move(inv.keys);
         d_inv_offsets_ = std::move(inv.offsets);
         d_inv_data_    = std::move(inv.data);
     }
     phases.mark("inverted index build", W::Device);
-    if (!sub.data.empty()) {
-        d_patch_data_.resize(sub.data.size());
-        d_patch_data_.copy_from_host(sub.data.data(), sub.data.size());
-    }
+
+    // The sub-patch lengths, back on the host once (M_global + 1 offsets): the
+    // initial scores are summed over the ranks there.
+    std::vector<std::uint64_t> sub_offsets(M_global_ + 1);
+    d_sub_offsets_.copy_to_host(sub_offsets.data(), sub_offsets.size());
 
     d_scores_.resize(M_global_);
     max_sub_len_ = 0;
@@ -1323,14 +1308,10 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
         // bounds the newly-covered scratch for the whole solve.
         std::vector<WireScore> init(M_global_);
         for (std::uint64_t s = 0; s < M_global_; ++s) {
-            const std::uint64_t len = sub.offsets[s + 1] - sub.offsets[s];
+            const std::uint64_t len = sub_offsets[s + 1] - sub_offsets[s];
             init[s] = static_cast<WireScore>(len);
             max_sub_len_ = std::max(max_sub_len_, len);
         }
-        // Offsets mirror — the commit kernel resolves winner ranges on device,
-        // so the host never touches the sub-CSR during the loop.
-        d_sub_offsets_.resize(sub.offsets.size());
-        d_sub_offsets_.copy_from_host(sub.offsets.data(), sub.offsets.size());
 
         // Full initial scores, replicated on every rank: one host allreduce of
         // the per-shard slices, in int64 so the int32 fit can be proven
@@ -1366,7 +1347,7 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 
     d_covered_.resize((shard_extent_ + 63) / 64);
     d_covered_.zero();
-    phases.mark("upload + initial scores", W::Transfer);
+    phases.mark("initial scores", W::HostComm);
 
     PatchSelection result = select();
     phases.mark("greedy loop", W::Device);
