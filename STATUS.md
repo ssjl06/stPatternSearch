@@ -117,29 +117,54 @@ tests/
 | NCCL | system (`libnccl-dev`) | required at runtime for the hot-path bcast |
 | GoogleTest | system (`libgtest-dev`) for stComm; FetchContent 1.15.2 for stPS | |
 
-### Per-iteration flow (ByPatch, device-resident)
+### ByPatch loop: several selections per round (device-resident)
 
-The host enqueues batches of up to 128 iterations on the NCCL stream and reads
-24 B of loop state per batch. Nothing crosses to the host inside an iteration.
+The host enqueues batches of rounds on the NCCL stream and reads 24 B of loop
+state per batch. A round takes the K best patches at once — ordered by (score
+descending, rank ascending, local patch ascending), the order greedy breaks
+ties in — and walks them in that order:
+
+- A candidate sharing no still-uncovered element with the patches accepted so
+  far this round keeps its score; every other score can only have dropped, so
+  it is the patch greedy would pick next. Accept.
+- A candidate that shares some is skipped; the largest score a skipped
+  candidate can still have is remembered.
+- When that bound reaches the next candidate's score, the round ends.
+
+The accepted patches, in order, are exactly sequential greedy's selections.
 
 | Step | Where |
 |---|---|
-| CUB ArgMax over local scores → 64-bit key `(score << 32) \| (2^32-1 − rank)` | device |
-| `ncclAllReduce<MAX>` of the key (1 element) — winner score + rank, ties → lowest rank | device |
-| commit kernel: loop state on every rank; the winner resolves its patch range, disables it | device |
-| winner compacts its still-uncovered elements into the payload | device |
-| `ncclAllReduce<SUM>` of the payload (`bound + 1` elements; only the winner's is non-zero) | device |
-| record selected patch, set_bits, strategy-A score update | device |
+| refresh block maxima; extract this rank's K best (scores parked) | device |
+| `ncclAllReduce<SUM>` of P segments × K keys | device |
+| merge → K best overall; owners write their candidates' uncovered elements | device |
+| `ncclAllReduce<SUM>` of K slots × (bound + 2) words | device |
+| walk (accept / skip / end), restore unselected scores, strategy-A score update | device |
 
-`bound` is the previous batch's last winner score (winner scores never
-increase), so every list of a batch fits. size == 1 skips both collectives.
-Scores are int32 on the device (a patch holds at most INT_MAX elements).
+Two collectives per round, as the one-selection loop had per selection. `bound`
+is the previous batch's last accepted score; K is as many candidates as fit a
+32768-word payload at that bound (at most 256). size == 1 skips both
+collectives. Scores are int32 on the device (a patch holds at most INT_MAX
+elements).
 
-**Verification (2026-11-13, 2×A40, `NCCL_P2P_DISABLE=1`):** full suite at 1 and
-2 ranks plus the 1M-patch scale tests pass; selections are identical to the
-previous host-driven loop at both rank counts (200k and 2M patches). 2M patches:
-1 rank 53.6 s → 28.3 s, 2 ranks 51.9 s → 31.1 s. Not yet run beyond 2 ranks or
-on NVLink hardware.
+Tests cap K at 1, 2, 3, 7, 64, 1024 (`detail::usc_patch_test_hooks`) against
+the brute-force reference, plus dense-conflict inputs where most candidates
+are skipped.
+
+Verified 2026-11-15 on 2×A40 (`NCCL_P2P_DISABLE=1`): full suite at 1 and 2
+ranks + the 1M-patch scale test pass; selections identical to the
+one-selection loop. USC ByPatch total, 2M patches (before → after):
+
+| input | 1 rank | 2 ranks |
+|---|---|---|
+| 32 per patch, overlap 0.5 | 19.6 s → 5.5 s | 31.3 s → 5.4 s |
+| 200 per patch, overlap 0.5 | 11.0 s → 7.0 s | 9.7 s → 4.3 s |
+| 32 per patch, overlap 0.9 | 3.9 s → 1.7 s | 5.9 s → 2.0 s |
+
+The first input runs 2528 rounds for 638530 selections (≈253 per round). The
+loop is now bound by GPU work, not by launches: ~1.7 ms per round, of which
+the sequential K-fold candidate extraction is ~1.2 ms — the next thing to
+speed up. Not yet run beyond 2 ranks or on NVLink hardware.
 
 ## M6 architecture (`PartitionMode::ByElement`, opt-in)
 
