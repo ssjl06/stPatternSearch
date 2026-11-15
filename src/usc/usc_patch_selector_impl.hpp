@@ -53,12 +53,13 @@ public:
     // `comm` must be a device-enabled Comm (Comm::onDevice).
     explicit UscPatchSelectorImpl(stComm::Comm& comm);
 
-    // Full pipeline: build the shared PatchSet from this rank's `raw_patches`,
-    // then run the distributed greedy select. `global_ids` gives the global
-    // PatchId of each local patch (index-aligned to raw_patches). **Collective** —
+    // Full pipeline: build the shared PatchSet from this rank's patches (flat:
+    // `hashes` patch after patch + CSR `offsets`), then run the distributed
+    // greedy select. `global_ids` gives the global PatchId of each local patch. **Collective** —
     // every rank must call together; all ranks return the same PatchSelection.
-    PatchSelection patch_select(std::vector<std::vector<Hash>> raw_patches,
-                                std::vector<PatchId>           global_ids);
+    PatchSelection patch_select(std::vector<Hash>          hashes,
+                                std::vector<std::uint64_t> offsets,
+                                std::vector<PatchId>       global_ids);
 
     // Print result to stdout; only the root rank actually writes anything.
     void print_selection(const PatchSelection& r) const;
@@ -127,8 +128,9 @@ public:
     explicit UscElemPatchSelectorImpl(stComm::Comm& comm);
 
     // Same collective contract as UscPatchSelectorImpl::patch_select.
-    PatchSelection patch_select(std::vector<std::vector<Hash>> raw_patches,
-                                std::vector<PatchId>           global_ids);
+    PatchSelection patch_select(std::vector<Hash>          hashes,
+                                std::vector<std::uint64_t> offsets,
+                                std::vector<PatchId>       global_ids);
 
 private:
     // Greedy main loop over the element-sharded state built by patch_select().

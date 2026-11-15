@@ -32,10 +32,14 @@ public:
     // coordinate-less file on every rank at once.
     virtual bool has_coords() = 0;
 
-    // Read patches [begin, end) plus their global IDs. Not collective — each
-    // rank calls independently with its own range. Throws std::runtime_error
-    // on I/O errors or a corrupt file.
-    virtual PatchSlice read_slice(std::uint64_t begin, std::uint64_t end) = 0;
+    // Read patches [begin, end) plus their global IDs, in flat form (offsets
+    // rebased to start at 0; coords empty when the file has none). Not
+    // collective — each rank calls independently with its own range. Throws
+    // std::runtime_error on I/O errors or a corrupt file.
+    virtual FlatPatches read_flat(std::uint64_t begin, std::uint64_t end) = 0;
+
+    // The same patches as one vector per patch (split from read_flat).
+    PatchSlice read_slice(std::uint64_t begin, std::uint64_t end);
 };
 
 // Open a patch file, sniffing the format by its magic. Throws
@@ -46,6 +50,7 @@ std::unique_ptr<PatchReader> open_patch_file(const std::string& path);
 // count — the same split slice_patches_by_rank applies in memory, so file
 // input and in-memory input give identical rank slices). Not collective.
 PatchSlice read_rank_slice(PatchReader& reader, int rank, int size);
+FlatPatches read_rank_flat(PatchReader& reader, int rank, int size);
 
 // Write the v1 .stps binary CSR file (format documented in stps_binary.cpp).
 // Overwrites `path`. Throws std::runtime_error on I/O failure.

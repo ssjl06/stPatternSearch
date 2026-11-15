@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stPS/partition.hpp>
 #include <stPS/types.hpp>
 
 #include <cstdint>
@@ -74,6 +75,13 @@ public:
     // offending rank only, so a caller must treat it as fatal for the job.
     PatchSelection patch_select(std::vector<std::vector<Hash>> patches,
                                 std::vector<PatchId>           global_ids);
+
+    // Same, from the flat form (see FlatPatches in <stPS/partition.hpp>):
+    // `patches.global_ids` must hold one ID per patch, `patches.coords` is
+    // ignored. Prefer this when the data already is flat (a patch file is):
+    // the nested form above is flattened on the host first. A malformed
+    // `offsets` array throws std::invalid_argument like an ID count mismatch.
+    PatchSelection patch_select(FlatPatches patches);
 
 private:
     struct Impl;

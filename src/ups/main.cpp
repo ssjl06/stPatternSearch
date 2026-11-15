@@ -152,16 +152,16 @@ int main(int argc, char** argv) {
             // Unique-hash-only mode: the distributed hash sort plus a parallel
             // write. Host-only — no GPU, no NCCL bootstrap, no coordinates.
             stComm::Comm comm;
-            auto slice = !opt.input.empty()
-                ? stPS::read_rank_slice(*stPS::open_patch_file(opt.input),
-                                        comm.getRank(), comm.getSize())
-                : stPS::slice_patches_by_rank(generate_synthetic(opt.params),
-                                              comm.getRank(), comm.getSize());
+            stPS::FlatPatches slice = !opt.input.empty()
+                ? stPS::read_rank_flat(*stPS::open_patch_file(opt.input),
+                                       comm.getRank(), comm.getSize())
+                : stPS::flatten_patches(stPS::slice_patches_by_rank(
+                      generate_synthetic(opt.params), comm.getRank(), comm.getSize()));
 
             auto t0 = std::chrono::steady_clock::now();
             const std::uint64_t n_unique =
                 stPS::write_unique_hashes_file(comm, opt.unique_hashes,
-                                               std::move(slice.patches));
+                                               std::move(slice.hashes));
             auto t1 = std::chrono::steady_clock::now();
 
             if (comm.getRank() == 0) {
@@ -189,23 +189,24 @@ int main(int argc, char** argv) {
             // onDevice bootstraps NCCL internally (uniqueId handshake + init).
             stComm::Comm comm = stComm::Comm::onDevice(device_id);
 
-            auto slice = !opt.input.empty()
-                ? stPS::read_rank_slice(*stPS::open_patch_file(opt.input),
-                                        comm.getRank(), comm.getSize())
+            // Either way the slice is flat: a file is read straight into that
+            // form, and the hashes go to the GPU once.
+            stPS::FlatPatches slice = !opt.input.empty()
+                ? stPS::read_rank_flat(*stPS::open_patch_file(opt.input),
+                                       comm.getRank(), comm.getSize())
                 : [&] {
                       auto patches = generate_synthetic(opt.params);
                       auto coords  = generate_synthetic_coords(opt.params, patches);
-                      return stPS::slice_patches_by_rank(std::move(patches), std::move(coords),
-                                                         comm.getRank(), comm.getSize());
+                      return stPS::flatten_patches(
+                          stPS::slice_patches_by_rank(std::move(patches), std::move(coords),
+                                                      comm.getRank(), comm.getSize()));
                   }();
 
             auto t0 = std::chrono::steady_clock::now();
             // The whole library API: build a UpsPatternStats on the comm, hand
             // it this rank's patches + occurrence coords, get the top-K back.
             stPS::UpsPatternStats ups(comm);
-            const auto topk = ups.pattern_stats(std::move(slice.patches),
-                                                std::move(slice.coords),
-                                                opt.output_limit,
+            const auto topk = ups.pattern_stats(std::move(slice), opt.output_limit,
                                                 opt.unique_hashes);
             stPS::write_pattern_stats_file(comm, opt.output, topk);
             auto t1 = std::chrono::steady_clock::now();

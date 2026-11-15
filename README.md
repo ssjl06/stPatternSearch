@@ -123,6 +123,25 @@ std::vector<stPS::PatternStat> top =            // {hash, count, rep (x,y)},
 stPS::write_pattern_stats_file(comm, "stats.txt", top);
 ```
 
+Both entry points also take the flat (CSR) form, `stPS::FlatPatches` — one
+array of hashes, patch after patch, plus the offsets where each patch starts:
+
+```cpp
+stPS::FlatPatches flat;          // patch p = hashes[offsets[p] .. offsets[p+1])
+flat.hashes     = ...;           // every occurrence, patch after patch
+flat.offsets    = ...;           // patch_count + 1 entries: 0 ... hashes.size()
+flat.global_ids = ...;           // one per patch (USC)
+flat.coords     = ...;           // one per hash (UPS)
+
+stPS::PatchSelection r = selector.patch_select(std::move(flat));
+// or: ups.pattern_stats(std::move(flat), /*k=*/100);
+```
+
+Prefer it when the data already is flat (a patch file is laid out this way, and
+the CLI tools read it so): the hashes go to the GPU in one upload, with no
+per-patch allocation and no second copy on the host. The nested form is
+flattened on the host first. `stPS::flatten_patches(slice)` converts.
+
 All algorithm internals (CSR, inverted index, device buffers, CUDA kernels) are
 hidden behind a pImpl — the public headers (`include/stPS/`) pull in no
 MPI/NCCL/CUDA.

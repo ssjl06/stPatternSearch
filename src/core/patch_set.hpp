@@ -2,6 +2,7 @@
 
 #include "core/csr.hpp"
 #include "core/device_buffer.hpp"
+#include "core/hash_id_map_device.hpp"
 #include <stPS/types.hpp>
 
 #include <cstddef>
@@ -33,6 +34,20 @@ struct IdMappedPatches {
     std::vector<Hash> shard_hashes;
     std::uint64_t     shard_start = 0;
 };
+
+// The distributed part of the mapping on its own (§5.1 steps 1–9): which ID
+// each of this rank's distinct hashes got, and this rank's shard.
+struct HostHashIds {
+    std::vector<Hash>          local_hashes;  // this rank's distinct hashes, sorted
+    std::vector<std::uint64_t> local_ids;     // local_ids[i] is the ID of local_hashes[i]
+    std::uint64_t              N = 0;
+    std::vector<Hash>          shard_hashes;  // as in IdMappedPatches
+    std::uint64_t              shard_start = 0;
+};
+
+// Collective, host-only. `hashes` is this rank's hash occurrences in any
+// order, duplicates allowed.
+HostHashIds assign_hash_ids(stComm::Comm& comm, std::vector<Hash> hashes);
 
 // Collective: distributed sample-sort hash → ID mapping (§5.1 steps 1–11).
 // Every rank must call together with its own local patches.
@@ -80,7 +95,16 @@ enum class PatchSetMirrors {
 
 class PatchSet {
 public:
-    // Collective: every rank must construct together with its own local patches.
+    // Collective: every rank must construct together with its own local
+    // patches — as device arrays (hashes patch after patch + CSR offsets of
+    // M + 1 entries; both consumed), as the same two arrays on the host
+    // (`offsets` may be empty for "no patches"), or as one vector per patch.
+    PatchSet(stComm::Comm& comm, DeviceBuffer<Hash> d_hashes,
+             DeviceBuffer<std::uint64_t> d_offsets, std::uint64_t M,
+             PatchSetMirrors mirrors = PatchSetMirrors::All);
+    PatchSet(stComm::Comm& comm, const std::vector<Hash>& hashes,
+             const std::vector<std::uint64_t>& offsets,
+             PatchSetMirrors mirrors = PatchSetMirrors::All);
     PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches,
              PatchSetMirrors mirrors = PatchSetMirrors::All);
 
@@ -116,6 +140,8 @@ public:
     const PatchId*       d_inv_data()      const noexcept { return d_inv_data_.data(); }
 
 private:
+    PatchSet(stComm::Comm& comm, DeviceIdMappedPatches mapped, PatchSetMirrors mirrors);
+
     std::uint64_t              M_local_ = 0;
     std::uint64_t              N_ = 0;
     std::uint64_t              num_inv_keys_ = 0;

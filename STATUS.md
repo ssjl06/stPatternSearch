@@ -301,6 +301,21 @@ patches (before → after):
 | 32 per patch, overlap 0.9 | ByPatch | 1.6 s → 1.5 s | 1.9 s → 1.6 s |
 | 32 per patch, overlap 0.9 | ByElement | 6.2 s → 1.4 s | 4.7 s → 1.8 s |
 
+### Flat input (2026-11)
+
+Every entry point takes `FlatPatches` (hashes patch after patch + CSR offsets;
+`<stPS/partition.hpp>`) next to the one-vector-per-patch form:
+`UscPatchSelector::patch_select`, `UpsPatternStats::pattern_stats`, and
+`write_unique_hashes_file` (which needs only the hash array). The `.stps`
+reader fills a `FlatPatches` straight from the file (`read_flat`), and both CLI
+tools use that path.
+
+With flat input nothing is copied or re-shaped on the host: the hashes are
+uploaded once (UPS hands the same device buffer on to the PatchSet instead of
+uploading them twice), and the per-patch host stages are gone — the phase
+timers of a file-driven UPS run show no host phase at all, only the upload.
+The nested overloads flatten on the host and then take the same path.
+
 ### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
 
 Because ByElement's one collective has a fixed count and no root (the exact
