@@ -59,8 +59,8 @@ std::vector<Hash> splitters_from_sample(stComm::Comm& comm, std::vector<Hash> lo
 // every patch algorithm (USC greedy set-cover, UPS pattern counting, ...) builds
 // on. Given each rank's patches as lists of Hash, it performs the distributed
 // hash → dense ElementId mapping (sample-sort, design doc §5.1) and builds the
-// structures the algorithms consume: a PatchCsr (patches in ElementId space) and
-// its sparse InvertedIndex, plus their device mirrors and the global universe N.
+// structures the algorithms consume, in device memory: the patches as a CSR in
+// ElementId space and its sparse inverted index, plus the global universe N.
 //
 // It holds NO algorithm state (no scores/covered) and NO per-patch application
 // metadata: the local patch index [0, M_local) is preserved in input order, so
@@ -84,14 +84,22 @@ public:
     PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches,
              PatchSetMirrors mirrors = PatchSetMirrors::All);
 
-    // Host-side views.
-    std::uint64_t        N() const noexcept { return N_; }
-    std::uint64_t        M_local() const noexcept { return patches_.M(); }
-    const PatchCsr&      patches() const noexcept { return patches_; }
-    // Sorted element IDs that occur in this rank's patches — the inverted
-    // index keys. The index itself is built and kept on the device (see the
-    // d_inv_* mirrors); only its keys are copied back.
-    const std::vector<ElementId>& inv_keys() const noexcept { return inv_keys_; }
+    // Host-side views: sizes and the patch offsets only. The patch contents
+    // and the inverted index live on the device (see the d_* mirrors) and are
+    // not copied back.
+    std::uint64_t N() const noexcept { return N_; }
+    std::uint64_t M_local() const noexcept { return M_local_; }
+    // CSR offsets of this rank's patches (M_local + 1 entries): patch p holds
+    // patch_offsets()[p + 1] - patch_offsets()[p] distinct elements.
+    const std::vector<std::uint64_t>& patch_offsets() const noexcept { return patch_offsets_; }
+    // Number of distinct element IDs occurring in this rank's patches (the
+    // inverted index keys, sorted ascending on the device).
+    std::uint64_t num_inv_keys() const noexcept { return num_inv_keys_; }
+
+    // The patches in ElementId space, copied back from the device — for tests
+    // and inspection. Needs PatchSetMirrors::All (throws std::logic_error
+    // otherwise).
+    PatchCsr download_patches() const;
 
     // ElementId → Hash reverse map for this rank's element shard (see
     // IdMappedPatches::shard_hashes): shard_hashes()[i] is the hash of global
@@ -108,9 +116,10 @@ public:
     const PatchId*       d_inv_data()      const noexcept { return d_inv_data_.data(); }
 
 private:
-    PatchCsr      patches_;
-    std::vector<ElementId> inv_keys_;
-    std::uint64_t N_ = 0;
+    std::uint64_t              M_local_ = 0;
+    std::uint64_t              N_ = 0;
+    std::uint64_t              num_inv_keys_ = 0;
+    std::vector<std::uint64_t> patch_offsets_;
 
     std::vector<Hash> shard_hashes_;
     std::uint64_t     shard_start_ = 0;

@@ -1,5 +1,6 @@
 #include <stPS/ups_pattern_stats.hpp>
 
+#include "core/device_primitives.hpp"
 #include "core/collective.hpp"
 #include "core/cuda_check.hpp"
 #include "core/device_buffer.hpp"
@@ -225,8 +226,7 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         write_unique_hash_shards(comm, unique_hashes_path,
                                  ps.shard_hashes(), ps.shard_start(), ps.N());
     }
-    const std::vector<ElementId>& inv_keys = ps.inv_keys();
-    const std::uint64_t n_local = inv_keys.size();
+    const std::uint64_t n_local = ps.num_inv_keys();
     // Per-rank conditions, agreed collectively so no rank throws alone and
     // strands the others in the exchange below.
     {
@@ -270,14 +270,25 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         starts[static_cast<std::size_t>(size)] = ps.N();
     }
 
-    // inv_keys is sorted → each owner's entries form one contiguous run; the
-    // host copy of the keys yields sendcounts without a D2H transfer.
+    // The index keys are sorted, so each owner's entries form one contiguous
+    // run: the counts are where the shard starts fall among the keys, found on
+    // the device.
     std::vector<std::size_t> owner_counts(static_cast<std::size_t>(size), 0);
-    for (std::size_t i = 0; i < n_local; ++i) {
-        const auto owner = static_cast<std::size_t>(
-            std::upper_bound(starts.begin() + 1, starts.begin() + size, inv_keys[i]) -
-            (starts.begin() + 1));
-        ++owner_counts[owner];
+    if (size > 1) {
+        const auto others = static_cast<std::size_t>(size) - 1;
+        DeviceBuffer<std::uint64_t> d_starts(others), d_pos(others);
+        d_starts.copy_from_host(starts.data() + 1, others);
+        device::lower_bound(ps.d_inv_keys(), n_local, d_starts.data(), others, d_pos.data());
+        std::vector<std::uint64_t> pos(others);
+        d_pos.copy_to_host(pos.data(), others);
+        std::uint64_t prev = 0;
+        for (std::size_t r = 0; r < others; ++r) {
+            owner_counts[r] = pos[r] - prev;
+            prev = pos[r];
+        }
+        owner_counts[others] = n_local - prev;
+    } else {
+        owner_counts[0] = n_local;
     }
     const ExchangeCounts counts = exchange_counts(comm, std::move(owner_counts));
     const std::vector<std::size_t>& sendcounts = counts.send;

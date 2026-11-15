@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -242,19 +243,29 @@ PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patche
     if (mirrors == PatchSetMirrors::All) d_inv_data_ = std::move(inv.data);
     phases.mark("inverted index build", W::Device);
 
-    // Host views: the patch CSR and the index keys.
-    patches_.offsets.resize(M + 1);
-    mapped.offsets.copy_to_host(patches_.offsets.data(), M + 1);
-    patches_.data.resize(total);
-    if (total) mapped.data.copy_to_host(patches_.data.data(), total);
-    inv_keys_.resize(inv.num_keys);
-    if (inv.num_keys > 0) d_inv_keys_.copy_to_host(inv_keys_.data(), inv_keys_.size());
+    // Host view: the offsets only (M_local + 1 values).
+    M_local_      = M;
+    num_inv_keys_ = inv.num_keys;
+    patch_offsets_.resize(M + 1);
+    mapped.offsets.copy_to_host(patch_offsets_.data(), M + 1);
     if (mirrors == PatchSetMirrors::All) {
         d_patch_data_    = std::move(mapped.data);
         d_patch_offsets_ = std::move(mapped.offsets);
     }
-    phases.mark("host views download", W::Transfer);
+    phases.mark("patch offsets download", W::Transfer);
     phases.report(stderr, "[stps-profile PatchSet]", comm.getRank());
+}
+
+PatchCsr PatchSet::download_patches() const {
+    PatchCsr out;
+    out.offsets = patch_offsets_;
+    const std::uint64_t total = patch_offsets_.empty() ? 0 : patch_offsets_.back();
+    if (d_patch_data_.size() != total) {
+        throw std::logic_error("PatchSet::download_patches needs PatchSetMirrors::All");
+    }
+    out.data.resize(total);
+    if (total) d_patch_data_.copy_to_host(out.data.data(), total);
+    return out;
 }
 
 }  // namespace stPS

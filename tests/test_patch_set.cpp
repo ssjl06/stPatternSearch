@@ -99,12 +99,13 @@ TEST(PatchSetShard, ReverseMapTranslatesCsrBackToInputHashes) {
     // Every CSR row, translated back through the reverse map, must equal the
     // sorted+deduped input patch (local patch order is preserved).
     ASSERT_EQ(ps.M_local(), raw.size());
+    const PatchCsr patches = ps.download_patches();
     for (std::size_t p = 0; p < raw.size(); ++p) {
         std::vector<Hash> expect(raw[p]);
         std::sort(expect.begin(), expect.end());
         expect.erase(std::unique(expect.begin(), expect.end()), expect.end());
 
-        const auto row = ps.patches().patch(p);
+        const auto row = patches.patch(p);
         ASSERT_EQ(row.size(), expect.size()) << "patch " << p;
         for (std::size_t i = 0; i < row.size(); ++i) {
             ASSERT_LT(row[i], all.size());
