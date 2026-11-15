@@ -912,11 +912,12 @@ PatchSelection UscPatchSelectorImpl::patch_select(
     d_covered_.resize((N + 63) / 64);
     std::uint64_t local_max = 0;
     if (M_local) {
-        const PatchCsr& patches = patch_set_->patches();
+        const std::vector<std::uint64_t>& offsets = patch_set_->patch_offsets();
         std::vector<WireScore> initial_scores(M_local);
         for (std::size_t p = 0; p < M_local; ++p) {
-            initial_scores[p] = static_cast<WireScore>(patches.patch_size(p));
-            local_max = std::max<std::uint64_t>(local_max, patches.patch_size(p));
+            const std::uint64_t len = offsets[p + 1] - offsets[p];
+            initial_scores[p] = static_cast<WireScore>(len);
+            local_max = std::max(local_max, len);
         }
         d_scores_.copy_from_host(initial_scores.data(), M_local);
         d_global_ids_.resize(M_local);
@@ -1086,7 +1087,7 @@ PatchSelection UscPatchSelectorImpl::select() {
             fixed_score_update_kernel
                 <<<kFixedGridBlocks, kScoreBlockThreads, 0, stream>>>(
                 d_newly.data(), d_winner.data(),
-                patch_set_->d_inv_keys(), patch_set_->inv_keys().size(),
+                patch_set_->d_inv_keys(), patch_set_->num_inv_keys(),
                 patch_set_->d_inv_offsets(), patch_set_->d_inv_data(),
                 d_scores_.data(), block_argmax.view());
             prof.mark(kPScoreUpdate);
@@ -1137,7 +1138,6 @@ void UscPatchSelectorImpl::print_selection(const PatchSelection& r) const {
 
 std::uint64_t        UscPatchSelectorImpl::N() const            { return patch_set_->N(); }
 std::uint64_t        UscPatchSelectorImpl::M_local() const      { return patch_set_->M_local(); }
-const PatchCsr&      UscPatchSelectorImpl::patches() const      { return patch_set_->patches(); }
 
 // ============================================================================
 // UscElemPatchSelectorImpl — PartitionMode::ByElement (design doc §7.3)

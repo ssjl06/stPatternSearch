@@ -67,7 +67,6 @@ public:
     // patch_select() has built the PatchSet.
     std::uint64_t        N() const;
     std::uint64_t        M_local() const;
-    const PatchCsr&      patches() const;
 
 private:
     // Greedy main loop over the built patch_set_ + USC device state.
