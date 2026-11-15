@@ -43,4 +43,13 @@ void lower_bound(const std::uint64_t* haystack, std::uint64_t n_haystack,
 void expand_owners(const std::uint64_t* offsets, std::uint64_t M, std::uint64_t total,
                    std::uint64_t* owners);
 
+// values[i] += delta for i in [0, n) (modulo 2^64, so a "negative" delta
+// subtracts).
+void add_scalar(std::uint64_t* values, std::uint64_t n, std::uint64_t delta);
+
+// CSR offsets from a sorted owner array: offsets[p] = number of owners below
+// p, for p in [0, M]. The inverse of expand_owners.
+void offsets_from_sorted_owners(const std::uint64_t* owners, std::uint64_t total,
+                                std::uint64_t M, std::uint64_t* offsets);
+
 }  // namespace stPS::device
