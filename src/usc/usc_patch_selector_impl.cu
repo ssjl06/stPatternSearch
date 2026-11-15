@@ -391,10 +391,10 @@ __device__ inline std::uint64_t pack_candidate_key(WireScore score, int rank, un
 //     blocks — therefore see only nb + K * block_size values, never all M.
 //   * Scores are small integers, so "the K best" is: everything above a
 //     threshold score t, plus the first few (by position) that equal t. t is
-//     found by bisection on the score, each step one parallel count.
+//     found by a search on the score, each step one parallel count.
 // ---------------------------------------------------------------------------
 
-constexpr int kSelectPasses = 33;   // bisection steps over a 32-bit score range
+constexpr int kSelectPasses = 64;   // upper bound on the threshold-search steps over a 32-bit score range
 
 // Run by every thread of ONE CUDA block of kTopThreads threads. Among items
 // [0, n) — item i has score score_at(i), and item order is position order —
@@ -421,14 +421,25 @@ __device__ inline unsigned int select_best(ScoreAt score_at, std::uint64_t n, un
     __syncthreads();
 
     // Largest t >= 1 with at least K scores >= t (t = 1 if there are fewer).
+    // The answer is almost always at or just below the top score, so probe
+    // downwards from `bound` in doubling steps first, then bisect what is left.
     WireScore lo = 1, hi = bound < 1 ? 1 : bound;
+    WireScore step = 1;
+    bool descending = true;
     for (int pass = 0; lo < hi; ++pass) {
-        const WireScore mid = lo + (hi - lo + 1) / 2;
+        WireScore mid = lo + (hi - lo + 1) / 2;
+        if (descending && hi - step + 1 > mid) mid = hi - step + 1;   // never below the midpoint
         unsigned int c = 0;
         for (std::uint64_t i = first; i < last; ++i) c += score_at(i) >= mid;
         if (c) atomicAdd(&s_pass[pass], c);
         __syncthreads();
-        if (s_pass[pass] >= K) lo = mid; else hi = mid - 1;
+        if (s_pass[pass] >= K) {
+            lo = mid;
+            descending = false;
+        } else {
+            hi = mid - 1;
+            step *= 2;
+        }
     }
     const WireScore t = lo;
 
