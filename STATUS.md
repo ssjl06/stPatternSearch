@@ -316,6 +316,29 @@ uploading them twice), and the per-patch host stages are gone — the phase
 timers of a file-driven UPS run show no host phase at all, only the upload.
 The nested overloads flatten on the host and then take the same path.
 
+### One-pass candidate selection and a barrier-light walk (2026-11)
+
+The two remaining K-sequential parts of a round:
+
+- **Candidate selection** (both modes) was K argmaxes in a row. It is now one
+  pass: the K best patches all lie in the K blocks with the best block maxima,
+  so two selections — over the block maxima, then inside the chosen blocks —
+  see only nb + K × block_size values. Each selection finds the threshold
+  score by bisection (one parallel count per step) and takes everything above
+  it plus the first few, by position, that equal it; the K results are then
+  ordered by counting. No score is parked any more; the accepted patches are
+  disabled after the walk.
+- **Walk** (ByPatch) paid three barriers per candidate. Now every listed
+  element is entered into a small hash table first; an element entered twice
+  is "shared". A candidate with no shared element shares nothing with anyone
+  and is accepted by one thread with no barrier. Only candidates with shared
+  elements take the barrier path, counting the elements already taken by an
+  accepted candidate — the same exact test as before, so rounds end where
+  they did.
+
+Selections are identical (all solver tests, candidate caps 1..1024, dense
+conflicts). Timing on the reference box is still to be measured.
+
 ### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
 
 Because ByElement's one collective has a fixed count and no root (the exact

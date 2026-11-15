@@ -152,20 +152,6 @@ __global__ void block_max_refresh_kernel(const WireScore* scores, std::uint64_t 
 
 constexpr int kTopThreads = 1024;   // one CUDA block
 
-// (score, position) packed so that the larger key is the larger score and,
-// among equal scores, the smaller position. 0 never encodes a real entry
-// (positions stay below 2^31), so it stands for "nothing".
-__device__ inline unsigned long long pack_max_key(WireScore score, std::uint64_t pos) {
-    const unsigned long long biased = static_cast<std::uint32_t>(score) ^ 0x80000000u;
-    return (biased << 32) | (0xFFFFFFFFull - pos);
-}
-__device__ inline WireScore max_key_score(unsigned long long key) {
-    return static_cast<WireScore>(static_cast<std::uint32_t>(key >> 32) ^ 0x80000000u);
-}
-__device__ inline int max_key_position(unsigned long long key) {
-    return static_cast<int>(0xFFFFFFFFull - (key & 0xFFFFFFFFull));
-}
-
 // ---------------------------------------------------------------------------
 // Device-resident loop kernels (Full-GPU iteration track), shared by both
 // partition modes.
@@ -379,6 +365,9 @@ __global__ void elem_delta_apply_kernel(const DeltaWord* recv, std::uint64_t ran
 // elements, validated on entry).
 // ---------------------------------------------------------------------------
 
+
+// A candidate's key: larger = earlier in the greedy order (see "ByPatch
+// device-resident loop" below).
 constexpr std::uint64_t kKeyField = 0xFFFFull;
 
 __device__ inline std::uint64_t pack_candidate_key(WireScore score, int rank, unsigned int j) {
@@ -387,86 +376,161 @@ __device__ inline std::uint64_t pack_candidate_key(WireScore score, int rank, un
          | (kKeyField - j);
 }
 
+// ---------------------------------------------------------------------------
 // The K best patches of one score array, best first (ByPatch: this rank's
-// patches; ByElement: all patches, identical on every rank). One CUDA block: K times, take the
-// maximum over the block maxima, set that patch aside (its score is parked in
-// cand_score and the slot disabled) and recompute its block. The parked
-// scores come back in restore_candidates_kernel unless the patch is selected.
-__global__ void extract_candidates_kernel(WireScore* scores, std::uint64_t M,
-                                                MaxBlocks blocks, std::uint64_t num_blocks,
-                                                unsigned int K, int my_rank,
-                                                int* cand_patch, WireScore* cand_score,
-                                                std::uint64_t* key_segment) {
-    __shared__ unsigned long long s_key;
-    __shared__ int                s_patch;   // patch just set aside, -1 = no more candidates
+// patches; ByElement: all patches, identical on every rank) — in one pass
+// instead of K argmaxes.
+//
+// "Best" is (score descending, position ascending). Two facts make a parallel
+// selection possible:
+//
+//   * The K best patches all lie in the K blocks whose block maxima are best:
+//     those K maxima are themselves K patches at least as good as the K-th
+//     best block maximum, so no patch outside these blocks can be among the K
+//     best. Two selections — over the block maxima, then inside the chosen
+//     blocks — therefore see only nb + K * block_size values, never all M.
+//   * Scores are small integers, so "the K best" is: everything above a
+//     threshold score t, plus the first few (by position) that equal t. t is
+//     found by bisection on the score, each step one parallel count.
+// ---------------------------------------------------------------------------
+
+constexpr int kSelectPasses = 33;   // bisection steps over a 32-bit score range
+
+// Run by every thread of ONE CUDA block of kTopThreads threads. Among items
+// [0, n) — item i has score score_at(i), and item order is position order —
+// pick the (at most K) best with a positive score and call emit(k, i, score)
+// for each, k = 0, 1, ... in item order. Returns how many were emitted (the
+// same value on every thread). `bound` is an upper bound on every score.
+// s_pass[kSelectPasses], s_base/s_take_gt/s_take_eq[kTopThreads] and s_total
+// are shared scratch.
+template <typename ScoreAt, typename Emit>
+__device__ inline unsigned int select_best(ScoreAt score_at, std::uint64_t n, unsigned int K,
+                                           WireScore bound, unsigned int* s_pass,
+                                           unsigned int* s_base, unsigned int* s_take_gt,
+                                           unsigned int* s_take_eq, unsigned int* s_total,
+                                           Emit emit) {
     const unsigned int tid = threadIdx.x;
+    // Contiguous chunks, so "first by position" survives the split.
+    const std::uint64_t chunk = (n + kTopThreads - 1) / kTopThreads;
+    std::uint64_t first = tid * chunk;
+    if (first > n) first = n;
+    std::uint64_t last = first + chunk;
+    if (last > n) last = n;
 
-    // Each thread owns a contiguous group of blocks and remembers the best
-    // block maximum in it. A candidate then costs one atomic per thread plus a
-    // rescan of the one group that changed — not a pass over every block
-    // maximum, which would grow with the patch count.
-    const std::uint64_t group = (num_blocks + kTopThreads - 1) / kTopThreads;
-    const auto group_best = [&](unsigned int t) {
-        unsigned long long best = 0;
-        const std::uint64_t lo = t * group;
-        std::uint64_t hi = lo + group;
-        if (hi > num_blocks) hi = num_blocks;
-        for (std::uint64_t b = lo; b < hi; ++b) {
-            const unsigned long long k = pack_max_key(blocks.block_val[b], b);
-            if (k > best) best = k;
-        }
-        return best;
-    };
-    unsigned long long my_best = group_best(tid);
+    if (tid < kSelectPasses) s_pass[tid] = 0;   // one counter per bisection step
+    __syncthreads();
 
+    // Largest t >= 1 with at least K scores >= t (t = 1 if there are fewer).
+    WireScore lo = 1, hi = bound < 1 ? 1 : bound;
+    for (int pass = 0; lo < hi; ++pass) {
+        const WireScore mid = lo + (hi - lo + 1) / 2;
+        unsigned int c = 0;
+        for (std::uint64_t i = first; i < last; ++i) c += score_at(i) >= mid;
+        if (c) atomicAdd(&s_pass[pass], c);
+        __syncthreads();
+        if (s_pass[pass] >= K) lo = mid; else hi = mid - 1;
+    }
+    const WireScore t = lo;
+
+    unsigned int gt = 0, eq = 0;
+    for (std::uint64_t i = first; i < last; ++i) {
+        const WireScore v = score_at(i);
+        gt += v > t;
+        eq += v == t;
+    }
+    s_take_gt[tid] = gt;
+    s_take_eq[tid] = eq;
+    __syncthreads();
     if (tid == 0) {
-        if (blocks.count) *blocks.count = 0;   // the refresh before this consumed the queue
-        s_key = 0;
+        // Hand out the K places in chunk order: every score above t (fewer
+        // than K of them, by the choice of t), then scores equal to t while
+        // places remain. The clamp on the first kind only matters if `bound`
+        // was not an upper bound.
+        unsigned int left = K, out = 0;
+        for (int k = 0; k < kTopThreads; ++k) {
+            const unsigned int g = s_take_gt[k] < left ? s_take_gt[k] : left;
+            left -= g;
+            s_take_gt[k] = g;
+        }
+        for (int k = 0; k < kTopThreads; ++k) {
+            const unsigned int e = s_take_eq[k] < left ? s_take_eq[k] : left;
+            left -= e;
+            s_take_eq[k] = e;
+            s_base[k] = out;
+            out += s_take_gt[k] + e;
+        }
+        *s_total = out;
     }
     __syncthreads();
-    unsigned int j = 0;
-    for (; j < K; ++j) {
-        // Second argmax stage: the best block maximum, first block among equals.
-        if (my_best) atomicMax(&s_key, my_best);
-        __syncthreads();
-        const std::uint64_t b = s_key ? static_cast<std::uint64_t>(max_key_position(s_key)) : 0;
-        if (tid == 0) {
-            s_patch = -1;
-            const WireScore score = s_key ? max_key_score(s_key) : 0;
-            if (score > 0) {
-                const int p = blocks.block_arg[b];
-                cand_patch[j]  = p;
-                cand_score[j]  = score;
-                key_segment[j] = pack_candidate_key(score, my_rank, j);
-                scores[p]      = kDisabledWireScore;
-                s_patch        = p;
-            }
-            s_key = 0;   // reused for the block rescan
+    unsigned int out = s_base[tid], take_gt = s_take_gt[tid], take_eq = s_take_eq[tid];
+    for (std::uint64_t i = first; i < last; ++i) {
+        const WireScore v = score_at(i);
+        if (v > t) {
+            if (take_gt) { emit(out++, i, v); --take_gt; }
+        } else if (v == t && take_eq) {
+            emit(out++, i, v);
+            --take_eq;
         }
-        __syncthreads();
-        if (s_patch < 0) break;
-
-        // First stage for the block that lost its maximum.
-        const std::uint64_t lo = b << blocks.shift;
-        std::uint64_t hi = lo + (std::uint64_t{1} << blocks.shift);
-        if (hi > M) hi = M;
-        unsigned long long in_block = 0;
-        for (std::uint64_t i = lo + tid; i < hi; i += kTopThreads) {
-            const unsigned long long k = pack_max_key(scores[i], i);
-            if (k > in_block) in_block = k;
-        }
-        if (in_block) atomicMax(&s_key, in_block);
-        __syncthreads();
-        if (tid == 0) {
-            blocks.block_val[b] = max_key_score(s_key);
-            blocks.block_arg[b] = max_key_position(s_key);
-            s_key = 0;   // ready for the next candidate
-        }
-        __syncthreads();
-        if (b / group == tid) my_best = group_best(tid);   // only this group changed
     }
-    if (tid == 0) {
-        for (; j < K; ++j) key_segment[j] = 0;
+    __syncthreads();
+    return *s_total;
+}
+
+// One CUDA block. Fills cand_patch / cand_score / key_segment [0, K): the
+// candidates best first, key 0 past the last one. sel_blocks, tmp_patch and
+// tmp_score are K-entry scratch.
+__global__ void select_candidates_kernel(const WireScore* scores, std::uint64_t M,
+                                         MaxBlocks blocks, std::uint64_t num_blocks,
+                                         unsigned int K, WireScore bound, int my_rank,
+                                         int* sel_blocks, int* tmp_patch, WireScore* tmp_score,
+                                         int* cand_patch, WireScore* cand_score,
+                                         std::uint64_t* key_segment) {
+    __shared__ unsigned int s_pass[kSelectPasses];
+    __shared__ unsigned int s_base[kTopThreads];
+    __shared__ unsigned int s_take_gt[kTopThreads];
+    __shared__ unsigned int s_take_eq[kTopThreads];
+    __shared__ unsigned int s_total;
+    const unsigned int tid = threadIdx.x;
+    if (tid == 0 && blocks.count) *blocks.count = 0;   // the refresh before this consumed the queue
+
+    // The K best blocks, in block order.
+    const unsigned int n_blocks = select_best(
+        [&](std::uint64_t b) { return blocks.block_val[b]; }, num_blocks, K, bound,
+        s_pass, s_base, s_take_gt, s_take_eq, &s_total,
+        [&](unsigned int k, std::uint64_t b, WireScore) { sel_blocks[k] = static_cast<int>(b); });
+
+    // The K best patches inside them. Item i = entry (i mod block size) of the
+    // (i / block size)-th chosen block — still position order.
+    const std::uint64_t in_block = (std::uint64_t{1} << blocks.shift) - 1;
+    const auto patch_of = [&](std::uint64_t i) {
+        return (static_cast<std::uint64_t>(sel_blocks[i >> blocks.shift]) << blocks.shift)
+             + (i & in_block);
+    };
+    const unsigned int n_cand = select_best(
+        [&](std::uint64_t i) {
+            const std::uint64_t p = patch_of(i);
+            return p < M ? scores[p] : kLowestScore;   // past the end of the last block
+        },
+        static_cast<std::uint64_t>(n_blocks) << blocks.shift, K, bound,
+        s_pass, s_base, s_take_gt, s_take_eq, &s_total,
+        [&](unsigned int k, std::uint64_t i, WireScore v) {
+            tmp_patch[k] = static_cast<int>(patch_of(i));
+            tmp_score[k] = v;
+        });
+
+    // Best first: a candidate's place is the number of better ones.
+    if (tid < n_cand) {
+        const WireScore v = tmp_score[tid];
+        const int       p = tmp_patch[tid];
+        unsigned int place = 0;
+        for (unsigned int i = 0; i < n_cand; ++i) {
+            place += tmp_score[i] > v || (tmp_score[i] == v && tmp_patch[i] < p);
+        }
+        cand_patch[place]  = p;
+        cand_score[place]  = v;
+        key_segment[place] = pack_candidate_key(v, my_rank, place);
+    } else if (tid < K) {
+        key_segment[tid] = 0;
     }
 }
 
@@ -540,105 +604,195 @@ __global__ void patch_build_payload_kernel(const ElementId*     patch_data,
 }
 
 // The walk described above — identical on every rank, since it reads only
-// reduced data and the replicated covered bitset. One CUDA block. An element
-// "shared with an accepted patch" is one whose covered bit is already set:
-// every listed element was uncovered when the round began.
-// Accepting = setting those bits, recording the patch, and appending the
-// elements to `newly` for the score update.
+// reduced data and the replicated covered bitset. One CUDA block. A candidate
+// that shares no element with any other candidate is decided without a
+// barrier; which ones those are is found in parallel beforehand:
+//
+//   1. Every listed element is entered into a small hash table. An element
+//      entered a second time is listed by more than one candidate: its table
+//      slot is flagged "shared".
+//   2. Each candidate learns whether it lists any shared element.
+//   3. The candidates are walked in order. One without shared elements
+//      shares nothing with anyone: thread 0 accepts it on its own. Otherwise
+//      all threads count its elements whose slot carries the "taken" flag —
+//      set, on every shared element, by each candidate accepted so far —
+//      which is exactly the number of elements it shares with the accepted
+//      ones: none → accept, some → skip.
+//   4. In parallel again: the accepted candidates' elements get their covered
+//      bit and go to `newly`; the table is emptied for the next round.
+//
+// The table is claim_keys (element + 1, 0 = free) / claim_flags; each element
+// remembers its slot in elem_slot, so later steps need no probing (and
+// emptying cannot break another thread's probe chain).
+constexpr unsigned int kClaimShared = 1;   // listed by more than one candidate
+constexpr unsigned int kClaimTaken  = 2;   // listed by an accepted candidate
+
 __global__ void patch_walk_kernel(const std::uint64_t* global_keys,
                                   const std::uint64_t* payload,
                                   unsigned int         K,
                                   std::uint64_t        slot_words,
                                   std::uint64_t        N,
                                   std::uint64_t*       covered,
+                                  unsigned long long*  claim_keys,
+                                  unsigned int*        claim_flags,
+                                  unsigned int         table_bits,
+                                  unsigned int*        elem_slot,
                                   unsigned int*        accepted,
                                   ElementId*           newly,
                                   PatchId*             selected,
                                   LoopState*           st,
                                   WinnerInfo*          w) {
+    __shared__ unsigned int s_first[kTopThreads];    // candidate g's elements: [s_first[g], s_first[g + 1])
+    __shared__ unsigned int s_end;                   // == s_first[K]
+    __shared__ unsigned int s_shared[kTopThreads];   // 1: g lists a shared element
+    __shared__ unsigned int s_out[kTopThreads];      // accepted candidate's offset in `newly`
+    __shared__ int          s_skip;                  // 1: the solve was already done
     __shared__ unsigned int s_overlap;
-    __shared__ unsigned int s_offset;     // elements appended to `newly` so far
-    __shared__ int          s_decision;   // 0 skip, 1 accept, 2 end of round
+    __shared__ int          s_decision;              // 0 skip, 1 accept, 2 end of round
     const unsigned int tid = threadIdx.x;
-    if (tid < K) accepted[tid] = 0;
-    std::uint64_t skip_best = 0;   // thread 0 only
+    if (tid < K) { accepted[tid] = 0; s_shared[tid] = 0; }
     if (tid == 0) {
-        s_offset   = 0;
-        s_decision = st->done ? 2 : 0;
+        unsigned int at = 0;
+        for (unsigned int g = 0; g < K; ++g) {
+            s_first[g] = at;
+            at += static_cast<unsigned int>(payload[static_cast<std::uint64_t>(g) * slot_words]);
+        }
+        s_end  = at;
+        s_skip = st->done ? 1 : 0;
+        w->newly_count = 0;
     }
     __syncthreads();
-    if (s_decision != 2) {
-        for (unsigned int g = 0; g < K; ++g) {
-            const std::uint64_t* slot  = payload + static_cast<std::uint64_t>(g) * slot_words;
-            const std::uint64_t  key   = global_keys[g];
-            const std::uint64_t  score = key >> 32;
-            const std::uint64_t  count = slot[0];
-            if (tid == 0) {
-                s_overlap  = 0;
-                s_decision = (key == 0 || skip_best >= score) ? 2 : 0;
-            }
-            __syncthreads();
-            if (s_decision == 2) break;
+    if (s_skip) return;
+    const unsigned int total = s_end;
+    // Element e of the flattened lists belongs to the last candidate whose
+    // first element is at or before e.
+    const auto owner_of = [&](unsigned int e) {
+        unsigned int lo = 0, hi = K;   // answer in [lo, hi)
+        while (hi - lo > 1) {
+            const unsigned int mid = lo + (hi - lo) / 2;
+            if (s_first[mid] <= e) lo = mid; else hi = mid;
+        }
+        return lo;
+    };
+    const auto last_of = [&](unsigned int g) { return g + 1 < K ? s_first[g + 1] : total; };
+    const auto element_at = [&](unsigned int g, unsigned int e) {
+        return payload[static_cast<std::uint64_t>(g) * slot_words + 2 + (e - s_first[g])];
+    };
+    const unsigned int mask = (1u << table_bits) - 1;
 
-            unsigned int mine = 0;
-            for (std::uint64_t i = tid; i < count; i += kTopThreads) {
-                const ElementId id = slot[2 + i];
-                mine += static_cast<unsigned int>((covered[id >> 6] >> (id & 63)) & 1ULL);
+    // 1. Enter every element; flag the ones entered more than once.
+    for (unsigned int e = tid; e < total; e += kTopThreads) {
+        const unsigned long long tag = element_at(owner_of(e), e) + 1;
+        unsigned int h = static_cast<unsigned int>(
+            (tag * 0x9E3779B97F4A7C15ull) >> (64 - table_bits));
+        while (true) {
+            const unsigned long long seen = atomicCAS(&claim_keys[h], 0ull, tag);
+            if (seen == 0) break;
+            if (seen == tag) { atomicOr(&claim_flags[h], kClaimShared); break; }
+            h = (h + 1) & mask;
+        }
+        elem_slot[e] = h;
+    }
+    __syncthreads();
+    // 2. Which candidates list a shared element.
+    for (unsigned int e = tid; e < total; e += kTopThreads) {
+        if (claim_flags[elem_slot[e]] & kClaimShared) s_shared[owner_of(e)] = 1;
+    }
+    __syncthreads();
+    // 3. Decisions. Thread 0 keeps the round's state; the other threads only
+    // join for candidates with shared elements (three barriers each), so a
+    // candidate without any costs no barrier at all.
+    std::uint64_t skip_best = 0;      // thread 0 only
+    unsigned int  out       = 0;      // thread 0 only
+    bool          ended     = false;  // thread 0 only: the round is over
+    const auto accept = [&](unsigned int g, std::uint64_t score) {   // thread 0
+        accepted[g] = 1;
+        s_out[g]    = out;
+        out += last_of(g) - s_first[g];
+        selected[st->num_selected] = payload[static_cast<std::uint64_t>(g) * slot_words + 1];
+        st->num_selected  += 1;
+        st->last_score     = static_cast<std::uint32_t>(score);
+        st->covered_count += score;
+        if (st->covered_count >= N) { st->done = 1; ended = true; }
+    };
+    for (unsigned int g = 0; g < K; ++g) {
+        const std::uint64_t key   = global_keys[g];
+        const std::uint64_t score = key >> 32;
+        if (!s_shared[g]) {
+            // Shares nothing with anyone: accept, unless the round is over.
+            if (tid == 0 && !ended) {
+                if (key == 0 || skip_best >= score) ended = true;
+                else accept(g, score);
             }
-            if (mine) atomicAdd(&s_overlap, mine);
-            __syncthreads();
-            if (tid == 0) {
-                if (s_overlap == 0) {
-                    s_decision = 1;
-                } else {
-                    const std::uint64_t left = score - s_overlap;
-                    if (left > skip_best) skip_best = left;
-                    s_decision = 0;
-                }
+            continue;
+        }
+        if (tid == 0) {
+            if (!ended && (key == 0 || skip_best >= score)) ended = true;
+            s_overlap  = 0;
+            s_decision = ended ? 2 : 0;
+        }
+        __syncthreads();
+        if (s_decision == 2) break;
+        // Elements shared with the candidates accepted so far.
+        unsigned int mine = 0;
+        for (unsigned int e = s_first[g] + tid; e < last_of(g); e += kTopThreads) {
+            mine += (claim_flags[elem_slot[e]] & kClaimTaken) ? 1u : 0u;
+        }
+        if (mine) atomicAdd(&s_overlap, mine);
+        __syncthreads();
+        if (tid == 0) {
+            if (s_overlap) {
+                const std::uint64_t left = score - s_overlap;
+                if (left > skip_best) skip_best = left;
+                s_decision = 0;
+            } else {
+                accept(g, score);
+                s_decision = 1;
             }
-            __syncthreads();
-            if (s_decision == 1) {
-                const unsigned int base = s_offset;
-                for (std::uint64_t i = tid; i < count; i += kTopThreads) {
-                    const ElementId id = slot[2 + i];
-                    atomicOr(reinterpret_cast<unsigned long long*>(&covered[id >> 6]),
-                             static_cast<unsigned long long>(1ULL << (id & 63)));
-                    newly[base + i] = id;
-                }
-                __syncthreads();
-                if (tid == 0) {
-                    accepted[g] = 1;
-                    s_offset   += static_cast<unsigned int>(count);
-                    selected[st->num_selected] = slot[1];
-                    st->num_selected  += 1;
-                    st->last_score     = static_cast<std::uint32_t>(score);
-                    st->covered_count += score;
-                    if (st->covered_count >= N) { st->done = 1; s_decision = 2; }
-                }
-                __syncthreads();
-                if (s_decision == 2) break;
+        }
+        __syncthreads();
+        if (s_decision == 1) {
+            // Later candidates must see its shared elements taken. (Read by the
+            // next shared candidate only after that candidate's first barrier.)
+            for (unsigned int e = s_first[g] + tid; e < last_of(g); e += kTopThreads) {
+                const unsigned int h = elem_slot[e];
+                if (claim_flags[h] & kClaimShared) atomicOr(&claim_flags[h], kClaimTaken);
             }
         }
     }
     if (tid == 0) {
         // No positive score anywhere: the solve is over.
         if (!st->done && global_keys[0] == 0) st->done = 1;
-        w->newly_count = s_offset;
+        w->newly_count = out;
+    }
+    __syncthreads();
+    // 4. Apply the accepted, empty the table.
+    for (unsigned int e = tid; e < total; e += kTopThreads) {
+        const unsigned int g = owner_of(e);
+        if (accepted[g]) {
+            const ElementId id = element_at(g, e);
+            atomicOr(reinterpret_cast<unsigned long long*>(&covered[id >> 6]),
+                     static_cast<unsigned long long>(1ULL << (id & 63)));
+            newly[s_out[g] + (e - s_first[g])] = id;
+        }
+        const unsigned int h = elem_slot[e];
+        claim_keys[h]  = 0;
+        claim_flags[h] = 0;
     }
 }
 
-// Give the parked scores back to every candidate that was not selected. Must
-// run before the score update, which then lowers them like any other patch.
-// A selected patch stays disabled.
-__global__ void restore_candidates_kernel(const int* cand_patch, const WireScore* cand_score,
-                                     const std::uint64_t* key_segment, const int* slot_of,
-                                     const unsigned int* accepted, unsigned int K,
-                                     WireScore* scores, MaxBlocks blocks) {
+// Disable the selected patches (their score stays negative from here on).
+// Runs before the round's score update. `slot_of` maps this rank's candidate
+// j to its place in the global order; null when the two are the same.
+__global__ void disable_accepted_kernel(const int* cand_patch, const std::uint64_t* key_segment,
+                                        const int* slot_of, const unsigned int* accepted,
+                                        unsigned int K, WireScore* scores, MaxBlocks blocks) {
     const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= K || key_segment[j] == 0) return;
+    const int g = slot_of ? slot_of[j] : static_cast<int>(j);
+    if (g < 0 || !accepted[g]) return;
     const int p = cand_patch[j];
-    const int g = slot_of ? slot_of[j] : static_cast<int>(j);   // null: local order IS the global one
-    if (g < 0 || !accepted[g]) scores[p] = cand_score[j];
+    scores[p] = kDisabledWireScore;
     mark_dirty(blocks, static_cast<std::uint64_t>(p));
 }
 
@@ -785,7 +939,7 @@ __global__ void elem_build_accepted_kernel(const ElementId*     patch_data,
 }
 
 // Host-side owner of the block maxima over one score array. Per round the
-// loops enqueue refresh() and then extract_candidates_kernel over
+// loops enqueue refresh() and then select_candidates_kernel over
 // num_blocks().
 class BlockArgmax {
 public:
@@ -966,13 +1120,13 @@ PatchSelection UscPatchSelectorImpl::patch_select(
 // on the NCCL stream and syncs once per batch to read the 24 B loop state.
 //
 // Per round:
-//   [device] refresh block maxima; extract this rank's K best patches
+//   [device] refresh block maxima; select this rank's K best patches
 //        ncclAllReduce<SUM>(P segments of K keys)       — everyone's candidates
 //   [device] merge → the K best overall; owners write their candidates'
 //            still-uncovered elements into the payload slots
 //        ncclAllReduce<SUM>(K slots of bound + 2 words) — only owners non-zero
-//   [device] walk (accept / skip / end), restore the unselected candidates'
-//            scores, strategy-A score update over all accepted elements
+//   [device] walk (accept / skip / end), disable the accepted patches,
+//            strategy-A score update over all accepted elements
 //
 // Two collectives per round, as the one-selection loop had per selection.
 // `bound` is the previous batch's last accepted score — no later score
@@ -1017,6 +1171,8 @@ PatchSelection UscPatchSelectorImpl::select() {
 
     DeviceBuffer<int>           d_cand_patch(k_cap), d_slot_of(k_cap);
     DeviceBuffer<WireScore>     d_cand_score(k_cap);
+    DeviceBuffer<int>           d_sel_blocks(k_cap), d_tmp_patch(k_cap);   // selection scratch
+    DeviceBuffer<WireScore>     d_tmp_score(k_cap);
     DeviceBuffer<unsigned int>  d_accepted(k_cap);
     DeviceBuffer<std::uint64_t> d_global_keys(k_cap);
     DeviceBuffer<std::uint64_t> d_keys_send(usize * k_cap);
@@ -1025,6 +1181,18 @@ PatchSelection UscPatchSelectorImpl::select() {
     DeviceBuffer<std::uint64_t> d_pay_recv_buf(size > 1 ? payload_words : 0);
     DeviceBuffer<ElementId>     d_newly(payload_words);
     d_keys_send.zero();
+    // The walk's claim table: twice as many places as a round can list
+    // elements, empty (all zero) between rounds.
+    unsigned int table_bits = 1;
+    while ((std::uint64_t{1} << table_bits) < 2 * payload_words) ++table_bits;
+    if (table_bits > 32) {   // same on every rank; a round's lists are counted in 32 bits
+        throw std::invalid_argument("ByPatch mode: a patch has more than 2^31 elements");
+    }
+    DeviceBuffer<unsigned long long> d_claim_keys(std::uint64_t{1} << table_bits);
+    DeviceBuffer<unsigned int>       d_claim_flags(std::uint64_t{1} << table_bits);
+    DeviceBuffer<unsigned int>       d_elem_slot(payload_words);
+    d_claim_keys.zero();
+    d_claim_flags.zero();
     // One rank: the "reduction" of a single contribution is itself.
     const std::uint64_t* d_keys_recv = size > 1 ? d_keys_recv_buf.data() : d_keys_send.data();
     const std::uint64_t* d_pay_recv  = size > 1 ? d_pay_recv_buf.data()  : d_pay_send.data();
@@ -1033,9 +1201,9 @@ PatchSelection UscPatchSelectorImpl::select() {
 
     enum { kPRefresh, kPExtract, kPKeyReduce, kPMerge, kPBuild, kPPayloadReduce, kPWalk,
            kPRestore, kPScoreUpdate };
-    LoopProfiler prof(stream, {"refresh blocks", "extract candidates", "key reduce",
+    LoopProfiler prof(stream, {"refresh blocks", "select candidates", "key reduce",
                                "merge (+clears)", "build payload", "payload reduce", "walk",
-                               "restore", "score update"});
+                               "disable accepted", "score update"});
 
     constexpr std::uint64_t kMaxBatch = 16;   // rounds
     std::uint64_t bound = max_bound;
@@ -1064,9 +1232,11 @@ PatchSelection UscPatchSelectorImpl::select() {
         for (std::uint64_t b = 0; b < batch; ++b) {
             block_argmax.refresh(stream);
             prof.mark(kPRefresh);
-            extract_candidates_kernel<<<1, kTopThreads, 0, stream>>>(
+            select_candidates_kernel<<<1, kTopThreads, 0, stream>>>(
                 d_scores_.data(), M_loc, block_argmax.view(), block_argmax.num_blocks(),
-                K, rank, d_cand_patch.data(), d_cand_score.data(), d_key_segment);
+                K, static_cast<WireScore>(bound), rank,
+                d_sel_blocks.data(), d_tmp_patch.data(), d_tmp_score.data(),
+                d_cand_patch.data(), d_cand_score.data(), d_key_segment);
             prof.mark(kPExtract);
             if (size > 1) {
                 comm_.allreduce<stComm::Space::Device, std::uint64_t>(
@@ -1098,12 +1268,13 @@ PatchSelection UscPatchSelectorImpl::select() {
             prof.mark(kPPayloadReduce);
             patch_walk_kernel<<<1, kTopThreads, 0, stream>>>(
                 d_global_keys.data(), d_pay_recv, K, slot_words, N,
-                d_covered_.data(), d_accepted.data(), d_newly.data(),
+                d_covered_.data(), d_claim_keys.data(), d_claim_flags.data(), table_bits,
+                d_elem_slot.data(), d_accepted.data(), d_newly.data(),
                 d_selected.data(), d_state.data(), d_winner.data());
             prof.mark(kPWalk);
-            restore_candidates_kernel<<<(K + kFixedBlockThreads - 1) / kFixedBlockThreads,
-                                   kFixedBlockThreads, 0, stream>>>(
-                d_cand_patch.data(), d_cand_score.data(), d_key_segment, d_slot_of.data(),
+            disable_accepted_kernel<<<(K + kFixedBlockThreads - 1) / kFixedBlockThreads,
+                                      kFixedBlockThreads, 0, stream>>>(
+                d_cand_patch.data(), d_key_segment, d_slot_of.data(),
                 d_accepted.data(), K, d_scores_.data(), block_argmax.view());
             prof.mark(kPRestore);
             fixed_score_update_kernel
@@ -1392,12 +1563,12 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
 //   [device] plan + fill this rank's window of pending decrements
 //        ncclAllReduce<SUM>(P segments of window + 2 words)
 //   [device] apply every rank's window to the scores
-//   [device] refresh block maxima, extract the K best patches (scores parked)
+//   [device] refresh block maxima, select the K best patches
 //   [device] count shared uncovered elements per candidate pair, this shard
 //        ncclAllReduce<SUM>(K x K words)
 //   [device] walk: accept / skip / end — nothing while any rank has more
 //            decrements to send; this shard's elements of the accepted
-//            patches → newly covered + covered bits; restore parked scores
+//            patches → newly covered + covered bits; disable the accepted
 //   [device] new delta stream: list lengths → prefix sum → cursor
 //
 // Two collectives per step. The host enqueues a batch of steps and syncs
@@ -1445,6 +1616,8 @@ PatchSelection UscElemPatchSelectorImpl::select() {
 
     DeviceBuffer<int>           d_cand_patch(K);
     DeviceBuffer<WireScore>     d_cand_score(K);
+    DeviceBuffer<int>           d_sel_blocks(K), d_tmp_patch(K);   // selection scratch
+    DeviceBuffer<WireScore>     d_tmp_score(K);
     DeviceBuffer<std::uint64_t> d_keys(K);
     DeviceBuffer<unsigned int>  d_accepted(K);
     DeviceBuffer<DeltaWord>     d_overlap_send(static_cast<std::uint64_t>(K) * K);
@@ -1492,8 +1665,8 @@ PatchSelection UscElemPatchSelectorImpl::select() {
     enum { kEPlan, kEFill, kEReduce, kEApply, kERefresh, kEExtract, kEOverlap, kEOverlapReduce,
            kEWalk, kEBuild, kERestore, kEDegrees, kEScan, kEBegin, kEScoreUpdate };
     LoopProfiler prof(stream, {"delta plan", "delta fill", "delta reduce", "delta apply",
-                               "refresh blocks", "extract candidates", "pair overlaps",
-                               "overlap reduce", "walk", "build accepted", "restore",
+                               "refresh blocks", "select candidates", "pair overlaps",
+                               "overlap reduce", "walk", "build accepted", "disable accepted",
                                "delta degrees", "delta prefix scan", "delta begin",
                                "score update (1 rank)"});
     LoopState h_state{};
@@ -1543,9 +1716,11 @@ PatchSelection UscElemPatchSelectorImpl::select() {
             }
             block_argmax.refresh(stream);
             prof.mark(kERefresh);
-            extract_candidates_kernel<<<1, kTopThreads, 0, stream>>>(
+            select_candidates_kernel<<<1, kTopThreads, 0, stream>>>(
                 d_scores_.data(), M_global_, block_argmax.view(), block_argmax.num_blocks(),
-                K, 0, d_cand_patch.data(), d_cand_score.data(), d_keys.data());
+                K, static_cast<WireScore>(score_bound), 0,
+                d_sel_blocks.data(), d_tmp_patch.data(), d_tmp_score.data(),
+                d_cand_patch.data(), d_cand_score.data(), d_keys.data());
             prof.mark(kEExtract);
             cuda_check(cudaMemsetAsync(d_overlap_send.data(), 0, d_overlap_send.bytes(), stream),
                        "overlap clear");
@@ -1569,9 +1744,9 @@ PatchSelection UscElemPatchSelectorImpl::select() {
                 d_cand_patch.data(), d_accepted.data(), K,
                 d_newly_ids.data(), d_winner.data());
             prof.mark(kEBuild);
-            restore_candidates_kernel<<<(K + kFixedBlockThreads - 1) / kFixedBlockThreads,
-                                        kFixedBlockThreads, 0, stream>>>(
-                d_cand_patch.data(), d_cand_score.data(), d_keys.data(), nullptr,
+            disable_accepted_kernel<<<(K + kFixedBlockThreads - 1) / kFixedBlockThreads,
+                                      kFixedBlockThreads, 0, stream>>>(
+                d_cand_patch.data(), d_keys.data(), nullptr,
                 d_accepted.data(), K, d_scores_.data(), block_argmax.view());
             prof.mark(kERestore);
             if (exchange) {
