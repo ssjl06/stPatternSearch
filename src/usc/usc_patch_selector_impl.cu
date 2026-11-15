@@ -4,6 +4,7 @@
 #include "core/cuda_check.hpp"
 #include "core/host_profiler.hpp"
 #include "core/device_primitives.hpp"
+#include "core/flat_patches.hpp"
 #include "core/hash_id_map_device.hpp"
 #include "core/inverted_index_device.hpp"
 
@@ -893,15 +894,18 @@ UscPatchSelectorImpl::UscPatchSelectorImpl(stComm::Comm& comm)
 }
 
 PatchSelection UscPatchSelectorImpl::patch_select(
-        std::vector<std::vector<Hash>> raw_patches,
-        std::vector<PatchId>           global_ids) {
+        std::vector<Hash>          hashes,
+        std::vector<std::uint64_t> offsets,
+        std::vector<PatchId>       global_ids) {
     patch_global_ids_ = std::move(global_ids);
     using W = detail::PhaseTimer::Where;
     detail::PhaseTimer phases;
 
     // Shared preprocessing: distributed hash→id mapping + PatchCsr + InvertedIndex
     // + device mirrors. USC owns only the score/covered state initialized below.
-    patch_set_ = std::make_unique<PatchSet>(comm_, std::move(raw_patches));
+    patch_set_ = std::make_unique<PatchSet>(comm_, hashes, offsets);
+    std::vector<Hash>().swap(hashes);
+    std::vector<std::uint64_t>().swap(offsets);
     phases.mark("PatchSet setup (detailed above)", W::Device);
 
     const std::uint64_t M_local = patch_set_->M_local();
@@ -912,10 +916,10 @@ PatchSelection UscPatchSelectorImpl::patch_select(
     d_covered_.resize((N + 63) / 64);
     std::uint64_t local_max = 0;
     if (M_local) {
-        const std::vector<std::uint64_t>& offsets = patch_set_->patch_offsets();
+        const std::vector<std::uint64_t>& id_offsets = patch_set_->patch_offsets();
         std::vector<WireScore> initial_scores(M_local);
         for (std::size_t p = 0; p < M_local; ++p) {
-            const std::uint64_t len = offsets[p + 1] - offsets[p];
+            const std::uint64_t len = id_offsets[p + 1] - id_offsets[p];
             initial_scores[p] = static_cast<WireScore>(len);
             local_max = std::max(local_max, len);
         }
@@ -1153,8 +1157,9 @@ UscElemPatchSelectorImpl::UscElemPatchSelectorImpl(stComm::Comm& comm)
 }
 
 PatchSelection UscElemPatchSelectorImpl::patch_select(
-        std::vector<std::vector<Hash>> raw_patches,
-        std::vector<PatchId>           global_ids) {
+        std::vector<Hash>          hashes,
+        std::vector<std::uint64_t> offsets,
+        std::vector<PatchId>       global_ids) {
     const int size = comm_.getSize();
     const int rank = comm_.getRank();
     using W = detail::PhaseTimer::Where;
@@ -1163,8 +1168,9 @@ PatchSelection UscElemPatchSelectorImpl::patch_select(
     // Shared §5.1 preprocessing: hash → dense ElementId translation.
     // The translated patches stay on the device (a CSR over this rank's
     // patches); everything up to the loop works on them there.
-    DeviceIdMappedPatches mapped =
-        map_hashes_to_element_ids_device(comm_, std::move(raw_patches));
+    DeviceIdMappedPatches mapped = map_hashes_to_element_ids_device(comm_, hashes, offsets);
+    std::vector<Hash>().swap(hashes);
+    std::vector<std::uint64_t>().swap(offsets);
     N_ = mapped.N;
     phases.mark("hash->id map (detailed above)", W::Device);
 
@@ -1642,24 +1648,33 @@ UscPatchSelector& UscPatchSelector::operator=(UscPatchSelector&&) noexcept = def
 
 PatchSelection UscPatchSelector::patch_select(std::vector<std::vector<Hash>> patches,
                                               std::vector<PatchId>           global_ids) {
+    PatchSlice slice;
+    slice.patches    = std::move(patches);
+    slice.global_ids = std::move(global_ids);
+    return patch_select(flatten_patches(std::move(slice)));
+}
+
+PatchSelection UscPatchSelector::patch_select(FlatPatches patches) {
     // Validate this rank's slice, then agree on the verdict: a rank throwing
     // on its own would leave its peers waiting in the setup collectives.
-    const auto int_max = static_cast<std::size_t>(std::numeric_limits<int>::max());
-    std::string err;
-    if (global_ids.size() != patches.size()) {
+    const auto int_max = static_cast<std::uint64_t>(std::numeric_limits<int>::max());
+    const std::uint64_t M = patches.patch_count();
+    std::string err = flat_patches_error(patches);
+    if (!err.empty()) {
+        err = "patch_select: " + err;
+    } else if (patches.global_ids.size() != M) {
         // Both modes index global_ids by local patch index (ByElement also
         // allgathers it as M_local entries) — a short vector reads out of bounds.
-        err = "patch_select: global_ids has " + std::to_string(global_ids.size()) +
-              " entries for " + std::to_string(patches.size()) + " patches";
-    } else if (patches.size() > int_max) {
-        // CUB ArgMax takes an int item count; a truncated one would scan a
-        // prefix and silently pick the wrong winner.
-        err = "patch_select: " + std::to_string(patches.size()) +
+        err = "patch_select: global_ids has " + std::to_string(patches.global_ids.size()) +
+              " entries for " + std::to_string(M) + " patches";
+    } else if (M > int_max) {
+        // Patch positions are int on the device.
+        err = "patch_select: " + std::to_string(M) +
               " patches on one rank exceeds the int index range — use more ranks";
     } else {
-        for (std::size_t p = 0; p < patches.size(); ++p) {
-            if (patches[p].size() > int_max) {  // kernel grid sizes derive from it
-                err = "patch_select: patch " + std::to_string(global_ids[p]) +
+        for (std::uint64_t p = 0; p < M; ++p) {
+            if (patches.offsets[p + 1] - patches.offsets[p] > int_max) {  // scores are int32
+                err = "patch_select: patch " + std::to_string(patches.global_ids[p]) +
                       " has more than INT_MAX elements";
                 break;
             }
@@ -1670,8 +1685,10 @@ PatchSelection UscPatchSelector::patch_select(std::vector<std::vector<Hash>> pat
             err.empty() ? std::string("patch_select: invalid input on another rank") : err);
     }
     return impl_->by_element
-        ? impl_->by_element->patch_select(std::move(patches), std::move(global_ids))
-        : impl_->by_patch->patch_select(std::move(patches), std::move(global_ids));
+        ? impl_->by_element->patch_select(std::move(patches.hashes), std::move(patches.offsets),
+                                          std::move(patches.global_ids))
+        : impl_->by_patch->patch_select(std::move(patches.hashes), std::move(patches.offsets),
+                                        std::move(patches.global_ids));
 }
 
 }  // namespace stPS

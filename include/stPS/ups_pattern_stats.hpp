@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stPS/partition.hpp>
 #include <stPS/types.hpp>
 
 #include <cstdint>
@@ -54,6 +55,16 @@ public:
     // write_unique_hashes_file call.
     std::vector<PatternStat> pattern_stats(std::vector<std::vector<Hash>>  patches,
                                            std::vector<std::vector<Point>> coords,
+                                           std::uint64_t k,
+                                           const std::string& unique_hashes_path = {});
+
+    // Same, from the flat form (see FlatPatches in <stPS/partition.hpp>):
+    // `patches.coords` must hold one point per hash; `patches.global_ids` is
+    // ignored. Prefer this when the data already is flat (a patch file is) —
+    // the hashes are uploaded to the GPU once and nothing is copied on the
+    // host. A malformed `offsets` array throws std::invalid_argument like a
+    // coords mismatch.
+    std::vector<PatternStat> pattern_stats(FlatPatches patches,
                                            std::uint64_t k,
                                            const std::string& unique_hashes_path = {});
 

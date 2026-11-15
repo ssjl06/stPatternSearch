@@ -89,8 +89,7 @@ inline std::size_t target_rank_for_hash(Hash h, const std::vector<Hash>& splitte
 
 }  // namespace
 
-IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
-                                          std::vector<std::vector<Hash>> raw_patches) {
+HostHashIds assign_hash_ids(stComm::Comm& comm, std::vector<Hash> local_uniq) {
     const int size = comm.getSize();
     const int rank = comm.getRank();
     const auto usize = static_cast<std::size_t>(size);
@@ -101,23 +100,13 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
     // ranks (permanent). Within setup we perform a *temporary* hash partition:
     // each unique hash is routed to its owner rank, the owner assigns a
     // contiguous block of global IDs to its bucket, then each rank receives back
-    // the IDs for the hashes it originally held. The hash partition is discarded;
-    // what survives is each patch translated into dense ElementId space.
+    // the IDs for the hashes it originally held. The hash partition is discarded.
 
-    // Step 1: flatten + dedupe this rank's local hash set.
-    std::vector<Hash> local_uniq;
-    {
-        std::size_t total = 0;
-        for (const auto& p : raw_patches) total += p.size();
-        local_uniq.reserve(total);
-        for (const auto& p : raw_patches) {
-            local_uniq.insert(local_uniq.end(), p.begin(), p.end());
-        }
-        std::sort(local_uniq.begin(), local_uniq.end());
-        local_uniq.erase(std::unique(local_uniq.begin(), local_uniq.end()), local_uniq.end());
-    }
+    // Step 1: this rank's distinct hashes, sorted.
+    std::sort(local_uniq.begin(), local_uniq.end());
+    local_uniq.erase(std::unique(local_uniq.begin(), local_uniq.end()), local_uniq.end());
 
-    phases.mark("flatten + sort + unique", W::Host);
+    phases.mark("sort + unique", W::Host);
 
     // Step 2: sample-sort based partitioning. Every rank computes the same
     // (size-1) splitters from gathered samples, then routes each hash to its
@@ -182,26 +171,48 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
 
     phases.mark("id return exchange", W::HostComm);
 
-    // Step 10: local_uniq[i] ↔ id_back[i] are paired by construction. Build
-    // this rank's hash → id map. A hash table on purpose: a binary search over
-    // local_uniq needs no extra memory but measured ~2.5× slower for the whole
-    // setup (one cache-missing probe chain per occurrence).
-    std::unordered_map<Hash, ElementId> hash_to_id;
-    hash_to_id.reserve(local_uniq.size() * 2);
-    for (std::size_t i = 0; i < local_uniq.size(); ++i) {
-        hash_to_id.emplace(local_uniq[i], id_back[i]);
-    }
-    local_uniq.clear(); local_uniq.shrink_to_fit();
-    id_back.clear();    id_back.shrink_to_fit();
-
-    // Step 11: translate raw_patches into ID-space, sort + dedupe per patch. The
-    // local patch index [0, M_local) is preserved in input order. The bucket
-    // (this rank's element shard, sorted) survives as the ElementId → Hash
-    // reverse map: bucket[i] ↔ global ID (global_id_start + i) by Step 8.
-    IdMappedPatches out;
+    phases.report(stderr, "[stps-profile hash ids]", rank);
+    HostHashIds out;
+    out.local_hashes = std::move(local_uniq);
+    out.local_ids    = std::move(id_back);
     out.N            = N_total;
     out.shard_hashes = std::move(bucket);
     out.shard_start  = global_id_start;
+    return out;
+}
+
+IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
+                                          std::vector<std::vector<Hash>> raw_patches) {
+    using W = detail::PhaseTimer::Where;
+    detail::PhaseTimer phases;
+    std::vector<Hash> all;
+    {
+        std::size_t total = 0;
+        for (const auto& p : raw_patches) total += p.size();
+        all.reserve(total);
+        for (const auto& p : raw_patches) all.insert(all.end(), p.begin(), p.end());
+    }
+    HostHashIds ids = assign_hash_ids(comm, std::move(all));
+    phases.mark("hash ids (detailed above)", W::Host);
+
+    // local_hashes[i] ↔ local_ids[i] are paired by construction. Build this
+    // rank's hash → id map. A hash table on purpose: a binary search over
+    // local_hashes needs no extra memory but measured ~2.5× slower for the
+    // whole setup (one cache-missing probe chain per occurrence).
+    std::unordered_map<Hash, ElementId> hash_to_id;
+    hash_to_id.reserve(ids.local_hashes.size() * 2);
+    for (std::size_t i = 0; i < ids.local_hashes.size(); ++i) {
+        hash_to_id.emplace(ids.local_hashes[i], ids.local_ids[i]);
+    }
+    std::vector<Hash>().swap(ids.local_hashes);
+    std::vector<std::uint64_t>().swap(ids.local_ids);
+
+    // Translate raw_patches into ID-space, sort + dedupe per patch. The local
+    // patch index [0, M_local) is preserved in input order.
+    IdMappedPatches out;
+    out.N            = ids.N;
+    out.shard_hashes = std::move(ids.shard_hashes);
+    out.shard_start  = ids.shard_start;
     out.id_patches.resize(raw_patches.size());
     for (std::size_t p = 0; p < raw_patches.size(); ++p) {
         std::vector<Hash>& src = raw_patches[p];
@@ -215,23 +226,33 @@ IdMappedPatches map_hashes_to_element_ids(stComm::Comm& comm,
         std::vector<Hash>().swap(src);  // release the hashes as we go
     }
     phases.mark("hash table + translate patches", W::Host);
-    phases.report(stderr, "[stps-profile hash->id map]", rank);
+    phases.report(stderr, "[stps-profile hash->id map]", comm.getRank());
     return out;
 }
 
 PatchSet::PatchSet(stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches,
-                   PatchSetMirrors mirrors) {
+                   PatchSetMirrors mirrors)
+    : PatchSet(comm, map_hashes_to_element_ids_device(comm, std::move(raw_patches)), mirrors) {}
+
+PatchSet::PatchSet(stComm::Comm& comm, const std::vector<Hash>& hashes,
+                   const std::vector<std::uint64_t>& offsets, PatchSetMirrors mirrors)
+    : PatchSet(comm, map_hashes_to_element_ids_device(comm, hashes, offsets), mirrors) {}
+
+PatchSet::PatchSet(stComm::Comm& comm, DeviceBuffer<Hash> d_hashes,
+                   DeviceBuffer<std::uint64_t> d_offsets, std::uint64_t M,
+                   PatchSetMirrors mirrors)
+    : PatchSet(comm,
+               map_hashes_to_element_ids_device(comm, std::move(d_hashes), std::move(d_offsets), M),
+               mirrors) {}
+
+PatchSet::PatchSet(stComm::Comm& comm, DeviceIdMappedPatches mapped, PatchSetMirrors mirrors) {
     // Shared §5.1 hash → ID mapping, then the patch-partitioned structures:
     // patch CSR + inverted index stay partitioned by patch ID.
     using W = detail::PhaseTimer::Where;
     detail::PhaseTimer phases;
-    DeviceIdMappedPatches mapped =
-        map_hashes_to_element_ids_device(comm, std::move(raw_patches));
     N_            = mapped.N;
     shard_hashes_ = std::move(mapped.shard_hashes);
     shard_start_  = mapped.shard_start;
-    phases.mark("hash->id map (detailed above)", W::Device);
-
     // Inverted index: built on the device from the device CSR. UPS reads only
     // its layout (keys + offsets), so the values are dropped there.
     const std::uint64_t M     = mapped.M_local;

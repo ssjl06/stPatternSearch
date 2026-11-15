@@ -33,4 +33,9 @@ inline constexpr std::size_t kUniqueHashHeaderBytes  = 16;
 std::uint64_t write_unique_hashes_file(stComm::Comm& comm, const std::string& path,
                                        std::vector<std::vector<Hash>> patches);
 
+// Same, from this rank's hashes as one flat array (FlatPatches::hashes — the
+// patch boundaries play no part here). Any order, duplicates allowed.
+std::uint64_t write_unique_hashes_file(stComm::Comm& comm, const std::string& path,
+                                       std::vector<Hash> hashes);
+
 }  // namespace stPS

@@ -1,5 +1,6 @@
 #include <stPS/ups_pattern_stats.hpp>
 
+#include "core/flat_patches.hpp"
 #include "core/device_primitives.hpp"
 #include "core/collective.hpp"
 #include "core/cuda_check.hpp"
@@ -137,15 +138,17 @@ struct UpsPatternStats::Impl {
         }
     }
 
-    std::vector<PatternStat> run(std::vector<std::vector<Hash>>  patches,
-                                 std::vector<std::vector<Point>> coords,
-                                 std::uint64_t k,
+    // Validate (collectively), then run. `preflight_error` carries a problem
+    // the caller already found while preparing `patches` (empty = none).
+    std::vector<PatternStat> checked_run(FlatPatches patches, std::string preflight_error,
+                                         std::uint64_t k,
+                                         const std::string& unique_hashes_path);
+    std::vector<PatternStat> run(FlatPatches patches, std::uint64_t k,
                                  const std::string& unique_hashes_path);
 };
 
 std::vector<PatternStat> UpsPatternStats::Impl::run(
-    std::vector<std::vector<Hash>>  patches,
-    std::vector<std::vector<Point>> coords,
+    FlatPatches patches,
     std::uint64_t k,
     const std::string& unique_hashes_path) {
     const int size = comm.getSize();
@@ -154,34 +157,34 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
     using W = detail::PhaseTimer::Where;
     detail::PhaseTimer phases;
 
+    // ---- Upload this rank's occurrences once: hashes (they also feed the
+    // PatchSet below, on the device), their points, and the patch offsets.
+    const std::size_t   total_occ = patches.hashes.size();
+    const std::uint64_t M         = patches.patch_count();
+    DeviceBuffer<Hash>          d_occ_hash(total_occ);
+    DeviceBuffer<Point>         d_occ_pts(total_occ);
+    DeviceBuffer<std::uint64_t> d_patch_offsets(M + 1);
+    if (total_occ > 0) {
+        d_occ_hash.copy_from_host(patches.hashes.data(), total_occ);
+        d_occ_pts.copy_from_host(patches.coords.data(), total_occ);
+    }
+    if (patches.offsets.empty()) d_patch_offsets.zero();
+    else d_patch_offsets.copy_from_host(patches.offsets.data(), M + 1);
+    patches = FlatPatches{};
+
+    phases.mark("upload occurrences", W::Transfer);
+
     // ---- A. Local occurrence reduction (device): sort this rank's raw
     // (hash, point) occurrences by hash, then reduce-by-key with lexicographic
     // min — one representative candidate per local unique hash, hash-sorted.
-    std::size_t total_occ = 0;
-    for (const auto& p : patches) total_occ += p.size();
-
-    std::vector<Hash>  h_occ_hash;  h_occ_hash.reserve(total_occ);
-    std::vector<Point> h_occ_pts;   h_occ_pts.reserve(total_occ);
-    for (std::size_t p = 0; p < patches.size(); ++p) {
-        h_occ_hash.insert(h_occ_hash.end(), patches[p].begin(), patches[p].end());
-        h_occ_pts.insert(h_occ_pts.end(), coords[p].begin(), coords[p].end());
-    }
-    coords.clear(); coords.shrink_to_fit();
-
-    phases.mark("flatten occurrences", W::Host);
-
-    // One representative per local unique hash, right-sized: everything else
-    // from this stage (24 B per raw occurrence) is released before the PatchSet
-    // and the exchange buffers are built.
+    // One representative per local unique hash, right-sized: the rest of this
+    // stage's scratch is released before the PatchSet and the exchange buffers
+    // are built (the unsorted hashes stay — the PatchSet consumes them).
     DeviceBuffer<Point> d_min_pts;
     std::uint64_t n_uniq = 0;
     if (total_occ > 0) {
-        DeviceBuffer<Hash>  d_occ_hash(total_occ), d_sorted_hash(total_occ);
-        DeviceBuffer<Point> d_occ_pts(total_occ),  d_sorted_pts(total_occ);
-        d_occ_hash.copy_from_host(h_occ_hash.data(), total_occ);
-        d_occ_pts.copy_from_host(h_occ_pts.data(), total_occ);
-        h_occ_hash.clear(); h_occ_hash.shrink_to_fit();
-        h_occ_pts.clear();  h_occ_pts.shrink_to_fit();
+        DeviceBuffer<Hash>  d_sorted_hash(total_occ);
+        DeviceBuffer<Point> d_sorted_pts(total_occ);
 
         cub_run(d_temp, "radix-sort occurrences", [&](void* t, std::size_t& b) {
             return cub::DeviceRadixSort::SortPairs(t, b,
@@ -213,13 +216,15 @@ std::vector<PatternStat> UpsPatternStats::Impl::run(
         }
     }
 
+    d_occ_pts = DeviceBuffer<Point>();
     phases.mark("A occurrence reduction", W::Device);
 
     // ---- Shared distributed setup. The §5.1 mapping assigns IDs in global
     // hash order, so the hash-sorted reduction above pairs positionally with
     // the PatchSet's sorted inverted-index keys.
     // UPS kernels read only the inverted-index layout (keys + offsets).
-    PatchSet ps(comm, std::move(patches), PatchSetMirrors::InvertedIndexLayout);
+    PatchSet ps(comm, std::move(d_occ_hash), std::move(d_patch_offsets), M,
+                PatchSetMirrors::InvertedIndexLayout);
     // Optional full unique-hash dump straight from the PatchSet's §5.1 shards,
     // so the hash sort runs once for both outputs.
     if (!unique_hashes_path.empty()) {
@@ -475,44 +480,70 @@ UpsPatternStats::~UpsPatternStats()                                      = defau
 UpsPatternStats::UpsPatternStats(UpsPatternStats&&) noexcept             = default;
 UpsPatternStats& UpsPatternStats::operator=(UpsPatternStats&&) noexcept = default;
 
-std::vector<PatternStat> UpsPatternStats::pattern_stats(
-    std::vector<std::vector<Hash>>  patches,
-    std::vector<std::vector<Point>> coords,
-    std::uint64_t k,
+std::vector<PatternStat> UpsPatternStats::Impl::checked_run(
+    FlatPatches patches, std::string err, std::uint64_t k,
     const std::string& unique_hashes_path) {
     // Validate this rank's slice, then agree on the verdict: a rank throwing
     // on its own would leave its peers waiting in the setup collectives.
-    std::string err;
-    std::size_t total_occ = 0;
-    if (coords.size() != patches.size()) {
-        err = "pattern_stats: coords/patches shape mismatch";
+    if (err.empty()) err = flat_patches_error(patches);
+    if (err.empty() && patches.coords.size() != patches.hashes.size()) {
+        err = "coords must hold one point per hash";
     }
-    for (std::size_t p = 0; err.empty() && p < patches.size(); ++p) {
-        total_occ += patches[p].size();
-        if (coords[p].size() != patches[p].size()) {
-            err = "pattern_stats: coords/patches shape mismatch at patch " + std::to_string(p);
-            break;
-        }
+    if (err.empty()) {
         // A NaN wins every LexMinPoint comparison (and breaks its
         // associativity), so it would silently become the representative.
-        for (const Point& pt : coords[p]) {
-            if (!std::isfinite(pt.x) || !std::isfinite(pt.y)) {
-                err = "pattern_stats: non-finite coordinate in patch " + std::to_string(p);
+        for (std::size_t i = 0; i < patches.coords.size(); ++i) {
+            if (!std::isfinite(patches.coords[i].x) || !std::isfinite(patches.coords[i].y)) {
+                err = "non-finite coordinate at occurrence " + std::to_string(i);
                 break;
             }
         }
     }
     if (err.empty() &&
-        total_occ > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        patches.hashes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         // The occurrence radix sort / reduce-by-key take an int item count.
-        err = "pattern_stats: " + std::to_string(total_occ) + " occurrences on one "
-              "rank exceeds the int range of the device sort — use more ranks";
+        err = std::to_string(patches.hashes.size()) + " occurrences on one rank exceeds "
+              "the int range of the device sort — use more ranks";
     }
-    if (!all_ranks_ok(impl_->comm, err.empty())) {
+    if (!all_ranks_ok(comm, err.empty())) {
         throw std::invalid_argument(
-            err.empty() ? std::string("pattern_stats: invalid input on another rank") : err);
+            err.empty() ? std::string("pattern_stats: invalid input on another rank")
+                        : "pattern_stats: " + err);
     }
-    return impl_->run(std::move(patches), std::move(coords), k, unique_hashes_path);
+    return run(std::move(patches), k, unique_hashes_path);
+}
+
+std::vector<PatternStat> UpsPatternStats::pattern_stats(
+    FlatPatches patches, std::uint64_t k, const std::string& unique_hashes_path) {
+    return impl_->checked_run(std::move(patches), {}, k, unique_hashes_path);
+}
+
+std::vector<PatternStat> UpsPatternStats::pattern_stats(
+    std::vector<std::vector<Hash>>  patches,
+    std::vector<std::vector<Point>> coords,
+    std::uint64_t k,
+    const std::string& unique_hashes_path) {
+    // A shape mismatch cannot be flattened; it still has to reach the
+    // collective verdict, so it travels as a preflight error.
+    std::string err;
+    if (coords.size() != patches.size()) {
+        err = "coords/patches shape mismatch";
+    }
+    for (std::size_t p = 0; err.empty() && p < patches.size(); ++p) {
+        if (coords[p].size() != patches[p].size()) {
+            err = "coords/patches shape mismatch at patch " + std::to_string(p);
+        }
+    }
+    FlatPatches flat;
+    if (err.empty()) {
+        PatchSlice slice;
+        slice.patches = std::move(patches);
+        slice.coords  = std::move(coords);
+        // flatten_patches reads an empty coords as "no coordinates"; here every
+        // patch has (possibly zero) points, and zero patches is fine either way.
+        flat = flatten_patches(std::move(slice));
+    }
+    return impl_->checked_run(std::move(flat), std::move(err), k, unique_hashes_path);
 }
 
 }  // namespace stPS

@@ -1,5 +1,7 @@
 #include <stPS/partition.hpp>
+#include "core/flat_patches.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -49,6 +51,58 @@ PatchSlice slice_patches_by_rank(std::vector<std::vector<Hash>> all_patches,
         slice.coords.push_back(std::move(coords[my_begin + p]));
     }
     return slice;
+}
+
+FlatPatches flatten_patches(PatchSlice slice) {
+    FlatPatches out;
+    const std::size_t M = slice.patches.size();
+    const bool with_coords = !slice.coords.empty();
+    if (with_coords && slice.coords.size() != M) {
+        throw std::invalid_argument("flatten_patches: coords must have one entry per patch");
+    }
+    out.offsets.resize(M + 1);
+    out.offsets[0] = 0;
+    for (std::size_t p = 0; p < M; ++p) {
+        if (with_coords && slice.coords[p].size() != slice.patches[p].size()) {
+            throw std::invalid_argument(
+                "flatten_patches: coords/patches shape mismatch at patch " + std::to_string(p));
+        }
+        out.offsets[p + 1] = out.offsets[p] + slice.patches[p].size();
+    }
+    out.hashes.reserve(out.offsets[M]);
+    if (with_coords) out.coords.reserve(out.offsets[M]);
+    for (std::size_t p = 0; p < M; ++p) {
+        out.hashes.insert(out.hashes.end(), slice.patches[p].begin(), slice.patches[p].end());
+        std::vector<Hash>().swap(slice.patches[p]);
+        if (with_coords) {
+            out.coords.insert(out.coords.end(), slice.coords[p].begin(), slice.coords[p].end());
+            std::vector<Point>().swap(slice.coords[p]);
+        }
+    }
+    out.global_ids = std::move(slice.global_ids);
+    return out;
+}
+
+std::string flat_patches_error(const FlatPatches& patches) {
+    const auto& off = patches.offsets;
+    if (off.empty()) {
+        if (!patches.hashes.empty()) return "hashes given without offsets";
+    } else {
+        if (off.front() != 0) return "offsets must start at 0";
+        for (std::size_t p = 0; p + 1 < off.size(); ++p) {
+            if (off[p] > off[p + 1]) {
+                return "offsets decrease at patch " + std::to_string(p);
+            }
+        }
+        if (off.back() != patches.hashes.size()) {
+            return "offsets end at " + std::to_string(off.back()) + " but there are " +
+                   std::to_string(patches.hashes.size()) + " hashes";
+        }
+    }
+    if (!patches.coords.empty() && patches.coords.size() != patches.hashes.size()) {
+        return "coords must be empty or hold one point per hash";
+    }
+    return {};
 }
 
 }  // namespace stPS

@@ -122,51 +122,43 @@ public:
     std::uint64_t patch_count() override { return M_; }
     bool has_coords() override { return has_coords_; }
 
-    PatchSlice read_slice(std::uint64_t begin, std::uint64_t end) override {
+    FlatPatches read_flat(std::uint64_t begin, std::uint64_t end) override {
         if (begin > end || end > M_) {
             fail(path_, "slice [" + std::to_string(begin) + ", " + std::to_string(end) +
                         ") out of range (M=" + std::to_string(M_) + ")");
         }
         const std::uint64_t n = end - begin;
+        FlatPatches out;
 
-        // Read this slice's offsets window: n+1 entries starting at offsets[begin].
-        std::vector<std::uint64_t> offs(n + 1);
+        // This slice's offsets window: n+1 entries starting at offsets[begin].
+        out.offsets.resize(n + 1);
         seek_to(file_.get(), kHeaderBytes + begin * 8, path_);
-        read_exact(file_.get(), offs.data(), (n + 1) * 8, path_);
+        read_exact(file_.get(), out.offsets.data(), (n + 1) * 8, path_);
         for (std::uint64_t i = 0; i < n; ++i) {
-            if (offs[i] > offs[i + 1]) fail(path_, "corrupt offsets (not monotone)");
+            if (out.offsets[i] > out.offsets[i + 1]) fail(path_, "corrupt offsets (not monotone)");
         }
-        if (offs[n] > total_K_) fail(path_, "corrupt offsets (past hash section)");
+        if (out.offsets[n] > total_K_) fail(path_, "corrupt offsets (past hash section)");
+        const std::uint64_t first = out.offsets[0];
+        const std::uint64_t count = out.offsets[n] - first;
 
-        // Read this slice's hash window in one contiguous read, then split.
+        // The hash window, one contiguous read straight into its final place.
         const std::uint64_t hash_base = kHeaderBytes + (M_ + 1) * 8;
-        std::vector<Hash> flat(offs[n] - offs[0]);
-        seek_to(file_.get(), hash_base + offs[0] * 8, path_);
-        read_exact(file_.get(), flat.data(), flat.size() * 8, path_);
+        out.hashes.resize(count);
+        seek_to(file_.get(), hash_base + first * 8, path_);
+        read_exact(file_.get(), out.hashes.data(), count * 8, path_);
 
         // v2: same window into the coords section (indexed by the same offsets).
-        std::vector<Point> flat_coords;
         if (has_coords_) {
             const std::uint64_t coord_base = hash_base + total_K_ * 8;
-            flat_coords.resize(flat.size());
-            seek_to(file_.get(), coord_base + offs[0] * 16, path_);
-            read_exact(file_.get(), flat_coords.data(), flat_coords.size() * 16, path_);
+            out.coords.resize(count);
+            seek_to(file_.get(), coord_base + first * 16, path_);
+            read_exact(file_.get(), out.coords.data(), count * 16, path_);
         }
 
-        PatchSlice slice;
-        slice.patches.reserve(n);
-        slice.global_ids.reserve(n);
-        if (has_coords_) slice.coords.reserve(n);
-        for (std::uint64_t p = 0; p < n; ++p) {
-            const auto b = static_cast<std::ptrdiff_t>(offs[p] - offs[0]);
-            const auto e = static_cast<std::ptrdiff_t>(offs[p + 1] - offs[0]);
-            slice.patches.emplace_back(flat.begin() + b, flat.begin() + e);
-            slice.global_ids.push_back(begin + p);
-            if (has_coords_) {
-                slice.coords.emplace_back(flat_coords.begin() + b, flat_coords.begin() + e);
-            }
-        }
-        return slice;
+        for (std::uint64_t& o : out.offsets) o -= first;
+        out.global_ids.resize(n);
+        for (std::uint64_t p = 0; p < n; ++p) out.global_ids[p] = begin + p;
+        return out;
     }
 
 private:
@@ -178,6 +170,30 @@ private:
 };
 
 }  // namespace
+
+PatchSlice PatchReader::read_slice(std::uint64_t begin, std::uint64_t end) {
+    FlatPatches flat = read_flat(begin, end);
+    const std::uint64_t n = flat.patch_count();
+    const bool with_coords = has_coords();
+    PatchSlice slice;
+    slice.patches.reserve(n);
+    if (with_coords) slice.coords.reserve(n);
+    for (std::uint64_t p = 0; p < n; ++p) {
+        const auto b = static_cast<std::ptrdiff_t>(flat.offsets[p]);
+        const auto e = static_cast<std::ptrdiff_t>(flat.offsets[p + 1]);
+        slice.patches.emplace_back(flat.hashes.begin() + b, flat.hashes.begin() + e);
+        if (with_coords) {
+            slice.coords.emplace_back(flat.coords.begin() + b, flat.coords.begin() + e);
+        }
+    }
+    slice.global_ids = std::move(flat.global_ids);
+    return slice;
+}
+
+FlatPatches read_rank_flat(PatchReader& reader, int rank, int size) {
+    const RankRange mine = rank_range(reader.patch_count(), rank, size);
+    return reader.read_flat(mine.begin, mine.end);
+}
 
 PatchSlice read_rank_slice(PatchReader& reader, int rank, int size) {
     const RankRange mine = rank_range(reader.patch_count(), rank, size);

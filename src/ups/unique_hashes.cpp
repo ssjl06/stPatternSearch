@@ -1,3 +1,5 @@
+#include <vector>
+#include <cstddef>
 #include <stPS/unique_hashes.hpp>
 
 #include "core/patch_set.hpp"
@@ -29,12 +31,24 @@ void write_unique_hash_shards(stComm::Comm& comm, const std::string& path,
 }
 
 std::uint64_t write_unique_hashes_file(stComm::Comm& comm, const std::string& path,
+                                       std::vector<Hash> hashes) {
+    // Only the hash sort's shards are needed — not which patch a hash is in.
+    const HostHashIds ids = assign_hash_ids(comm, std::move(hashes));
+    write_unique_hash_shards(comm, path, ids.shard_hashes, ids.shard_start, ids.N);
+    return ids.N;
+}
+
+std::uint64_t write_unique_hashes_file(stComm::Comm& comm, const std::string& path,
                                        std::vector<std::vector<Hash>> patches) {
-    // Only the hash sort's shards are needed; the hash → ID translation the
-    // mapping also does is unused here (cheap next to the sort itself).
-    const IdMappedPatches mapped = map_hashes_to_element_ids(comm, std::move(patches));
-    write_unique_hash_shards(comm, path, mapped.shard_hashes, mapped.shard_start, mapped.N);
-    return mapped.N;
+    std::size_t total = 0;
+    for (const auto& p : patches) total += p.size();
+    std::vector<Hash> all;
+    all.reserve(total);
+    for (auto& p : patches) {
+        all.insert(all.end(), p.begin(), p.end());
+        std::vector<Hash>().swap(p);
+    }
+    return write_unique_hashes_file(comm, path, std::move(all));
 }
 
 }  // namespace stPS

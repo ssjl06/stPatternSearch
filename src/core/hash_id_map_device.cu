@@ -73,6 +73,37 @@ __global__ void csr_offsets_kernel(const u64* owners, const u64* rank, u64 total
 
 DeviceIdMappedPatches map_hashes_to_element_ids_device(
         stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches) {
+    const u64 M = raw_patches.size();
+    std::vector<u64> offsets(M + 1, 0);
+    for (u64 p = 0; p < M; ++p) offsets[p + 1] = offsets[p] + raw_patches[p].size();
+    std::vector<Hash> flat;
+    flat.reserve(offsets[M]);
+    for (auto& p : raw_patches) {
+        flat.insert(flat.end(), p.begin(), p.end());
+        std::vector<Hash>().swap(p);  // release the hashes as we go
+    }
+    return map_hashes_to_element_ids_device(comm, flat, offsets);
+}
+
+DeviceIdMappedPatches map_hashes_to_element_ids_device(
+        stComm::Comm& comm, const std::vector<Hash>& hashes,
+        const std::vector<u64>& offsets) {
+    using W = detail::PhaseTimer::Where;
+    detail::PhaseTimer phases;
+    const u64 M = offsets.empty() ? 0 : offsets.size() - 1;
+    DeviceBuffer<u64> d_hashes(hashes.size());
+    if (!hashes.empty()) d_hashes.copy_from_host(hashes.data(), hashes.size());
+    DeviceBuffer<u64> d_offsets(M + 1);
+    if (offsets.empty()) d_offsets.zero();
+    else d_offsets.copy_from_host(offsets.data(), M + 1);
+    phases.mark("upload", W::Transfer);
+    phases.report(stderr, "[stps-profile hash upload]", comm.getRank());
+    return map_hashes_to_element_ids_device(comm, std::move(d_hashes), std::move(d_offsets), M);
+}
+
+DeviceIdMappedPatches map_hashes_to_element_ids_device(
+        stComm::Comm& comm, DeviceBuffer<Hash> d_values,   // hashes now, element IDs later
+        DeviceBuffer<u64> d_offsets, u64 M) {
     if (!comm.hasDevice()) {
         throw std::invalid_argument(
             "map_hashes_to_element_ids_device requires a device-enabled Comm");
@@ -84,28 +115,8 @@ DeviceIdMappedPatches map_hashes_to_element_ids_device(
     detail::PhaseTimer phases;
 
     DeviceIdMappedPatches out;
-    const u64 M = raw_patches.size();
     out.M_local = M;
-
-    // ---- Upload: one flat hash array + the patch offsets ---------------------
-    std::vector<u64> offsets(M + 1, 0);
-    for (u64 p = 0; p < M; ++p) offsets[p + 1] = offsets[p] + raw_patches[p].size();
-    const u64 total = offsets[M];
-
-    DeviceBuffer<u64> d_values(total);  // hashes now, element IDs after translation
-    {
-        std::vector<Hash> flat;
-        flat.reserve(total);
-        for (auto& p : raw_patches) {
-            flat.insert(flat.end(), p.begin(), p.end());
-            std::vector<Hash>().swap(p);  // release the hashes as we go
-        }
-        if (total) d_values.copy_from_host(flat.data(), total);
-    }
-    DeviceBuffer<u64> d_offsets(M + 1);
-    d_offsets.copy_from_host(offsets.data(), M + 1);
-    std::vector<u64>().swap(offsets);
-    phases.mark("flatten + upload", W::Transfer);
+    const u64 total = d_values.size();
 
     // ---- This rank's distinct hashes, sorted ---------------------------------
     DeviceBuffer<u64> d_uniq;

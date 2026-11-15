@@ -123,16 +123,19 @@ int main(int argc, char** argv) {
             // --input: each rank reads only its own slice of the patch file;
             // otherwise every rank generates the (deterministic) synthetic set
             // and keeps its slice.
-            auto slice = !opt.input.empty()
-                ? stPS::read_rank_slice(*stPS::open_patch_file(opt.input),
-                                        comm.getRank(), comm.getSize())
-                : stPS::slice_patches_by_rank(
-                      generate_synthetic(opt.params), comm.getRank(), comm.getSize());
-            const std::size_t m_local = slice.patches.size();  // capture before move
+            // Either way the slice is flat: a file is read straight into that
+            // form, with no per-patch allocation on the way to the GPU.
+            stPS::FlatPatches slice = !opt.input.empty()
+                ? stPS::read_rank_flat(*stPS::open_patch_file(opt.input),
+                                       comm.getRank(), comm.getSize())
+                : stPS::flatten_patches(stPS::slice_patches_by_rank(
+                      generate_synthetic(opt.params), comm.getRank(), comm.getSize()));
+            slice.coords.clear();   // a v2 file's locations play no part in USC
+            slice.coords.shrink_to_fit();
+            const std::uint64_t m_local = slice.patch_count();  // capture before move
 
             auto t0 = std::chrono::steady_clock::now();
-            const auto result =
-                selector.patch_select(std::move(slice.patches), std::move(slice.global_ids));
+            const auto result = selector.patch_select(std::move(slice));
             auto t1 = std::chrono::steady_clock::now();
 
             if (comm.getRank() == 0) {

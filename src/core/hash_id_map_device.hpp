@@ -26,15 +26,29 @@ struct DeviceIdMappedPatches {
 };
 
 // Collective: the distributed hash → ID mapping of map_hashes_to_element_ids,
-// run on the GPU. The hashes are uploaded once; sorting, de-duplication, the
-// rank-to-rank exchanges (device-direct) and the per-patch translation all
-// happen in device memory. Only scalars and the splitter samples cross to the
+// run on the GPU: sorting, de-duplication, the rank-to-rank exchanges
+// (device-direct) and the per-patch translation all happen in device memory. Only scalars and the splitter samples cross to the
 // host. Needs a device-enabled Comm.
 //
 // IDs, N and the shards are identical to the host mapping's.
 //
 // Peak device memory: 32 B per hash occurrence (the pair sort that orders each
 // patch), on top of this rank's distinct hashes.
+//
+// `d_hashes` holds this rank's hash occurrences patch after patch and
+// `d_offsets` their CSR offsets (M + 1 entries, the first 0, the last
+// d_hashes.size()); both are consumed.
+DeviceIdMappedPatches map_hashes_to_element_ids_device(
+    stComm::Comm& comm, DeviceBuffer<Hash> d_hashes,
+    DeviceBuffer<std::uint64_t> d_offsets, std::uint64_t M);
+
+// Same, uploading a flat host slice first (`offsets` may be empty for "no
+// patches").
+DeviceIdMappedPatches map_hashes_to_element_ids_device(
+    stComm::Comm& comm, const std::vector<Hash>& hashes,
+    const std::vector<std::uint64_t>& offsets);
+
+// Same, from one vector per patch: flattened on the host, then uploaded.
 DeviceIdMappedPatches map_hashes_to_element_ids_device(
     stComm::Comm& comm, std::vector<std::vector<Hash>> raw_patches);
 
