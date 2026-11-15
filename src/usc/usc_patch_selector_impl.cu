@@ -166,23 +166,6 @@ __device__ inline int max_key_position(unsigned long long key) {
     return static_cast<int>(0xFFFFFFFFull - (key & 0xFFFFFFFFull));
 }
 
-// Run by every thread of ONE CUDA block: the maximum of values[lo, hi), first
-// position among equals, left in *s_key (shared; 0 for an empty range). One
-// atomic per thread instead of a reduction tree: the candidate extraction
-// calls this twice per candidate, and the tree's barriers dominated it.
-__device__ inline void reduce_range_max(const WireScore* values, std::uint64_t lo,
-                                        std::uint64_t hi, unsigned long long* s_key) {
-    if (threadIdx.x == 0) *s_key = 0;
-    __syncthreads();
-    unsigned long long best = 0;
-    for (std::uint64_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
-        const unsigned long long k = pack_max_key(values[i], i);
-        if (k > best) best = k;
-    }
-    if (best) atomicMax(s_key, best);
-    __syncthreads();
-}
-
 // ---------------------------------------------------------------------------
 // Device-resident loop kernels (Full-GPU iteration track), shared by both
 // partition modes.
@@ -417,35 +400,70 @@ __global__ void extract_candidates_kernel(WireScore* scores, std::uint64_t M,
     __shared__ unsigned long long s_key;
     __shared__ int                s_patch;   // patch just set aside, -1 = no more candidates
     const unsigned int tid = threadIdx.x;
-    if (tid == 0 && blocks.count) *blocks.count = 0;   // the refresh before this consumed the queue
+
+    // Each thread owns a contiguous group of blocks and remembers the best
+    // block maximum in it. A candidate then costs one atomic per thread plus a
+    // rescan of the one group that changed — not a pass over every block
+    // maximum, which would grow with the patch count.
+    const std::uint64_t group = (num_blocks + kTopThreads - 1) / kTopThreads;
+    const auto group_best = [&](unsigned int t) {
+        unsigned long long best = 0;
+        const std::uint64_t lo = t * group;
+        std::uint64_t hi = lo + group;
+        if (hi > num_blocks) hi = num_blocks;
+        for (std::uint64_t b = lo; b < hi; ++b) {
+            const unsigned long long k = pack_max_key(blocks.block_val[b], b);
+            if (k > best) best = k;
+        }
+        return best;
+    };
+    unsigned long long my_best = group_best(tid);
+
+    if (tid == 0) {
+        if (blocks.count) *blocks.count = 0;   // the refresh before this consumed the queue
+        s_key = 0;
+    }
+    __syncthreads();
     unsigned int j = 0;
     for (; j < K; ++j) {
         // Second argmax stage: the best block maximum, first block among equals.
-        reduce_range_max(blocks.block_val, 0, num_blocks, &s_key);
+        if (my_best) atomicMax(&s_key, my_best);
+        __syncthreads();
+        const std::uint64_t b = s_key ? static_cast<std::uint64_t>(max_key_position(s_key)) : 0;
         if (tid == 0) {
             s_patch = -1;
             const WireScore score = s_key ? max_key_score(s_key) : 0;
             if (score > 0) {
-                const int p = blocks.block_arg[max_key_position(s_key)];
+                const int p = blocks.block_arg[b];
                 cand_patch[j]  = p;
                 cand_score[j]  = score;
                 key_segment[j] = pack_candidate_key(score, my_rank, j);
                 scores[p]      = kDisabledWireScore;
                 s_patch        = p;
             }
+            s_key = 0;   // reused for the block rescan
         }
         __syncthreads();
         if (s_patch < 0) break;
-        const std::uint64_t b  = static_cast<std::uint64_t>(s_patch) >> blocks.shift;
+
+        // First stage for the block that lost its maximum.
         const std::uint64_t lo = b << blocks.shift;
         std::uint64_t hi = lo + (std::uint64_t{1} << blocks.shift);
         if (hi > M) hi = M;
-        reduce_range_max(scores, lo, hi, &s_key);
+        unsigned long long in_block = 0;
+        for (std::uint64_t i = lo + tid; i < hi; i += kTopThreads) {
+            const unsigned long long k = pack_max_key(scores[i], i);
+            if (k > in_block) in_block = k;
+        }
+        if (in_block) atomicMax(&s_key, in_block);
+        __syncthreads();
         if (tid == 0) {
             blocks.block_val[b] = max_key_score(s_key);
             blocks.block_arg[b] = max_key_position(s_key);
+            s_key = 0;   // ready for the next candidate
         }
         __syncthreads();
+        if (b / group == tid) my_best = group_best(tid);   // only this group changed
     }
     if (tid == 0) {
         for (; j < K; ++j) key_segment[j] = 0;
