@@ -28,7 +28,8 @@ All of the above lives on `main` (GPU-only: CUDA + NCCL are required).
 
 ## Documentation
 
-- **[STATUS.md](STATUS.md)** — what's been built, architecture summary, verification baseline
+- **[STATUS.md](STATUS.md)** — what the code does today: architecture, limits, performance, verification, build & run
+- **[HISTORY.md](HISTORY.md)** — the dated record: milestone notes, older measurements, abandoned attempts
 - **[ROADMAP.md](ROADMAP.md)** — M5+ planned work, new-environment setup, open decisions
 - **[CONVENTIONS.md](CONVENTIONS.md)** — collaboration patterns and design preferences
 

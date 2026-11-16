@@ -1,5 +1,24 @@
 # stPatternSearch — Roadmap (M5.5+)
 
+> **2026-11 note.** The current state of the code is in [STATUS.md](STATUS.md).
+> Much of what this file lists as future work has shipped since: both USC
+> loops are device-resident and select several patches per round, the setup
+> runs on the device, and input can be flat. The sections below are kept for
+> their rationale and post-mortems; where they describe the hot loop they
+> describe the old one. Still open from here: M7b (real OPC reader), runs
+> beyond 2 ranks and on NVLink, and the candidates under "Open candidates".
+
+## Open candidates (2026-11)
+
+- **ByElement at 2+ ranks**: its pair-overlap counting, walk and two
+  reductions dominate its round (STATUS "Performance").
+- **Candidate selection on more than one CUDA block** — it runs on one SM.
+- **ByElement's global patch limit** (INT_MAX, 32-bit slots in its exchanges).
+- **UPS int counts** in the device sort / reduce-by-key.
+- **Verification breadth**: more than 2 GPU ranks, NVLink, real data, a rank
+  dying mid-run.
+
+
 This file describes what's still planned. See [STATUS.md](STATUS.md) for
 completed work and the M5 profile baseline that drives the new ordering.
 
@@ -56,7 +75,7 @@ export CUDA_ARCH=<your GPU arch, e.g. 80 for A100>
 
 Replaced the strategy-B full sweep with `score_update_invidx_kernel` (design
 doc §6.3 strategy A): one block per newly covered element, inverted-index
-lookup, per-patch atomic −1. See STATUS.md decision #7 and the M5.5 profile
+lookup, per-patch atomic −1. See HISTORY.md decision #7 and the M5.5 profile
 table for the full write-up.
 
 **Result (2×L4):** bit-identical `selected` at all four scales; 27 ctest pass
@@ -174,7 +193,7 @@ winner-sequence diff harness to catch the first divergence.
 ## M6 — Element-partitioned covered bitset (§7.3) ✅ DONE (2026-07-06)
 
 Implemented as the opt-in `PartitionMode::ByElement` (public ctor enum; CLI
-`--partition element`). See STATUS.md "M6 architecture" for the full write-up.
+`--partition element`). See HISTORY.md "M6 architecture" for the original write-up and STATUS.md for the current loop.
 
 Deviations from the original spec, and how the deferral concerns resolved:
 
