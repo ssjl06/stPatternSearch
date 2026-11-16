@@ -316,6 +316,48 @@ uploading them twice), and the per-patch host stages are gone — the phase
 timers of a file-driven UPS run show no host phase at all, only the upload.
 The nested overloads flatten on the host and then take the same path.
 
+### One-pass candidate selection and a barrier-light walk (2026-11)
+
+The two remaining K-sequential parts of a round:
+
+- **Candidate selection** (both modes) was K argmaxes in a row. It is now one
+  pass: the K best patches all lie in the K blocks with the best block maxima,
+  so two selections — over the block maxima, then inside the chosen blocks —
+  see only nb + K × block_size values. Each selection finds the threshold
+  score by bisection (one parallel count per step) and takes everything above
+  it plus the first few, by position, that equal it; the K results are then
+  ordered by counting. No score is parked any more; the accepted patches are
+  disabled after the walk.
+- **Walk** (ByPatch) paid three barriers per candidate. Now every listed
+  element is entered into a small hash table first; an element entered twice
+  is "shared". A candidate with no shared element shares nothing with anyone
+  and is accepted by one thread with no barrier. Only candidates with shared
+  elements take the barrier path, counting the elements already taken by an
+  accepted candidate — the same exact test as before, so rounds end where
+  they did.
+
+Verified 2026-11-16 on 2×A100-80GB (`NCCL_P2P_DISABLE=1`): full suite at 1 and
+2 ranks + the 1M-patch scale test pass; selections identical. USC total, 2M
+patches (before → after):
+
+| input | mode | 1 rank | 2 ranks |
+|---|---|---|---|
+| 32 per patch, overlap 0.5 | ByPatch | 4.0 s → 1.7 s | 3.8 s → 2.0 s |
+| 32 per patch, overlap 0.5 | ByElement | 4.5 s → 2.8 s | 6.1 s → 4.3 s |
+| 200 per patch, overlap 0.5 | ByPatch | 2.5 s → 2.1 s | 2.2 s → 1.9 s |
+| 200 per patch, overlap 0.5 | ByElement | 3.2 s → 2.8 s | 11.0 s → 9.9 s |
+| 32 per patch, overlap 0.9 | ByPatch | 0.91 s → 0.62 s | 0.93 s → 0.54 s |
+| 32 per patch, overlap 0.9 | ByElement | 1.08 s → 0.73 s | 1.97 s → 1.53 s |
+
+At 20M patches (8 per patch, 1 rank, RTX PRO 4500): ByPatch 66.9 s → 16.1 s,
+ByElement 69.8 s → 24.3 s — the old selection re-scanned every block maximum
+per candidate, so it grew with the patch count.
+
+Per round at 2 ranks (2M patches, stage view): selection ~0.21 ms (it runs on
+one CUDA block, i.e. one SM), ByPatch walk ~0.15 ms. ByElement's pair-overlap
+counting (~0.29 ms), walk (~0.24 ms) and its two reductions are unchanged and
+now the larger part of its round.
+
 ### M6.5 — the ByElement loop is DEVICE-RESIDENT (2026-07-06)
 
 Because ByElement's one collective has a fixed count and no root (the exact
