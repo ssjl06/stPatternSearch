@@ -12,11 +12,14 @@ namespace stPS::io {
 // Collective: every rank pwrites its own `bytes` at `offset` of one shared
 // file (created if missing); rank 0 additionally writes `head` (if any) at
 // offset 0 — so a file header needn't be copied in front of rank 0's data.
-// Rank 0 then truncates to `total_size` so a longer stale file can't leave
-// garbage past the end. Used by the UPS stats file and the unique-hash file.
+// Once every rank has closed, rank 0 truncates to `total_size` so a longer
+// stale file can't leave garbage past the end. Opened O_DSYNC: each pwrite is
+// stable on return, and on NFS it stops the client widening a partial-page
+// write over a neighbouring rank's bytes (rank ranges meet mid-page).
+// Used by the UPS stats file and the unique-hash file.
 //
-// Errors (open, pwrite, ftruncate, close — the last can be the first to
-// report a deferred NFS/quota failure) are collected per rank and agreed on
+// Errors (open, pwrite, close — which can be the first to report a deferred
+// NFS/quota failure — and truncate) are collected per rank and agreed on
 // with an allreduce, so if any rank fails every rank throws
 // std::runtime_error("<label>: <path>: ...") together instead of one rank
 // stranding its peers in the next collective. Returns only once the file is

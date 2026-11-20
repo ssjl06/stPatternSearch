@@ -66,19 +66,33 @@ void write_shared_file(stComm::Comm& comm, const std::string& path, const char* 
     const std::string prefix = std::string(label) + ": " + path + ": ";
 
     std::string err;
-    FdGuard file;
-    file.fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0644);
-    if (file.fd < 0) err = io_error("cannot open");
-    if (err.empty() && comm.getRank() == 0 && head_bytes > 0) {
-        err = pwrite_all(file.fd, head, head_bytes, 0);
+    {
+        // O_DSYNC is required for correctness on NFS, not just durability:
+        // rank byte ranges meet mid-page, and without it (and without byte-
+        // range locks) the Linux NFS client may widen a partial-page WRITE to
+        // the whole page, zero-filled past its view of EOF — overwriting a
+        // neighbouring rank's bytes from another node with NULs. O_DSYNC turns
+        // that widening off (nfs_can_extend_write) even under a write
+        // delegation, and makes each pwrite stable on return.
+        FdGuard file;
+        file.fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_DSYNC, 0644);
+        if (file.fd < 0) err = io_error("cannot open");
+        if (err.empty() && comm.getRank() == 0 && head_bytes > 0) {
+            err = pwrite_all(file.fd, head, head_bytes, 0);
+        }
+        if (err.empty()) err = pwrite_all(file.fd, data, bytes, offset);
+        if (file.fd >= 0 && ::close(file.release()) != 0 && err.empty()) {
+            err = io_error("close failed");
+        }
     }
-    if (err.empty()) err = pwrite_all(file.fd, data, bytes, offset);
-    agree_or_throw(comm, prefix, err);  // everyone has written
+    agree_or_throw(comm, prefix, err);  // every rank's data is on the server
 
-    if (comm.getRank() == 0 && ::ftruncate(file.fd, total_size) != 0) {
-        err = io_error("ftruncate failed");
+    // Trim a longer stale file only after every rank has closed: on NFS a
+    // peer's data reaches the server at its close, so truncating earlier
+    // could race with it.
+    if (comm.getRank() == 0 && ::truncate(path.c_str(), total_size) != 0) {
+        err = io_error("truncate failed");
     }
-    if (::close(file.release()) != 0 && err.empty()) err = io_error("close failed");
     agree_or_throw(comm, prefix, err);  // no rank returns before the file is complete
 }
 
